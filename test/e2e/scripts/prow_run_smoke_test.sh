@@ -227,27 +227,23 @@ run_token_verification() {
     fi
 }
 
-setup_test_user() {
+# Extract user credentials from $USERS env variable
+# Format: testuser-1:pass1,testuser-2:pass2,...
+get_user_credentials() {
     local username="$1"
-    local cluster_role="$2"
-    
-    # Check and create service account
-    if ! oc get serviceaccount "$username" -n default >/dev/null 2>&1; then
-        echo "Creating service account: $username"
-        oc create serviceaccount "$username" -n default
+    echo "$USERS" | tr ',' '\n' | grep "^${username}:" | cut -d: -f2
+}
+
+# Grant cluster-admin role to a user
+make_user_admin() {
+    local username="$1"
+    log_info "Granting cluster-admin role to ${username}..."
+    if oc adm policy add-cluster-role-to-user cluster-admin "$username"; then
+        log_success "${username} is now a cluster-admin"
     else
-        echo "Service account $username already exists"
+        log_error "Failed to grant cluster-admin role to ${username}"
+        return 1
     fi
-    
-    # Check and create cluster role binding
-    if ! oc get clusterrolebinding "${username}-binding" >/dev/null 2>&1; then
-        echo "Creating cluster role binding for $username"
-        oc adm policy add-cluster-role-to-user "$cluster_role" "system:serviceaccount:default:$username"
-    else
-        echo "Cluster role binding for $username already exists"
-    fi
-    
-    echo "✅ User setup completed: $username"
 }
 
 # Main execution
@@ -261,37 +257,16 @@ deploy_models
 print_header "Setting up variables for tests"
 setup_vars_for_tests
 
-# Setup HTPasswd identity provider and capture credentials
-print_header "Setting up HTPasswd Identity Provider"
-IDP_OUTPUT=$("$PROJECT_ROOT/test/e2e/scripts/setup-idp-openshift.sh" 2>&1) || {
-    echo "❌ ERROR: HTPasswd identity provider setup failed"
-    # Print output but filter out export statements containing credentials
-    echo "$IDP_OUTPUT" | grep -v '^export '
-    exit 1
-}
-# Print output but filter out export statements containing credentials
-echo "$IDP_OUTPUT" | grep -v '^export '
-
-# Extract and export credentials from the setup script output (silently)
-eval "$(echo "$IDP_OUTPUT" | grep '^export ')"
-
-if [ -z "${OPENSHIFT_ADMIN_USER:-}" ] || [ -z "${OPENSHIFT_ADMIN_PASS:-}" ]; then
-    echo "❌ ERROR: Failed to retrieve admin credentials from IDP setup"
-    exit 1
-fi
-echo "✅ HTPasswd identity provider setup completed"
-
 # Login as admin user for the next steps
+OPENSHIFT_ADMIN_USER="testuser-1"
+make_user_admin "$OPENSHIFT_ADMIN_USER"
 print_header "Logging in as admin user"
 echo "Logging in as ${OPENSHIFT_ADMIN_USER}..."
-if ! oc login -u "$OPENSHIFT_ADMIN_USER" -p "$OPENSHIFT_ADMIN_PASS" "$K8S_CLUSTER_URL" --insecure-skip-tls-verify=true; then
+if ! oc login -u "$OPENSHIFT_ADMIN_USER" -p "$(get_user_credentials "$OPENSHIFT_ADMIN_USER")" "$K8S_CLUSTER_URL" --insecure-skip-tls-verify=true; then
     echo "❌ ERROR: Failed to login as admin user"
     exit 1
 fi
 echo "✅ Logged in as ${OPENSHIFT_ADMIN_USER}"
-
-# Now run tests for each user
-print_header "Running tests for all users"
 
 print_header "Validating Deployment and Token Metadata Logic"
 validate_deployment
@@ -303,12 +278,9 @@ run_smoke_tests
 
 # Test dev user (edit role)
 print_header "Running Maas e2e Tests as dev user"
-if [ -z "${OPENSHIFT_DEV_USER:-}" ] || [ -z "${OPENSHIFT_DEV_PASS:-}" ]; then
-    echo "❌ ERROR: Dev user credentials not available"
-    exit 1
-fi
+OPENSHIFT_DEV_USER="testuser-2"
 echo "Logging in as ${OPENSHIFT_DEV_USER}..."
-if ! oc login -u "$OPENSHIFT_DEV_USER" -p "$OPENSHIFT_DEV_PASS" "$K8S_CLUSTER_URL" --insecure-skip-tls-verify=true; then
+if ! oc login -u "$OPENSHIFT_DEV_USER" -p "$(get_user_credentials "$OPENSHIFT_DEV_USER")" "$K8S_CLUSTER_URL" --insecure-skip-tls-verify=true; then
     echo "❌ ERROR: Failed to login as dev user"
     exit 1
 fi
