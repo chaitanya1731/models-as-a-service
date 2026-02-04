@@ -192,19 +192,42 @@ echo "   Deploying Gateway and GatewayClass..."
 cd "$PROJECT_ROOT"
 kubectl apply --server-side=true --force-conflicts -f deployment/base/networking/odh/odh-gateway-api.yaml
 
-# Detect which TLS certificate secret exists for the MaaS gateway
-CERT_CANDIDATES=("default-gateway-cert" "data-science-gatewayconfig-tls" "data-science-gateway-service-tls")
-CERT_NAME=""
-for cert in "${CERT_CANDIDATES[@]}"; do
-    if kubectl get secret -n openshift-ingress "$cert" &>/dev/null; then
-        CERT_NAME="$cert"
-        echo "   Found TLS certificate secret: $cert"
-        break
+# Detect TLS certificate secret for the MaaS gateway
+# Primary: Get certificate from IngressController (most reliable source of truth)
+CERT_NAME=$(kubectl get ingresscontroller default -n openshift-ingress-operator \
+  -o jsonpath='{.spec.defaultCertificate.name}' 2>/dev/null)
+if [[ -n "$CERT_NAME" ]] && kubectl get secret -n openshift-ingress "$CERT_NAME" &>/dev/null; then
+    echo "   Found certificate from IngressController: ${CERT_NAME}"
+else
+    [[ -n "$CERT_NAME" ]] && echo "   IngressController cert '${CERT_NAME}' not found, trying alternatives..."
+    CERT_NAME=""
+fi
+
+# Fallback 1: Get certificate from router deployment
+if [[ -z "$CERT_NAME" ]]; then
+    CERT_NAME=$(kubectl get deployment router-default -n openshift-ingress \
+      -o jsonpath='{.spec.template.spec.volumes[?(@.name=="default-certificate")].secret.secretName}' 2>/dev/null)
+    if [[ -n "$CERT_NAME" ]] && kubectl get secret -n openshift-ingress "$CERT_NAME" &>/dev/null; then
+        echo "   Found certificate from router deployment: ${CERT_NAME}"
+    else
+        CERT_NAME=""
     fi
-done
-if [ -z "$CERT_NAME" ]; then
-    echo "   ⚠️  No TLS certificate secret found (checked: ${CERT_CANDIDATES[*]})"
-    echo "      HTTPS listener will not be configured for MaaS gateway"
+fi
+
+# Fallback 2: Check known certificate secret names (best-effort for RHOAI/ODH)
+if [[ -z "$CERT_NAME" ]]; then
+    CERT_CANDIDATES=("default-gateway-cert")
+    for cert in "${CERT_CANDIDATES[@]}"; do
+        if kubectl get secret -n openshift-ingress "$cert" &>/dev/null; then
+            CERT_NAME="$cert"
+            echo "   Found TLS certificate secret: $cert"
+            break
+        fi
+    done
+fi
+
+if [[ -z "$CERT_NAME" ]]; then
+    echo "   ⚠️  No TLS certificate found. HTTPS listener will not be configured."
 fi
 export CERT_NAME
 

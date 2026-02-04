@@ -566,9 +566,9 @@ spec:
       modelsAsService:
         managementState: Managed
     
-    # Components recommended for MaaS:
+    # Components not needed for MaaS:
     dashboard:
-      managementState: Managed
+      managementState: Removed
     
     llamastackoperator:
       managementState: Removed 
@@ -625,46 +625,37 @@ echo "* Cluster audience: ${AUD}"
 if [[ -z "${CERT_NAME:-}" ]]; then
   echo "* Detecting TLS certificate secret..."
 
-  # Try 1: Get certificate from GatewayConfig (operator-managed, most reliable)
-  if kubectl get gatewayconfig.services.platform.opendatahub.io default-gateway &>/dev/null; then
-    GATEWAY_CERT_TYPE=$(kubectl get gatewayconfig.services.platform.opendatahub.io default-gateway \
-      -o jsonpath='{.spec.certificate.type}' 2>/dev/null)
-
-    if [[ "$GATEWAY_CERT_TYPE" == "Provided" ]]; then
-      CERT_NAME=$(kubectl get gatewayconfig.services.platform.opendatahub.io default-gateway \
-        -o jsonpath='{.spec.certificate.secretName}' 2>/dev/null)
-      if [[ -n "$CERT_NAME" ]]; then
-        echo "  * Found certificate from GatewayConfig (Provided): ${CERT_NAME}"
-      fi
-    elif [[ "$GATEWAY_CERT_TYPE" == "OpenshiftDefaultIngress" ]]; then
-      # Try to get the default ingress certificate
-      CERT_NAME=$(kubectl get ingresscontroller default -n openshift-ingress-operator \
-        -o jsonpath='{.spec.defaultCertificate.name}' 2>/dev/null)
-      if [[ -n "$CERT_NAME" ]]; then
-        echo "  * Found certificate from IngressController: ${CERT_NAME}"
-      fi
-    fi
+  # Primary: Get certificate from IngressController (most reliable source of truth)
+  CERT_NAME=$(kubectl get ingresscontroller default -n openshift-ingress-operator \
+    -o jsonpath='{.spec.defaultCertificate.name}' 2>/dev/null)
+  if [[ -n "$CERT_NAME" ]] && kubectl get secret -n openshift-ingress "$CERT_NAME" &>/dev/null; then
+    echo "  * Found certificate from IngressController: ${CERT_NAME}"
+  else
+    [[ -n "$CERT_NAME" ]] && echo "  * IngressController cert '${CERT_NAME}' not found, trying alternatives..."
+    CERT_NAME=""
   fi
 
-  # Try 2: Check known certificate secret names (RHOAI/ODH defaults)
-  if [[ -z "$CERT_NAME" ]]; then
-    CERT_CANDIDATES=("data-science-gateway-service-tls" "default-gateway-cert")
-    for cert in "${CERT_CANDIDATES[@]}"; do
-      if kubectl get secret -n openshift-ingress "$cert" &>/dev/null; then
-        CERT_NAME="$cert"
-        echo "  * Found TLS certificate secret in openshift-ingress: ${cert}"
-        break
-      fi
-    done
-  fi
-
-  # Try 3: Get certificate from router deployment (fallback for default cluster cert)
+  # Fallback 1: Get certificate from router deployment
   if [[ -z "$CERT_NAME" ]]; then
     CERT_NAME=$(kubectl get deployment router-default -n openshift-ingress \
       -o jsonpath='{.spec.template.spec.volumes[?(@.name=="default-certificate")].secret.secretName}' 2>/dev/null)
-    if [[ -n "$CERT_NAME" ]]; then
+    if [[ -n "$CERT_NAME" ]] && kubectl get secret -n openshift-ingress "$CERT_NAME" &>/dev/null; then
       echo "  * Found certificate from router deployment: ${CERT_NAME}"
+    else
+      CERT_NAME=""
     fi
+  fi
+
+  # Fallback 2: Check known certificate secret names (best-effort for RHOAI/ODH)
+  if [[ -z "$CERT_NAME" ]]; then
+    CERT_CANDIDATES=("default-gateway-cert")
+    for cert in "${CERT_CANDIDATES[@]}"; do
+      if kubectl get secret -n openshift-ingress "$cert" &>/dev/null; then
+        CERT_NAME="$cert"
+        echo "  * Found TLS certificate secret: ${cert}"
+        break
+      fi
+    done
   fi
 
   # Warning if no certificate found
@@ -704,11 +695,9 @@ kubectl apply --server-side=true \
 # and is already configured. We only need to configure the outbound TLS here.
 # See: docs/content/configuration-and-management/tls-configuration.md
 if [[ "$ENABLE_TLS_BACKEND" -eq 1 ]]; then
-  echo "   Configuring Authorino CA bundle for outbound TLS..."
-  kubectl -n kuadrant-system set env deployment/authorino \
-    SSL_CERT_FILE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt \
-    REQUESTS_CA_BUNDLE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt 2>&1 || \
-    echo "   ⚠️  Authorino CA bundle configuration had issues (non-fatal)"
+  echo "   Configuring Authorino for TLS..."
+  "${PROJECT_ROOT}/deployment/overlays/tls-backend/configure-authorino-tls.sh" 2>&1 || \
+    echo "   ⚠️  Authorino TLS configuration had issues (non-fatal)"
 
   echo "   Waiting for Authorino deployment to pick up config..."
   kubectl rollout status deployment/authorino -n kuadrant-system --timeout=120s 2>&1 || \
@@ -779,12 +768,37 @@ spec:
   fi
 fi
 
-echo
-echo "## Observability Setup (Optional)"
-echo "* NOTE: Observability (Prometheus/Grafana integration) is not installed by default."
-echo "* To enable observability, apply the observability manifests:"
-echo "   kubectl apply --server-side=true \\"
-echo "     -f <(kustomize build \"https://github.com/opendatahub-io/models-as-a-service.git/deployment/base/observability?ref=${MAAS_REF}\")"
+echo ""
+echo "========================================="
+echo "TEMPORARY WORKAROUNDS (TO BE REMOVED)"
+echo "========================================="
+echo ""
+echo "Applying temporary workarounds for known issues..."
+
+echo "   Restarting Kuadrant, Authorino, and Limitador operators to refresh webhook configurations..."
+kubectl delete pod -n kuadrant-system -l control-plane=controller-manager 2>/dev/null && \
+  echo "   * Kuadrant operator restarted" || \
+  echo "   WARNING: Could not restart Kuadrant operator"
+
+kubectl rollout restart deployment authorino-operator -n kuadrant-system 2>/dev/null && \
+  echo "   * Authorino operator restarted" || \
+  echo "   WARNING: Could not restart Authorino operator"
+
+kubectl rollout restart deployment limitador-operator-controller-manager -n kuadrant-system 2>/dev/null && \
+  echo "   * Limitador operator restarted" || \
+  echo "   WARNING: Could not restart Limitador operator"
+
+echo "   Waiting for operators to be ready..."
+kubectl rollout status deployment kuadrant-operator-controller-manager -n kuadrant-system --timeout=60s 2>/dev/null || \
+  echo "   WARNING: Kuadrant operator taking longer than expected"
+kubectl rollout status deployment authorino-operator -n kuadrant-system --timeout=60s 2>/dev/null || \
+  echo "   WARNING: Authorino operator taking longer than expected"
+kubectl rollout status deployment limitador-operator-controller-manager -n kuadrant-system --timeout=60s 2>/dev/null || \
+  echo "   WARNING: Limitador operator taking longer than expected"
+
+echo "   Waiting for Authorino CR to be ready..."
+kubectl wait --for=condition=Ready authorino/authorino -n kuadrant-system --timeout=120s 2>/dev/null || \
+  echo "   WARNING: Authorino CR not ready yet (non-fatal, may take longer)"
 
 echo ""
 echo "========================================="

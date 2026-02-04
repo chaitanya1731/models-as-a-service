@@ -730,20 +730,43 @@ wait_authorino_ready() {
 
   while [[ $elapsed -lt $timeout ]]; do
     # Make a test request - we expect 401 (auth working) not 500 (auth failing)
+    # Capture both response body and HTTP code
+    local response_file
+    response_file=$(mktemp)
     local http_code
-    http_code=$(curl -sSk -o /dev/null -w "%{http_code}" "$maas_url" 2>/dev/null || echo "000")
-    
+    http_code=$(curl -sSk -o "$response_file" -w "%{http_code}" "$maas_url" 2>&1)
+
+    # If http_code is not a 3-digit number, curl failed
+    if ! [[ "$http_code" =~ ^[0-9]{3}$ ]]; then
+      local curl_error="$http_code"
+      http_code="000"
+    fi
+
     if [[ "$http_code" == "401" || "$http_code" == "200" ]]; then
       consecutive_success=$((consecutive_success + 1))
       echo "  - Auth request succeeded (HTTP $http_code) [$consecutive_success/$required_success]"
-      
+      rm -f "$response_file"
+
       if [[ $consecutive_success -ge $required_success ]]; then
         echo "  * Auth requests verified working"
         return 0
       fi
     else
       consecutive_success=0
-      echo "  - Auth request returned HTTP $http_code, waiting for stabilization..."
+      if [[ "$http_code" == "000" ]]; then
+        # Show actual curl error
+        local error_msg
+        error_msg=$(echo "$curl_error" | head -1 | sed 's/^curl: ([0-9]*) //')
+        echo "  - Auth request failed: ${error_msg:-Connection failed}"
+      elif [[ "$http_code" == "500" || "$http_code" == "502" || "$http_code" == "503" ]]; then
+        # Show response body for server errors
+        local error_body
+        error_body=$(cat "$response_file" 2>/dev/null | head -c 200 | tr '\n' ' ')
+        echo "  - Auth request returned HTTP $http_code: ${error_body:-no details}"
+      else
+        echo "  - Auth request returned HTTP $http_code, waiting for stabilization..."
+      fi
+      rm -f "$response_file"
     fi
     
     sleep 2
