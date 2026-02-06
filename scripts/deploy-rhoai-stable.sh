@@ -370,6 +370,18 @@ metadata:
   name: kuadrant
   namespace: kuadrant-system
 EOF
+
+echo "* Waiting for Kuadrant deployments to be ready..."
+kubectl -n kuadrant-system wait --timeout=180s --for=condition=Available deployments --all
+echo "* Kuadrant deployments are ready"
+
+echo "* Waiting for Kuadrant CR to be ready..."
+kubectl wait --for=condition=Ready kuadrant/kuadrant -n kuadrant-system --timeout=180s || \
+  echo "  WARNING: Kuadrant CR not ready yet, continuing..."
+
+echo "* Waiting for Authorino CR to be ready..."
+kubectl wait --for=condition=Ready authorino/authorino -n kuadrant-system --timeout=180s || \
+  echo "  WARNING: Authorino CR not ready yet, continuing..."
 }
 
 deploy_rhoai() {
@@ -668,14 +680,6 @@ fi
 
 export CERT_NAME
 echo "* TLS certificate secret: ${CERT_NAME:-<none>}"
-
-OVERLAY="overlays/tls-backend"
-if [[ "$ENABLE_TLS_BACKEND" -eq 0 ]]; then
-  OVERLAY="overlays/http-backend"
-  echo "   ⚠️  TLS disabled, applying HTTP backend overlay..."
-else
-  echo "   Applying TLS backend overlay..."
-fi
 
 echo
 echo "## Installing MaaS Gateway"
