@@ -2,6 +2,9 @@
 
 This guide covers TLS configuration for the MaaS API component to enable encrypted communication for all API traffic.
 
+!!! tip "Quick Verification"
+    For TLS verification commands, see [Validation Guide - TLS Verification](../install/validation.md#tls-verification).
+
 ## Overview
 
 The MaaS API supports end-to-end TLS encryption across all traffic paths:
