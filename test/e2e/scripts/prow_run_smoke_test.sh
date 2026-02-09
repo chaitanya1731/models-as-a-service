@@ -92,7 +92,7 @@ check_prerequisites() {
         exit 1
     fi
     
-    echo "✅ Prerequisites met - logged in as: $current_user on OpenShift"
+    echo "✅ Prerequisites met - Currently logged in as: $current_user on OpenShift"
 }
 
 deploy_maas_platform() {
@@ -190,8 +190,8 @@ setup_vars_for_tests() {
     if [ "$INSECURE_HTTP" = "true" ]; then
         echo "⚠️  INSECURE_HTTP=true - will use HTTP for tests"
     fi
-       
-    export CLUSTER_DOMAIN="$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}')"
+    # Detect MAAS_API_BASE_URL while logged in as admin (non-admin users can't read cluster ingress)
+    export CLUSTER_DOMAIN="$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}' 2>/dev/null || true)"
     if [ -z "$CLUSTER_DOMAIN" ]; then
         echo "❌ ERROR: Failed to detect cluster ingress domain (ingresses.config.openshift.io/cluster)"
         exit 1
@@ -240,27 +240,48 @@ run_token_verification() {
     fi
 }
 
-setup_test_user() {
+smoke_test_bundle() {
+    echo "-- Running Validation Tests for MaaS --"
+    # Skip validation and token verification for non-admin users as 
+    # currently validate-deployment.sh and verify-tokens-metadata-logic.sh are only run for admin users
+    # TODO: Implement Validation/Token Verification for non-admin users in 
+    # ./scripts/validate-deployment.sh and ./scripts/verify-tokens-metadata-logic.sh
+    # TODO: Consolidate all validations in a single test suite.
+    # if ! oc auth can-i '*' '*' --all-namespaces >/dev/null 2>&1; then
+    #     echo "⏭️  Skipping validation and token verification for non-admin users"
+    # else
+    #     validate_deployment
+    #     echo "waiting for rate limit to reset..."
+    #     sleep 120       # Wait for the rate limit to reset (120 seconds is the default rate limit window)
+    # fi
+    validate_deployment
+    echo "waiting for rate limit to reset..."
+    sleep 120       # Wait for the rate limit to reset (120 seconds is the default rate limit window)
+    run_token_verification
+    run_smoke_tests
+    echo "✅ MaaS Validation Successful"
+}
+
+get_password_for_user() {
     local username="$1"
-    local cluster_role="$2"
-    
-    # Check and create service account
-    if ! oc get serviceaccount "$username" -n default >/dev/null 2>&1; then
-        echo "Creating service account: $username"
-        oc create serviceaccount "$username" -n default
-    else
-        echo "Service account $username already exists"
+    echo "$USERS" | tr ',' '\n' | grep "^${username}:" | cut -d: -f2-
+}
+
+# Login as user and run smoke_test_bundle. Uses K8S_CLUSTER_URL from setup_vars_for_tests.
+run_smoke_bundle_as_user() {
+    local username="$1"
+    local password
+    password="$(get_password_for_user "$username")"
+    if [ -z "$password" ]; then
+        echo "❌ ERROR: No password found for user '$username' in \$USERS"
+        return 1
     fi
-    
-    # Check and create cluster role binding
-    if ! oc get clusterrolebinding "${username}-binding" >/dev/null 2>&1; then
-        echo "Creating cluster role binding for $username"
-        oc adm policy add-cluster-role-to-user "$cluster_role" "system:serviceaccount:default:$username"
-    else
-        echo "Cluster role binding for $username already exists"
+    echo "Logging in as $username and running smoke test bundle..."
+    if ! oc login "$K8S_CLUSTER_URL" -u "$username" -p "$password" --insecure-skip-tls-verify >/dev/null 2>&1; then
+        echo "❌ ERROR: Failed to login as $username"
+        return 1
     fi
-    
-    echo "✅ User setup completed: $username"
+    smoke_test_bundle
 }
 
 # Main execution
@@ -274,37 +295,22 @@ deploy_models
 print_header "Setting up variables for tests"
 setup_vars_for_tests
 
-# Setup all users first (while logged in as admin)
-print_header "Setting up test users"
-setup_test_user "tester-admin-user" "cluster-admin"
-setup_test_user "tester-edit-user" "edit"
-setup_test_user "tester-view-user" "view"
+# When USERS_TO_TEST is set (e.g. by maas-e2e-test-runner.sh), run smoke bundle for each user.
+# When not set (script run directly), run smoke bundle once for the already logged-in user.
+print_header "Running MaaS test bundle"
+if [ -n "${USERS_TO_TEST:-}" ]; then
+    if [ -z "${USERS:-}" ]; then
+        echo "❌ ERROR: USERS not set. Please setup IDP users using maas-e2e-test-runner.sh --mode dev"
+        exit 1
+    fi
+    print_header "Testing users: $USERS_TO_TEST"
+    for username in $USERS_TO_TEST; do
+        print_header "Testing user: $username"
+        run_smoke_bundle_as_user "$username"
+    done
+else
+    echo "Running MaaS test bundle for user: $(oc whoami)"
+    smoke_test_bundle
+fi
 
-# Now run tests for each user
-print_header "Running tests for all users"
-
-# Test admin user
-print_header "Running Maas e2e Tests as admin user"
-ADMIN_TOKEN=$(oc create token tester-admin-user -n default)
-oc login --token "$ADMIN_TOKEN" --server "$K8S_CLUSTER_URL"
-
-print_header "Validating Deployment and Token Metadata Logic"
-validate_deployment
-run_token_verification
-
-sleep 120       # Wait for the rate limit to reset
-run_smoke_tests
-
-# Test edit user  
-print_header "Running Maas e2e Tests as edit user"
-EDIT_TOKEN=$(oc create token tester-edit-user -n default)
-oc login --token "$EDIT_TOKEN" --server "$K8S_CLUSTER_URL"
-run_smoke_tests
-
-# Test view user
-print_header "Running Maas e2e Tests as view user"
-VIEW_TOKEN=$(oc create token tester-view-user -n default)
-oc login --token "$VIEW_TOKEN" --server "$K8S_CLUSTER_URL"
-run_smoke_tests
-
-echo "🎉 Deployment completed successfully!"
+echo "🎉 MaaS Deployment and Smoke Tests completed successfully!"
