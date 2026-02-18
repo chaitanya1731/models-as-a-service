@@ -1,0 +1,173 @@
+# Promote Main to Stable Workflow
+#
+# Creates a promotional PR to sync the stable branch with main.
+# Runs automatically every Sunday night (midnight UTC) and can be triggered manually.
+#
+# This workflow:
+#   1. Checks if stable is behind main
+#   2. Creates a PR from main -> stable if there are new changes
+#   3. Reuses an existing open PR if one already exists
+
+name: Promote Main to Stable
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # Every Sunday at midnight UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  GH_USER_NAME: github-actions[bot]
+  GH_USER_EMAIL: github-actions[bot]@users.noreply.github.com
+  PR_TITLE: "chore: promote main to stable"
+  PR_LABEL: promotion
+
+jobs:
+  promote:
+    name: Create Promotion PR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "${{ env.GH_USER_NAME }}"
+          git config user.email "${{ env.GH_USER_EMAIL }}"
+
+      - name: Check for changes between main and stable
+        id: check_diff
+        run: |
+          git fetch origin main stable
+          DIFF_COUNT=$(git rev-list --count origin/stable..origin/main)
+          echo "diff_count=$DIFF_COUNT" >> "$GITHUB_OUTPUT"
+          if [ "$DIFF_COUNT" -eq 0 ]; then
+            echo "stable is already up to date with main. Nothing to promote."
+          else
+            echo "Found $DIFF_COUNT commit(s) to promote from main to stable."
+          fi
+
+      - name: Check for existing promotion PR
+        if: steps.check_diff.outputs.diff_count != '0'
+        id: existing_pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXISTING_PR=$(gh pr list \
+            --base stable \
+            --head main \
+            --state open \
+            --json number,url \
+            --jq '.[0] // empty')
+
+          if [ -n "$EXISTING_PR" ]; then
+            PR_URL=$(echo "$EXISTING_PR" | jq -r '.url')
+            PR_NUMBER=$(echo "$EXISTING_PR" | jq -r '.number')
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+            echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+            echo "Existing promotion PR found: $PR_URL"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No existing promotion PR found. Will create a new one."
+          fi
+
+      - name: Generate PR body
+        if: steps.check_diff.outputs.diff_count != '0' && steps.existing_pr.outputs.found == 'false'
+        id: pr_body
+        run: |
+          COMMIT_LOG=$(git log --oneline origin/stable..origin/main --no-merges | head -50)
+          COMMIT_COUNT=$(git rev-list --count origin/stable..origin/main)
+
+          BODY=$(cat <<PREOF
+          ## Promotion: main → stable
+
+          This is an automated PR to sync the \`stable\` branch with \`main\`.
+
+          ### Changes
+          **$COMMIT_COUNT commit(s)** to promote:
+
+          \`\`\`
+          $COMMIT_LOG
+          \`\`\`
+
+          ### Trigger
+          - **Workflow:** \`${{ github.workflow }}\`
+          - **Event:** \`${{ github.event_name }}\`
+          - **Run:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          PREOF
+          )
+
+          echo "body<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$BODY" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Create promotion PR
+        if: steps.check_diff.outputs.diff_count != '0' && steps.existing_pr.outputs.found == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_URL=$(gh pr create \
+            --base stable \
+            --head main \
+            --title "${{ env.PR_TITLE }}" \
+            --body "${{ steps.pr_body.outputs.body }}" \
+            --label "${{ env.PR_LABEL }}")
+
+          echo "Created promotion PR: $PR_URL"
+
+      - name: Update existing PR body
+        if: steps.check_diff.outputs.diff_count != '0' && steps.existing_pr.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          COMMIT_LOG=$(git log --oneline origin/stable..origin/main --no-merges | head -50)
+          COMMIT_COUNT=$(git rev-list --count origin/stable..origin/main)
+
+          BODY=$(cat <<PREOF
+          ## Promotion: main → stable
+
+          This is an automated PR to sync the \`stable\` branch with \`main\`.
+
+          ### Changes
+          **$COMMIT_COUNT commit(s)** to promote:
+
+          \`\`\`
+          $COMMIT_LOG
+          \`\`\`
+
+          ### Trigger
+          - **Workflow:** \`${{ github.workflow }}\`
+          - **Event:** \`${{ github.event_name }}\`
+          - **Run:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          > *PR body updated on $(date -u +"%Y-%m-%d %H:%M UTC")*
+          PREOF
+          )
+
+          gh pr edit ${{ steps.existing_pr.outputs.pr_number }} --body "$BODY"
+          echo "Updated existing promotion PR: ${{ steps.existing_pr.outputs.pr_url }}"
+
+      - name: Summary
+        run: |
+          {
+            echo "## Promote Main to Stable"
+            echo ""
+            DIFF_COUNT="${{ steps.check_diff.outputs.diff_count }}"
+            if [ "$DIFF_COUNT" -eq 0 ]; then
+              echo "✅ **stable** is already up to date with **main**. No PR needed."
+            elif [ "${{ steps.existing_pr.outputs.found }}" == "true" ]; then
+              echo "🔄 Updated existing promotion PR: ${{ steps.existing_pr.outputs.pr_url }}"
+              echo "- **Commits to promote:** $DIFF_COUNT"
+            else
+              echo "🆕 Created new promotion PR from **main** → **stable**"
+              echo "- **Commits to promote:** $DIFF_COUNT"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
