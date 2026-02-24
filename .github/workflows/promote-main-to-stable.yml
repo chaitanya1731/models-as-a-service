@@ -63,11 +63,17 @@ jobs:
           EXISTING_PR=$(gh pr list --base stable --head main --state open --json number --jq '.[0].number // empty')
 
           if [ -n "$EXISTING_PR" ]; then
-            echo "$BODY" | gh pr edit "$EXISTING_PR" --body-file -
+            if ! echo "$BODY" | gh pr edit "$EXISTING_PR" --body-file -; then
+              echo "::error::Failed to update existing promotion PR #${EXISTING_PR}"
+              exit 1
+            fi
             echo "Updated existing promotion PR #${EXISTING_PR}"
           else
-            echo "$BODY" | gh pr create --base stable --head main \
+            if ! echo "$BODY" | gh pr create --base stable --head main \
               --title "chore: promote main to stable" \
-              --body-file -
+              --body-file -; then
+              echo "::error::Failed to create promotion PR"
+              exit 1
+            fi
             echo "Created new promotion PR"
           fi
