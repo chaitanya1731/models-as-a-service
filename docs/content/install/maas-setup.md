@@ -38,7 +38,7 @@ are applied automatically. For manual install:
 
 ```shell
 kubectl apply --server-side=true \
-  -f <(kustomize build "https://github.com/opendatahub-io/models-as-a-service.git/deployment/base/maas-controller/policies?ref=main")
+  -f <(kustomize build "https://github.com/opendatahub-io/models-as-a-service.git/deployment/base/maas-controller/policies?ref=ck-development")
 ```
 
 !!! note "Custom Token Review Audience"

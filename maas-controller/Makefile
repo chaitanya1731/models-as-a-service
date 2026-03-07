@@ -22,7 +22,7 @@ BUILD_DIR := bin
 CONTAINER_RUNTIME := $(shell command -v podman 1>/dev/null 2>&1 && echo podman || (command -v buildah 1>/dev/null 2>&1 && echo buildah || echo docker))
 # Default image
 IMAGE ?= quay.io/opendatahub/maas-controller
-IMAGE_TAG ?= latest
+IMAGE_TAG ?= ck-development
 FULL_IMAGE := $(IMAGE):$(IMAGE_TAG)
 
 build: tidy $(BUILD_DIR)

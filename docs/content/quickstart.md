@@ -41,7 +41,7 @@ For step-by-step commands, see [TLS Configuration: Authorino TLS Configuration](
 For OpenShift clusters, use the unified automated deployment script:
 
 ```bash
-export MAAS_REF="main"  # Use the latest release tag, or "main" for development
+export MAAS_REF="ck-development"  # Use the latest release tag, or "main" for development
 
 # Deploy using RHOAI operator (default)
 ./scripts/deploy.sh

@@ -1378,7 +1378,7 @@ setup_maas_gateway() {
     # Fallback: fetch from GitHub (for standalone script usage)
     log_debug "  Local manifest not found, fetching from GitHub..."
     kubectl apply --server-side=true \
-      -f <(kustomize build "https://github.com/opendatahub-io/models-as-a-service.git/deployment/base/networking/maas?ref=main" | \
+      -f <(kustomize build "https://github.com/opendatahub-io/models-as-a-service.git/deployment/base/networking/maas?ref=ck-development" | \
            envsubst '$CLUSTER_DOMAIN $CERT_NAME')
   fi
 }

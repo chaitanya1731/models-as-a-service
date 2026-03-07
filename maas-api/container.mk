@@ -2,7 +2,7 @@
 
 CONTAINER_ENGINE ?= podman
 REPO ?= quay.io/opendatahub/maas-api
-TAG ?= latest
+TAG ?= ck-development
 FULL_IMAGE ?= $(REPO):$(TAG)
 
 DOCKER_BUILD_ARGS := --build-arg CGO_ENABLED=$(CGO_ENABLED)

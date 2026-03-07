@@ -18,7 +18,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 echo "Updating kustomization.yaml files with tag: $TAG"
 
 # Update base maas-api kustomization.yaml
-BASE_KUSTOMIZATION="${PROJECT_ROOT}/deployment/base/maas-api/kustomization.yaml"
+BASE_KUSTOMIZATION="${PROJECT_ROOT}/deployment/base/maas-api/core/kustomization.yaml"
 if [ -f "$BASE_KUSTOMIZATION" ]; then
     echo "  - Updating ${BASE_KUSTOMIZATION}"
     # Use sed to update the newTag field, preserving indentation
@@ -40,10 +40,26 @@ if [ -f "$ODH_PARAMS" ]; then
     sed -i "s|\(maas-api-image=quay.io/opendatahub/maas-api:\).*|\1${TAG}|" "$ODH_PARAMS"
 fi
 
+# Update base maas-controller kustomization.yaml
+CONTROLLER_KUSTOMIZATION="${PROJECT_ROOT}/deployment/base/maas-controller/manager/kustomization.yaml"
+if [ -f "$CONTROLLER_KUSTOMIZATION" ]; then
+    echo "  - Updating ${CONTROLLER_KUSTOMIZATION}"
+    sed -i "s/\(newTag: \).*/\1${TAG}/" "$CONTROLLER_KUSTOMIZATION"
+fi
+
+# Update deployment overlay ODH params.env if it exists
+DEPLOY_ODH_PARAMS="${PROJECT_ROOT}/deployment/overlays/odh/params.env"
+if [ -f "$DEPLOY_ODH_PARAMS" ]; then
+    echo "  - Updating ${DEPLOY_ODH_PARAMS}"
+    sed -i "s|\(maas-api-image=quay.io/opendatahub/maas-api:\).*|\1${TAG}|" "$DEPLOY_ODH_PARAMS"
+fi
+
 echo "Tag update complete!"
 echo ""
 echo "Updated files:"
 echo "  - ${BASE_KUSTOMIZATION}"
+[ -f "$CONTROLLER_KUSTOMIZATION" ] && echo "  - ${CONTROLLER_KUSTOMIZATION}"
 [ -f "$DEV_KUSTOMIZATION" ] && echo "  - ${DEV_KUSTOMIZATION}"
 [ -f "$ODH_PARAMS" ] && echo "  - ${ODH_PARAMS}"
+[ -f "$DEPLOY_ODH_PARAMS" ] && echo "  - ${DEPLOY_ODH_PARAMS}"
 
