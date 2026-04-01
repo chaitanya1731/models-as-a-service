@@ -20,7 +20,6 @@ import (
 	"context"
 	"testing"
 
-	maasv1alpha1 "github.com/opendatahub-io/models-as-a-service/maas-controller/api/maas/v1alpha1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -29,6 +28,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gatewayapiv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	maasv1alpha1 "github.com/opendatahub-io/models-as-a-service/maas-controller/api/maas/v1alpha1"
 )
 
 // newPreexistingAuthPolicy builds a Kuadrant AuthPolicy as an unstructured object
@@ -1140,11 +1141,11 @@ func TestMaaSAuthPolicyReconciler_NoIdentityHeadersUpstream(t *testing.T) {
 
 		// Verify essential fields for TRLP
 		requiredFields := []string{
-			"userid",                      // User identification
-			"groups",                      // User groups
-			"selected_subscription_key",   // Model-scoped subscription key for TRLP
-			"selected_subscription",       // Subscription name
-			"subscription_info",           // Full subscription object (includes labels, organizationId, costCenter, etc.)
+			"userid",                    // User identification
+			"groups",                    // User groups
+			"selected_subscription_key", // Model-scoped subscription key for TRLP
+			"selected_subscription",     // Subscription name
+			"subscription_info",         // Full subscription object (includes labels, organizationId, costCenter, etc.)
 		}
 
 		for _, field := range requiredFields {
@@ -1175,7 +1176,7 @@ func TestMaaSAuthPolicyReconciler_NoIdentityHeadersUpstream(t *testing.T) {
 			t.Error("filters.identity must include 'subscription_info' field (full object from subscription-select)")
 		} else {
 			// Verify it's an expression that returns the full object
-			subscriptionInfoMap, ok := subscriptionInfoField.(map[string]interface{})
+			subscriptionInfoMap, ok := subscriptionInfoField.(map[string]any)
 			if !ok {
 				t.Errorf("subscription_info should be a map, got %T", subscriptionInfoField)
 			} else {
@@ -1231,4 +1232,3 @@ func contains(s, substr string) bool {
 			return false
 		}())
 }
-
