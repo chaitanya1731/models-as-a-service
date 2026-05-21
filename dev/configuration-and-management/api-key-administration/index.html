@@ -8,9 +8,13 @@
       
       
       
-        <link rel="canonical" href="https://opendatahub-io.github.io/models-as-a-service/dev/configuration-and-management/model-gateway-and-serving/">
+        <link rel="canonical" href="https://opendatahub-io.github.io/models-as-a-service/dev/configuration-and-management/api-key-administration/">
       
       
+        <link rel="prev" href="../quota-and-access-configuration/">
+      
+      
+        <link rel="next" href="../namespace-rbac/">
       
       
         
@@ -21,7 +25,7 @@
     
     
       
-        <title>On-cluster models - ODH Models-as-a-Service Documentation</title>
+        <title>API Key Administration - ODH Models-as-a-Service Documentation</title>
       
     
     
@@ -72,7 +76,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#on-cluster-models" class="md-skip">
+        <a href="#api-key-administration" class="md-skip">
           Skip to content
         </a>
       
@@ -109,7 +113,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              On-cluster models
+              API Key Administration
             
           </span>
         </div>
@@ -285,6 +289,8 @@
   
   
   
+    
+  
   
     
     
@@ -292,10 +298,12 @@
   
   
   
+    
+  
   
     
     
-      <li class="md-tabs__item">
+      <li class="md-tabs__item md-tabs__item--active">
         <a href="../quota-and-access-configuration/" class="md-tabs__link">
           
   
@@ -319,7 +327,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../user-guide/self-service-model-access/" class="md-tabs__link">
+        <a href="../../user-guide/api-key-management/" class="md-tabs__link">
           
   
   
@@ -339,11 +347,11 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../contributing/testing-guide/" class="md-tabs__link">
+        <a href="../../architecture-internals/controller-architecture/" class="md-tabs__link">
           
   
   
-  Contributing
+  Developer Guide
 
         </a>
       </li>
@@ -607,6 +615,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../migration/upgrade-to-3.4/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Upgrade to 3.4
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -775,6 +811,62 @@
     
   
     Model Reference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/api-key-authentication/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    API Key Authentication
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/model-access-control/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Model Access Control
   
 
     
@@ -1091,7 +1183,35 @@
   <span class="md-ellipsis">
     
   
-    Model Setup (On Cluster)
+    Model Setup
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../install/external-model-setup/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    External Model Setup (Tech Preview)
   
 
     
@@ -1180,28 +1300,31 @@
       
   
   
+    
   
   
+  
     
     
     
     
+      
+        
+        
       
       
         
       
     
     
-    <li class="md-nav__item md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
       
         
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" checked>
         
           
-        
-        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4" >
-        
-          
-          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
             
   
   
@@ -1219,7 +1342,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="true">
           <label class="md-nav__title" for="__nav_4">
             <span class="md-nav__icon md-icon"></span>
             
@@ -1234,28 +1357,31 @@
                 
   
   
+    
   
   
+  
     
     
     
     
       
       
-        
-      
-    
-    
-    <li class="md-nav__item md-nav__item--nested">
-      
-        
         
           
+          
         
-        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_1" >
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_1" checked>
         
           
-          <label class="md-nav__link" for="__nav_4_1" id="__nav_4_1_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_4_1" id="__nav_4_1_label" tabindex="">
             
   
   
@@ -1273,7 +1399,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_1_label" aria-expanded="false">
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_1_label" aria-expanded="true">
           <label class="md-nav__title" for="__nav_4_1">
             <span class="md-nav__icon md-icon"></span>
             
@@ -1316,17 +1442,44 @@
                 
   
   
+    
   
   
-    <li class="md-nav__item">
-      <a href="../token-management/" class="md-nav__link">
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    API Key Administration
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
         
   
   
   <span class="md-ellipsis">
     
   
-    Token Management
+    API Key Administration
   
 
     
@@ -1335,6 +1488,165 @@
   
 
       </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#bulk-key-revocation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Bulk Key Revocation
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Bulk Key Revocation">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#revoking-all-keys-for-a-user" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Revoking All Keys for a User
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#use-cases" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Use Cases
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#group-membership-changes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Group Membership Changes
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Group Membership Changes">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#when-to-revoke-keys" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When to Revoke Keys
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#ephemeral-key-cleanup" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Ephemeral Key Cleanup
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Ephemeral Key Cleanup">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#how-it-works" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How It Works
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#grace-period" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Grace Period
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#security" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Security
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#troubleshooting-cleanup" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Troubleshooting Cleanup
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#related-documentation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Related Documentation
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
     </li>
   
 
@@ -1355,6 +1667,34 @@
     
   
     Namespace User Permissions (RBAC)
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../troubleshooting-external-model-rbac/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Troubleshooting ExternalModel RBAC
   
 
     
@@ -1403,14 +1743,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../subscription-known-issues/" class="md-nav__link">
+      <a href="../gateway-patterns/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Subscription limitations & known issues
+    Gateway Patterns
   
 
     
@@ -1445,10 +1785,13 @@
       
       
         
+          
+          
+        
       
     
     
-    <li class="md-nav__item md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
       
         
         
@@ -1457,7 +1800,7 @@
         <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_2" >
         
           
-          <label class="md-nav__link" for="__nav_4_2" id="__nav_4_2_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_4_2" id="__nav_4_2_label" tabindex="">
             
   
   
@@ -1500,7 +1843,7 @@
   <span class="md-ellipsis">
     
   
-    Model Setup (On Cluster)
+    Model Setup
   
 
     
@@ -1542,34 +1885,6 @@
 
               
             
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../maas-model-kinds/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    MaaS Model Kinds
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
           </ul>
         </nav>
       
@@ -1591,10 +1906,13 @@
       
       
         
+          
+          
+        
       
     
     
-    <li class="md-nav__item md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
       
         
         
@@ -1603,125 +1921,7 @@
         <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_3" >
         
           
-          <label class="md-nav__link" for="__nav_4_3" id="__nav_4_3_label" tabindex="0">
-            
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    MaaS Controller
-  
-
-    
-  </span>
-  
-  
-
-            <span class="md-nav__icon md-icon"></span>
-          </label>
-        
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_3_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_4_3">
-            <span class="md-nav__icon md-icon"></span>
-            
-  
-    MaaS Controller
-  
-
-          </label>
-          <ul class="md-nav__list" data-md-scrollfix>
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../maas-controller-overview/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Controller Overview
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../crd-annotations/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    CRD Annotations
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-          </ul>
-        </nav>
-      
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    
-    
-    
-    
-      
-      
-        
-      
-    
-    
-    <li class="md-nav__item md-nav__item--nested">
-      
-        
-        
-          
-        
-        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_4" >
-        
-          
-          <label class="md-nav__link" for="__nav_4_4" id="__nav_4_4_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_4_3" id="__nav_4_3_label" tabindex="">
             
   
   
@@ -1739,8 +1939,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_4_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_4_4">
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_3">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -1764,35 +1964,7 @@
   <span class="md-ellipsis">
     
   
-    Observability
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../advanced-administration/limitador-persistence/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Limitador Persistence
+    Observability Dashboard
   
 
     
@@ -1821,6 +1993,34 @@
     
   
     Subscription Cardinality
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../advanced-administration/limitador-persistence/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Limitador Persistence
   
 
     
@@ -1938,14 +2138,70 @@
   
   
     <li class="md-nav__item">
-      <a href="../../user-guide/self-service-model-access/" class="md-nav__link">
+      <a href="../../user-guide/api-key-management/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Self Service Model Access
+    API Key Management
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../user-guide/model-discovery/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Model Discovery
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../user-guide/inference/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Inference
   
 
     
@@ -1998,7 +2254,7 @@
   <span class="md-ellipsis">
     
   
-    Contributing
+    Developer Guide
   
 
     
@@ -2011,6 +2267,144 @@
         
         <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Developer Guide
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture-internals/controller-architecture/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Controller Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture-internals/reconciliation-flow/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reconciliation Flow
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture-internals/authentication-internals/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Authentication Internals
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_6_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_6_4" id="__nav_6_4_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contributing
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_6_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6_4">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -2043,6 +2437,42 @@
   
 
       </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../contributing/release-strategy/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Release Strategy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
     </li>
   
 
@@ -2331,6 +2761,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/crds/tenant/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Tenant
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -2373,65 +2831,138 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#backends-at-a-glance" class="md-nav__link">
+  <a href="#bulk-key-revocation" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Backends at a glance
+        Bulk Key Revocation
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Bulk Key Revocation">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#revoking-all-keys-for-a-user" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Revoking All Keys for a User
       
     </span>
   </a>
   
 </li>
-      
-        <li class="md-nav__item">
-  <a href="#standard-vs-maas-gateway" class="md-nav__link">
+        
+          <li class="md-nav__item">
+  <a href="#use-cases" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Standard vs MaaS gateway
+        Use Cases
       
     </span>
   </a>
   
 </li>
+        
+      </ul>
+    </nav>
+  
+</li>
       
         <li class="md-nav__item">
-  <a href="#prerequisites" class="md-nav__link">
+  <a href="#group-membership-changes" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Prerequisites
+        Group Membership Changes
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Group Membership Changes">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#when-to-revoke-keys" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When to Revoke Keys
       
     </span>
   </a>
   
 </li>
+        
+      </ul>
+    </nav>
+  
+</li>
       
         <li class="md-nav__item">
-  <a href="#configure-the-gateway-reference" class="md-nav__link">
+  <a href="#ephemeral-key-cleanup" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Configure the gateway reference
+        Ephemeral Key Cleanup
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Ephemeral Key Cleanup">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#how-it-works" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How It Works
       
     </span>
   </a>
   
 </li>
-      
-        <li class="md-nav__item">
-  <a href="#maasmodelref-metadata-optional" class="md-nav__link">
+        
+          <li class="md-nav__item">
+  <a href="#grace-period" class="md-nav__link">
     <span class="md-ellipsis">
       
-        MaaSModelRef metadata (optional)
+        Grace Period
       
     </span>
   </a>
   
 </li>
-      
-        <li class="md-nav__item">
-  <a href="#update-an-existing-llminferenceservice" class="md-nav__link">
+        
+          <li class="md-nav__item">
+  <a href="#security" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Update an existing LLMInferenceService
+        Security
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#troubleshooting-cleanup" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Troubleshooting Cleanup
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#related-documentation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Related Documentation
       
     </span>
   </a>
@@ -2458,105 +2989,79 @@
   
 
 
-<h1 id="on-cluster-models">On-cluster models</h1>
-<p>This page covers <strong>on-cluster models</strong>: point an <strong>LLMInferenceService</strong> at <strong><code>maas-default-gateway</code></strong> so traffic uses MaaS authentication, subscriptions, and rate limits. For end-to-end samples (LLMInferenceService + MaaSModelRef + policies), see <a href="../../install/model-setup/">Deploy sample models</a>.</p>
-<p><strong>Related topics (canonical detail elsewhere):</strong></p>
-<ul>
-<li>Catalog and <strong><code>GET /v1/models</code></strong> behavior: <a href="../model-listing-flow/">Model listing flow</a></li>
-<li><strong><code>spec.modelRef</code> kinds</strong> (<code>LLMInferenceService</code>, <code>ExternalModel</code>): <a href="../maas-model-kinds/">MaaSModelRef kinds</a></li>
-<li>Access and quotas: <a href="../quota-and-access-configuration/">Quota and Access Configuration</a></li>
-</ul>
-<div class="admonition tip">
-<p class="admonition-title">Subscription model</p>
-<p>Model access and rate limits use <strong>MaaSModelRef</strong>, <strong>MaaSAuthPolicy</strong>, and <strong>MaaSSubscription</strong>. See <a href="../../concepts/subscription-overview/">Access and Quota Overview</a>.</p>
-</div>
-<h2 id="backends-at-a-glance">Backends at a glance</h2>
-<p>On-cluster models typically use <strong>LLMInferenceService</strong> (for example vLLM via KServe). For <strong>off-cluster</strong> providers, see <a href="../external-models/">External models</a>. See <a href="../maas-model-kinds/">MaaSModelRef kinds</a> for field semantics.</p>
-<h2 id="standard-vs-maas-gateway">Standard vs MaaS gateway</h2>
-<p>MaaS uses a <strong>separate</strong> Gateway API instance for policy enforcement. Only workloads attached to <strong><code>maas-default-gateway</code></strong> participate in MaaS listing (via <strong>MaaSModelRef</strong>), API keys, and subscription limits. The default KServe/ODH gateway path does not apply those policies.</p>
-<p>The diagram summarizes the split; for platform-wide context see <a href="../../concepts/architecture/">Architecture</a>.</p>
-<pre class="mermaid"><code>graph TB
-    subgraph cluster["OpenShift/K8s Cluster"]
-        subgraph gateways["Gateway Layer"]
-            defaultGW["Default Gateway ODH/KServe"]
-            maasGW["MaaS gateway maas-default-gateway"]
-        end
-
-        subgraph models["Model Deployments"]
-            standardModel["LLMInferenceService standard"]
-            maasModel["LLMInferenceService MaaS-enabled router.gateway.refs"]
-        end
-
-        defaultGW -.-&gt;|routes| standardModel
-        maasGW --&gt;|routes| maasModel
-    end
-
-    users["Users"] --&gt;|ODH auth| defaultGW
-    apiUsers["API clients"] --&gt;|Bearer token| maasGW</code></pre>
-<div class="admonition note">
-<p class="admonition-title">Note</p>
-<p><strong><code>maas-default-gateway</code></strong> is created during MaaS installation; you do not create it by hand for normal setups.</p>
-</div>
-<h2 id="prerequisites">Prerequisites</h2>
-<ul>
-<li>MaaS installed with <strong><code>maas-default-gateway</code></strong></li>
-<li>An <strong>LLMInferenceService</strong> to configure (or plan to create one)</li>
-<li>Permissions to edit <strong>LLMInferenceService</strong> in the target namespace</li>
-</ul>
-<h2 id="configure-the-gateway-reference">Configure the gateway reference</h2>
-<p>Set <strong><code>spec.router.gateway.refs</code></strong> so the inference route attaches to <strong><code>maas-default-gateway</code></strong> in <strong><code>openshift-ingress</code></strong>. Without this, KServe uses the default gateway and <strong>MaaS policies do not apply</strong>.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">serving.kserve.io/v1alpha1</span>
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">LLMInferenceService</span>
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="nt">metadata</span><span class="p">:</span>
-<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">my-production-model</span>
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="w">  </span><span class="nt">namespace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">llm</span>
-<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="nt">spec</span><span class="p">:</span>
-<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="w">  </span><span class="nt">model</span><span class="p">:</span>
-<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="w">    </span><span class="nt">uri</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">hf://Qwen/Qwen3-0.6B</span>
-<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Qwen/Qwen3-0.6B</span>
-<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="w">  </span><span class="nt">replicas</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
-<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="w">  </span><span class="nt">router</span><span class="p">:</span>
-<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="w">    </span><span class="nt">route</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="w"> </span><span class="p p-Indicator">}</span>
-<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a><span class="w">    </span><span class="nt">gateway</span><span class="p">:</span>
-<a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a><span class="w">      </span><span class="nt">refs</span><span class="p">:</span>
-<a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a><span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">maas-default-gateway</span>
-<a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a><span class="w">          </span><span class="nt">namespace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">openshift-ingress</span>
-<a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a><span class="w">  </span><span class="nt">template</span><span class="p">:</span>
-<a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a><span class="w">    </span><span class="c1"># ... your container / resources ...</span>
+<h1 id="api-key-administration">API Key Administration</h1>
+<p>This guide covers administrative operations for managing API keys across the MaaS platform.</p>
+<h2 id="bulk-key-revocation">Bulk Key Revocation</h2>
+<p>Platform administrators can revoke API keys for any user, which is useful for security incidents or offboarding.</p>
+<h3 id="revoking-all-keys-for-a-user">Revoking All Keys for a User</h3>
+<p>Send a <code>POST</code> request to <code>/v1/api-keys/bulk-revoke</code> with the target username:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>curl<span class="w"> </span>-sS<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">MAAS_API_URL</span><span class="si">}</span><span class="s2">/maas-api/v1/api-keys/bulk-revoke&quot;</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="k">$(</span>oc<span class="w"> </span>whoami<span class="w"> </span>-t<span class="k">)</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;username&quot;: &quot;alice&quot;}&#39;</span>
 </code></pre></div>
-<p>GPU, image, and resource blocks vary by model; see <a href="../../install/model-setup/">Deploy sample models</a> for full samples.</p>
+<p>This updates the status of all API keys belonging to the specified user to <code>revoked</code> in the database. The next validation request for any of those keys will reject them. Authorino may cache validation results briefly; revocation is effective as soon as the cache expires.</p>
 <div class="admonition warning">
-<p class="admonition-title">Legacy tier annotation</p>
-<p>The annotation <strong><code>alpha.maas.opendatahub.io/tiers</code></strong> applied to <strong>LLMInferenceService</strong> was part of the <strong>legacy tier-based</strong> access model (automatic tier RBAC). Current deployments should use <strong>MaaSSubscription</strong> and <strong>MaaSAuthPolicy</strong> instead. If you still maintain tier annotations, see <a href="../../migration/tier-to-subscription/">Tier to Subscription migration</a>.</p>
+<p class="admonition-title">Administrative privilege required</p>
+<p>Only administrators with appropriate permissions can revoke other users' keys. Regular users can only revoke their own keys via <code>DELETE /v1/api-keys/{id}</code>.</p>
 </div>
-<h2 id="maasmodelref-metadata-optional">MaaSModelRef metadata (optional)</h2>
-<p>After the LLMInferenceService uses the MaaS gateway, register it with a <strong>MaaSModelRef</strong> and optional display annotations for <strong><code>GET /v1/models</code></strong>. See <a href="../crd-annotations/">CRD annotations</a> for the full list.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">maas.opendatahub.io/v1alpha1</span>
-<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">MaaSModelRef</span>
-<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="nt">metadata</span><span class="p">:</span>
-<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">my-production-model</span>
-<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="w">  </span><span class="nt">namespace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">llm</span>
-<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="w">  </span><span class="nt">annotations</span><span class="p">:</span>
-<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="w">    </span><span class="nt">openshift.io/display-name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;My</span><span class="nv"> </span><span class="s">Production</span><span class="nv"> </span><span class="s">Model&quot;</span>
-<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="nt">spec</span><span class="p">:</span>
-<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="w">  </span><span class="nt">modelRef</span><span class="p">:</span>
-<a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="w">    </span><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">LLMInferenceService</span>
-<a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">my-production-model</span>
+<h3 id="use-cases">Use Cases</h3>
+<ul>
+<li><strong>Security incident response</strong>: Immediately cut off access for a compromised account</li>
+<li><strong>User offboarding</strong>: Revoke all keys when a user leaves the organization</li>
+<li><strong>Policy enforcement</strong>: Revoke keys that violate usage policies</li>
+</ul>
+<hr />
+<h2 id="group-membership-changes">Group Membership Changes</h2>
+<p>API keys store the user's group membership at creation time. When a user's groups change (role changes, offboarding, etc.), their existing API keys retain the old group membership and permissions until revoked.</p>
+<h3 id="when-to-revoke-keys">When to Revoke Keys</h3>
+<p>Revoke all keys for a user immediately when:</p>
+<ul>
+<li><strong>User leaves the organization</strong> - Offboarding requires immediate revocation</li>
+<li><strong>Role or group changes</strong> - User moves to a different team or loses access to certain models</li>
+<li><strong>Security incident</strong> - Compromised credentials or unauthorized access detected</li>
+</ul>
+<p>Use the bulk revoke endpoint to revoke all keys for the affected user, then notify them to create new keys with updated permissions.</p>
+<hr />
+<h2 id="ephemeral-key-cleanup">Ephemeral Key Cleanup</h2>
+<p>Expired ephemeral keys are automatically deleted from the database by a <strong>CronJob</strong> (<code>maas-api-key-cleanup</code>) that runs every 15 minutes. This prevents unbounded accumulation of expired short-lived credentials.</p>
+<h3 id="how-it-works">How It Works</h3>
+<ol>
+<li>The CronJob sends <code>POST /internal/v1/api-keys/cleanup</code> to the maas-api Service</li>
+<li>The endpoint deletes ephemeral keys that expired <strong>more than 30 minutes ago</strong> (grace period)</li>
+<li>Regular (non-ephemeral) keys are <strong>never</strong> deleted by cleanup — they remain until manually revoked</li>
+</ol>
+<h3 id="grace-period">Grace Period</h3>
+<p>A 30-minute grace period after expiration ensures that recently-expired keys are not deleted while in-flight requests may still reference them. Only keys expired for longer than 30 minutes are removed.</p>
+<h3 id="security">Security</h3>
+<p>The cleanup endpoint is cluster-internal only:</p>
+<ul>
+<li>It is registered under <code>/internal/v1/</code> and is <strong>not exposed</strong> on the external Service or Route</li>
+<li>A <code>NetworkPolicy</code> (<code>maas-api-cleanup-restrict</code>) restricts cleanup pods to communicate only with <code>maas-api:8080</code> and DNS</li>
+<li>No authentication is required on the endpoint itself — access control is enforced at the network layer</li>
+</ul>
+<h3 id="troubleshooting-cleanup">Troubleshooting Cleanup</h3>
+<p><strong>Check CronJob status:</strong></p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>oc<span class="w"> </span>get<span class="w"> </span>cronjob<span class="w"> </span>maas-api-key-cleanup<span class="w"> </span>-n<span class="w"> </span>&lt;namespace&gt;
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>oc<span class="w"> </span>get<span class="w"> </span><span class="nb">jobs</span><span class="w"> </span>-n<span class="w"> </span>&lt;namespace&gt;<span class="w"> </span>-l<span class="w"> </span><span class="nv">app</span><span class="o">=</span>maas-api-cleanup<span class="w"> </span>--sort-by<span class="o">=</span>.metadata.creationTimestamp
 </code></pre></div>
-<h2 id="update-an-existing-llminferenceservice">Update an existing LLMInferenceService</h2>
-<p><strong>Patch:</strong></p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>kubectl<span class="w"> </span>patch<span class="w"> </span>llminferenceservice<span class="w"> </span>my-production-model<span class="w"> </span>-n<span class="w"> </span>llm<span class="w"> </span>--type<span class="o">=</span><span class="s1">&#39;json&#39;</span><span class="w"> </span>-p<span class="o">=</span><span class="s1">&#39;[</span>
-<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="s1">  {</span>
-<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="s1">    &quot;op&quot;: &quot;add&quot;,</span>
-<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="s1">    &quot;path&quot;: &quot;/spec/router/gateway/refs/-&quot;,</span>
-<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="s1">    &quot;value&quot;: {</span>
-<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="s1">      &quot;name&quot;: &quot;maas-default-gateway&quot;,</span>
-<a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a><span class="s1">      &quot;namespace&quot;: &quot;openshift-ingress&quot;</span>
-<a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="s1">    }</span>
-<a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="s1">  }</span>
-<a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="s1">]&#39;</span>
+<p><strong>View cleanup logs:</strong></p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="c1"># Latest CronJob run</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>oc<span class="w"> </span>logs<span class="w"> </span>job/<span class="k">$(</span>oc<span class="w"> </span>get<span class="w"> </span><span class="nb">jobs</span><span class="w"> </span>-n<span class="w"> </span>&lt;namespace&gt;<span class="w"> </span>-l<span class="w"> </span><span class="nv">app</span><span class="o">=</span>maas-api-cleanup<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">  </span>--sort-by<span class="o">=</span>.metadata.creationTimestamp<span class="w"> </span>-o<span class="w"> </span><span class="nv">jsonpath</span><span class="o">=</span><span class="s1">&#39;{.items[-1].metadata.name}&#39;</span><span class="k">)</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="w">  </span>-n<span class="w"> </span>&lt;namespace&gt;
 </code></pre></div>
-<p>Or <strong><code>kubectl edit llminferenceservice my-production-model -n llm</code></strong> and set <strong><code>spec.router.gateway.refs</code></strong> as in the YAML above.</p>
+<p><strong>Manually trigger cleanup</strong> (from an allowed pod or via oc exec):</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>oc<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>deploy/maas-api<span class="w"> </span>-n<span class="w"> </span>&lt;namespace&gt;<span class="w"> </span>--<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">  </span>curl<span class="w"> </span>-sf<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/internal/v1/api-keys/cleanup
+</code></pre></div>
+<p>Response: <code>{"deletedCount": N, "message": "Successfully deleted N expired ephemeral key(s)"}</code></p>
+<hr />
+<h2 id="related-documentation">Related Documentation</h2>
+<ul>
+<li><strong><a href="../../user-guide/api-key-management/">API Key Management</a></strong>: User guide for creating and managing API keys</li>
+<li><strong><a href="../quota-and-access-configuration/">Quota and Access Configuration</a></strong>: Subscription setup and access control</li>
+</ul>
 
 
 
@@ -2579,7 +3084,7 @@
     <span class="md-icon" title="Last update">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M21 13.1c-.1 0-.3.1-.4.2l-1 1 2.1 2.1 1-1c.2-.2.2-.6 0-.8l-1.3-1.3c-.1-.1-.2-.2-.4-.2m-1.9 1.8-6.1 6V23h2.1l6.1-6.1zM12.5 7v5.2l4 2.4-1 1L11 13V7zM11 21.9c-5.1-.5-9-4.8-9-9.9C2 6.5 6.5 2 12 2c5.3 0 9.6 4.1 10 9.3-.3-.1-.6-.2-1-.2s-.7.1-1 .2C19.6 7.2 16.2 4 12 4c-4.4 0-8 3.6-8 8 0 4.1 3.1 7.5 7.1 7.9l-.1.2z"/></svg>
     </span>
-    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-date" title="April 17, 2026 02:14:44 UTC">April 17, 2026</span>
+    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-date" title="May 7, 2026 14:37:02 UTC">May 7, 2026</span>
   </span>
 
     
@@ -2589,7 +3094,7 @@
     <span class="md-icon" title="Created">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M14.47 15.08 11 13V7h1.5v5.25l3.08 1.83c-.41.28-.79.62-1.11 1m-1.39 4.84c-.36.05-.71.08-1.08.08-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8c0 .37-.03.72-.08 1.08.69.1 1.33.32 1.92.64.1-.56.16-1.13.16-1.72 0-5.5-4.5-10-10-10S2 6.5 2 12s4.47 10 10 10c.59 0 1.16-.06 1.72-.16-.32-.59-.54-1.23-.64-1.92M18 15v3h-3v2h3v3h2v-3h3v-2h-3v-3z"/></svg>
     </span>
-    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-date" title="April 17, 2026 02:14:44 UTC">April 17, 2026</span>
+    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-date" title="April 29, 2026 19:59:56 UTC">April 29, 2026</span>
   </span>
 
     

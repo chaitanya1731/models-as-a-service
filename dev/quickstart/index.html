@@ -11,7 +11,7 @@
         <link rel="canonical" href="https://opendatahub-io.github.io/models-as-a-service/dev/quickstart/">
       
       
-        <link rel="prev" href="../concepts/model-reference/">
+        <link rel="prev" href="../concepts/model-access-control/">
       
       
         <link rel="next" href="../install/prerequisites/">
@@ -325,7 +325,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../user-guide/self-service-model-access/" class="md-tabs__link">
+        <a href="../user-guide/api-key-management/" class="md-tabs__link">
           
   
   
@@ -345,11 +345,11 @@
     
     
       <li class="md-tabs__item">
-        <a href="../contributing/testing-guide/" class="md-tabs__link">
+        <a href="../architecture-internals/controller-architecture/" class="md-tabs__link">
           
   
   
-  Contributing
+  Developer Guide
 
         </a>
       </li>
@@ -613,6 +613,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../migration/upgrade-to-3.4/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Upgrade to 3.4
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -794,6 +822,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/api-key-authentication/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    API Key Authentication
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/model-access-control/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Model Access Control
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -929,17 +1013,6 @@
     <span class="md-ellipsis">
       
         Prerequisites
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#configure-authorino-tls" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Configure Authorino TLS
       
     </span>
   </a>
@@ -1225,7 +1298,35 @@
   <span class="md-ellipsis">
     
   
-    Model Setup (On Cluster)
+    Model Setup
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../install/external-model-setup/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    External Model Setup (Tech Preview)
   
 
     
@@ -1453,14 +1554,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../configuration-and-management/token-management/" class="md-nav__link">
+      <a href="../configuration-and-management/api-key-administration/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Token Management
+    API Key Administration
   
 
     
@@ -1509,6 +1610,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../configuration-and-management/troubleshooting-external-model-rbac/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Troubleshooting ExternalModel RBAC
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../configuration-and-management/tls-configuration/" class="md-nav__link">
         
   
@@ -1537,14 +1666,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../configuration-and-management/subscription-known-issues/" class="md-nav__link">
+      <a href="../configuration-and-management/gateway-patterns/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Subscription limitations & known issues
+    Gateway Patterns
   
 
     
@@ -1634,7 +1763,7 @@
   <span class="md-ellipsis">
     
   
-    Model Setup (On Cluster)
+    Model Setup
   
 
     
@@ -1663,34 +1792,6 @@
     
   
     Model Listing Flow
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../configuration-and-management/maas-model-kinds/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    MaaS Model Kinds
   
 
     
@@ -1744,7 +1845,7 @@
   <span class="md-ellipsis">
     
   
-    MaaS Controller
+    Advanced Administration
   
 
     
@@ -1757,124 +1858,6 @@
         
         <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_3_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_4_3">
-            <span class="md-nav__icon md-icon"></span>
-            
-  
-    MaaS Controller
-  
-
-          </label>
-          <ul class="md-nav__list" data-md-scrollfix>
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../configuration-and-management/maas-controller-overview/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Controller Overview
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../configuration-and-management/crd-annotations/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    CRD Annotations
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-          </ul>
-        </nav>
-      
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    
-    
-    
-    
-      
-      
-        
-      
-    
-    
-    <li class="md-nav__item md-nav__item--nested">
-      
-        
-        
-          
-        
-        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_4" >
-        
-          
-          <label class="md-nav__link" for="__nav_4_4" id="__nav_4_4_label" tabindex="0">
-            
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Advanced Administration
-  
-
-    
-  </span>
-  
-  
-
-            <span class="md-nav__icon md-icon"></span>
-          </label>
-        
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_4_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_4_4">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -1898,35 +1881,7 @@
   <span class="md-ellipsis">
     
   
-    Observability
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../advanced-administration/limitador-persistence/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Limitador Persistence
+    Observability Dashboard
   
 
     
@@ -1955,6 +1910,34 @@
     
   
     Subscription Cardinality
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../advanced-administration/limitador-persistence/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Limitador Persistence
   
 
     
@@ -2072,14 +2055,70 @@
   
   
     <li class="md-nav__item">
-      <a href="../user-guide/self-service-model-access/" class="md-nav__link">
+      <a href="../user-guide/api-key-management/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Self Service Model Access
+    API Key Management
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user-guide/model-discovery/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Model Discovery
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user-guide/inference/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Inference
   
 
     
@@ -2132,7 +2171,7 @@
   <span class="md-ellipsis">
     
   
-    Contributing
+    Developer Guide
   
 
     
@@ -2145,6 +2184,144 @@
         
         <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Developer Guide
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../architecture-internals/controller-architecture/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Controller Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../architecture-internals/reconciliation-flow/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reconciliation Flow
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../architecture-internals/authentication-internals/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Authentication Internals
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_6_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_6_4" id="__nav_6_4_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contributing
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_6_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6_4">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -2177,6 +2354,42 @@
   
 
       </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../contributing/release-strategy/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Release Strategy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
     </li>
   
 
@@ -2465,6 +2678,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/crds/tenant/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Tenant
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -2511,17 +2752,6 @@
     <span class="md-ellipsis">
       
         Prerequisites
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#configure-authorino-tls" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Configure Authorino TLS
       
     </span>
   </a>
@@ -2610,16 +2840,6 @@
 <li><strong>Recommended</strong> 16 vCPUs, 32GB RAM, 100GB storage</li>
 </ul>
 </li>
-<li><strong>ODH/RHOAI requirements</strong>:<ul>
-<li>RHOAI 3.0 +</li>
-<li>ODH 3.0 +</li>
-</ul>
-</li>
-<li><strong>RHCL requirements</strong> (Note: This can be installed automatically by the script below):<ul>
-<li>RHCL 1.2 +</li>
-</ul>
-</li>
-<li><strong>Authorino TLS</strong>: Listener TLS must be enabled on Authorino (see <a href="#configure-authorino-tls">Configure Authorino TLS</a>)</li>
 <li><strong>Cluster admin</strong> or equivalent permissions</li>
 <li><strong>Required tools</strong>:<ul>
 <li><code>oc</code> (OpenShift CLI)</li>
@@ -2630,16 +2850,6 @@
 </ul>
 </li>
 </ul>
-<h2 id="configure-authorino-tls">Configure Authorino TLS</h2>
-<p>Before deploying MaaS, Authorino's listener TLS must be enabled. This is a platform prerequisite for secure <code>LLMInferenceService</code> communication:</p>
-<ul>
-<li><strong>Gateway → Authorino (Listener TLS)</strong>: Enable TLS on Authorino's gRPC listener for incoming authentication requests</li>
-</ul>
-<p>For step-by-step commands, see <a href="../configuration-and-management/tls-configuration/#authorino-tls-configuration">TLS Configuration: Authorino TLS Configuration</a>.</p>
-<div class="admonition tip">
-<p class="admonition-title">Automated configuration</p>
-<p>The <code>deploy.sh</code> script automatically configures all remaining TLS settings after deployment, including Gateway TLS bootstrap and Authorino → maas-api outbound TLS.</p>
-</div>
 <h2 id="quick-start">Quick Start</h2>
 <h3 id="automated-openshift-deployment">Automated OpenShift Deployment</h3>
 <p>For OpenShift clusters, use the unified automated deployment script. Choose your deployment method:</p>
@@ -2692,12 +2902,13 @@ to use the new release tag when a release is created. Use <code>"main"</code> on
 <p>The deployment script creates the following core resources:</p>
 <ul>
 <li><strong>Gateway</strong>: <code>maas-default-gateway</code> in <code>openshift-ingress</code> namespace</li>
-<li><strong>HTTPRoutes</strong>: <code>maas-api-route</code> in the <code>redhat-ods-applications</code> namespace (deployed by operator)</li>
+<li><strong>HTTPRoutes</strong>: <code>maas-api-route</code> in the application namespace (deployed by Tenant reconciler)</li>
 <li><strong>Policies</strong>:</li>
-<li><code>maas-api-auth-policy</code> (deployed by operator) - Protects MaaS API</li>
-<li><code>gateway-auth-policy</code> (deployed by script) - Protects Gateway/model inference</li>
-<li><code>TokenRateLimitPolicy</code>, <code>RateLimitPolicy</code> (deployed by script) - Usage limits</li>
-<li><strong>MaaS API</strong>: Deployment and service in <code>redhat-ods-applications</code> namespace (deployed by operator)</li>
+<li><code>maas-api-auth-policy</code> (deployed by Tenant reconciler) - Protects MaaS API</li>
+<li><code>gateway-default-auth</code> (deployed by Tenant reconciler) - Denies unauthenticated traffic</li>
+<li><code>gateway-default-deny</code> (deployed by Tenant reconciler) - Denies unsubscribed traffic</li>
+<li><strong>MaaS API</strong>: Deployment and service in the application namespace (deployed by Tenant reconciler)</li>
+<li><strong>Tenant CR</strong>: <code>default-tenant</code> in <code>models-as-a-service</code> namespace (self-bootstrapped by maas-controller)</li>
 <li><strong>Operators</strong>: Cert-manager, LWS, Red Hat Connectivity Link and Red Hat OpenShift AI.</li>
 </ul>
 <p>Check deployment status:</p>
@@ -2712,24 +2923,24 @@ to use the new release tag when a release is created. Use <code>"main"</code> on
 <a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>kubectl<span class="w"> </span>get<span class="w"> </span>tokenratelimitpolicy<span class="w"> </span>-A
 <a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>kubectl<span class="w"> </span>get<span class="w"> </span>ratelimitpolicy<span class="w"> </span>-A
 <a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a>
-<a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="c1"># Check MaaS API (deployed by operator in redhat-ods-applications)</span>
-<a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a>kubectl<span class="w"> </span>get<span class="w"> </span>pods<span class="w"> </span>-n<span class="w"> </span>redhat-ods-applications<span class="w"> </span>-l<span class="w"> </span>app.kubernetes.io/name<span class="o">=</span>maas-api
-<a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a>kubectl<span class="w"> </span>get<span class="w"> </span>svc<span class="w"> </span>-n<span class="w"> </span>redhat-ods-applications<span class="w"> </span>maas-api
-<a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a>
-<a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a><span class="c1"># Check Kuadrant operators</span>
-<a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a>kubectl<span class="w"> </span>get<span class="w"> </span>pods<span class="w"> </span>-n<span class="w"> </span>kuadrant-system
-<a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a>
-<a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a><span class="c1"># Check RHOAI/KServe</span>
-<a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a>kubectl<span class="w"> </span>get<span class="w"> </span>pods<span class="w"> </span>-n<span class="w"> </span>kserve
-<a id="__codelineno-2-21" name="__codelineno-2-21" href="#__codelineno-2-21"></a>kubectl<span class="w"> </span>get<span class="w"> </span>pods<span class="w"> </span>-n<span class="w"> </span>redhat-ods-applications
+<a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="c1"># Check MaaS API (deployed by Tenant reconciler in the application namespace)</span>
+<a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="c1"># APP_NS is &quot;opendatahub&quot; for ODH or &quot;redhat-ods-applications&quot; for RHOAI</span>
+<a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a>kubectl<span class="w"> </span>get<span class="w"> </span>pods<span class="w"> </span>-n<span class="w"> </span><span class="si">${</span><span class="nv">APP_NS</span><span class="si">}</span><span class="w"> </span>-l<span class="w"> </span>app.kubernetes.io/name<span class="o">=</span>maas-api
+<a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a>kubectl<span class="w"> </span>get<span class="w"> </span>svc<span class="w"> </span>-n<span class="w"> </span><span class="si">${</span><span class="nv">APP_NS</span><span class="si">}</span><span class="w"> </span>maas-api
+<a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a>
+<a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a><span class="c1"># Check Kuadrant operators</span>
+<a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a>kubectl<span class="w"> </span>get<span class="w"> </span>pods<span class="w"> </span>-n<span class="w"> </span>kuadrant-system
+<a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a>
+<a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a><span class="c1"># Check Tenant CR</span>
+<a id="__codelineno-2-21" name="__codelineno-2-21" href="#__codelineno-2-21"></a>kubectl<span class="w"> </span>get<span class="w"> </span>tenant<span class="w"> </span>default-tenant<span class="w"> </span>-n<span class="w"> </span>models-as-a-service
+<a id="__codelineno-2-22" name="__codelineno-2-22" href="#__codelineno-2-22"></a>
+<a id="__codelineno-2-23" name="__codelineno-2-23" href="#__codelineno-2-23"></a><span class="c1"># Check RHOAI/KServe</span>
+<a id="__codelineno-2-24" name="__codelineno-2-24" href="#__codelineno-2-24"></a>kubectl<span class="w"> </span>get<span class="w"> </span>pods<span class="w"> </span>-n<span class="w"> </span>kserve
+<a id="__codelineno-2-25" name="__codelineno-2-25" href="#__codelineno-2-25"></a>kubectl<span class="w"> </span>get<span class="w"> </span>pods<span class="w"> </span>-n<span class="w"> </span><span class="si">${</span><span class="nv">APP_NS</span><span class="si">}</span>
 </code></pre></div>
-<div class="admonition tip">
-<p class="admonition-title">TLS Configuration</p>
-<p>TLS is enabled by default. See <a href="../configuration-and-management/tls-configuration/">TLS Configuration</a> for details.</p>
-</div>
 <p>For detailed validation and troubleshooting, see the <a href="../install/validation/">Validation Guide</a>.</p>
 <h2 id="next-steps">Next Steps</h2>
-<p>After deployment, proceed to <a href="../install/model-setup/">Model Setup (On Cluster)</a> to deploy sample models, then <a href="../install/validation/">Validation</a> to test and verify your deployment.</p>
+<p>After deployment, proceed to <a href="../install/model-setup/">Model Setup</a> to deploy sample models, then <a href="../install/validation/">Validation</a> to test and verify your deployment.</p>
 
 
 
@@ -2752,7 +2963,7 @@ to use the new release tag when a release is created. Use <code>"main"</code> on
     <span class="md-icon" title="Last update">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M21 13.1c-.1 0-.3.1-.4.2l-1 1 2.1 2.1 1-1c.2-.2.2-.6 0-.8l-1.3-1.3c-.1-.1-.2-.2-.4-.2m-1.9 1.8-6.1 6V23h2.1l6.1-6.1zM12.5 7v5.2l4 2.4-1 1L11 13V7zM11 21.9c-5.1-.5-9-4.8-9-9.9C2 6.5 6.5 2 12 2c5.3 0 9.6 4.1 10 9.3-.3-.1-.6-.2-1-.2s-.7.1-1 .2C19.6 7.2 16.2 4 12 4c-4.4 0-8 3.6-8 8 0 4.1 3.1 7.5 7.1 7.9l-.1.2z"/></svg>
     </span>
-    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-date" title="March 18, 2026 15:47:11 UTC">March 18, 2026</span>
+    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-date" title="May 1, 2026 20:21:15 UTC">May 1, 2026</span>
   </span>
 
     

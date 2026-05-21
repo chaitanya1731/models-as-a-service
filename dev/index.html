@@ -323,7 +323,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="user-guide/self-service-model-access/" class="md-tabs__link">
+        <a href="user-guide/api-key-management/" class="md-tabs__link">
           
   
   
@@ -343,11 +343,11 @@
     
     
       <li class="md-tabs__item">
-        <a href="contributing/testing-guide/" class="md-tabs__link">
+        <a href="architecture-internals/controller-architecture/" class="md-tabs__link">
           
   
   
-  Contributing
+  Developer Guide
 
         </a>
       </li>
@@ -566,10 +566,21 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#configuration-management" class="md-nav__link">
+  <a href="#user-guide" class="md-nav__link">
     <span class="md-ellipsis">
       
-        ⚙️ Configuration &amp; Management
+        👤 User Guide
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#administration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        ⚙️ Administration
       
     </span>
   </a>
@@ -581,17 +592,6 @@
     <span class="md-ellipsis">
       
         📋 Release Notes
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#advanced-administration" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        🔧 Advanced Administration
       
     </span>
   </a>
@@ -734,6 +734,34 @@
     
   
     Tier to Subscription
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="migration/upgrade-to-3.4/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Upgrade to 3.4
   
 
     
@@ -915,6 +943,62 @@
     
   
     Model Reference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="concepts/api-key-authentication/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    API Key Authentication
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="concepts/model-access-control/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Model Access Control
   
 
     
@@ -1231,7 +1315,35 @@
   <span class="md-ellipsis">
     
   
-    Model Setup (On Cluster)
+    Model Setup
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="install/external-model-setup/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    External Model Setup (Tech Preview)
   
 
     
@@ -1459,14 +1571,14 @@
   
   
     <li class="md-nav__item">
-      <a href="configuration-and-management/token-management/" class="md-nav__link">
+      <a href="configuration-and-management/api-key-administration/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Token Management
+    API Key Administration
   
 
     
@@ -1515,6 +1627,34 @@
   
   
     <li class="md-nav__item">
+      <a href="configuration-and-management/troubleshooting-external-model-rbac/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Troubleshooting ExternalModel RBAC
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="configuration-and-management/tls-configuration/" class="md-nav__link">
         
   
@@ -1543,14 +1683,14 @@
   
   
     <li class="md-nav__item">
-      <a href="configuration-and-management/subscription-known-issues/" class="md-nav__link">
+      <a href="configuration-and-management/gateway-patterns/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Subscription limitations & known issues
+    Gateway Patterns
   
 
     
@@ -1640,7 +1780,7 @@
   <span class="md-ellipsis">
     
   
-    Model Setup (On Cluster)
+    Model Setup
   
 
     
@@ -1669,34 +1809,6 @@
     
   
     Model Listing Flow
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="configuration-and-management/maas-model-kinds/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    MaaS Model Kinds
   
 
     
@@ -1750,7 +1862,7 @@
   <span class="md-ellipsis">
     
   
-    MaaS Controller
+    Advanced Administration
   
 
     
@@ -1763,124 +1875,6 @@
         
         <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_3_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_4_3">
-            <span class="md-nav__icon md-icon"></span>
-            
-  
-    MaaS Controller
-  
-
-          </label>
-          <ul class="md-nav__list" data-md-scrollfix>
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="configuration-and-management/maas-controller-overview/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Controller Overview
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="configuration-and-management/crd-annotations/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    CRD Annotations
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-          </ul>
-        </nav>
-      
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    
-    
-    
-    
-      
-      
-        
-      
-    
-    
-    <li class="md-nav__item md-nav__item--nested">
-      
-        
-        
-          
-        
-        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_4" >
-        
-          
-          <label class="md-nav__link" for="__nav_4_4" id="__nav_4_4_label" tabindex="0">
-            
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Advanced Administration
-  
-
-    
-  </span>
-  
-  
-
-            <span class="md-nav__icon md-icon"></span>
-          </label>
-        
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_4_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_4_4">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -1904,35 +1898,7 @@
   <span class="md-ellipsis">
     
   
-    Observability
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="advanced-administration/limitador-persistence/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Limitador Persistence
+    Observability Dashboard
   
 
     
@@ -1961,6 +1927,34 @@
     
   
     Subscription Cardinality
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="advanced-administration/limitador-persistence/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Limitador Persistence
   
 
     
@@ -2078,14 +2072,70 @@
   
   
     <li class="md-nav__item">
-      <a href="user-guide/self-service-model-access/" class="md-nav__link">
+      <a href="user-guide/api-key-management/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Self Service Model Access
+    API Key Management
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="user-guide/model-discovery/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Model Discovery
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="user-guide/inference/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Inference
   
 
     
@@ -2138,7 +2188,7 @@
   <span class="md-ellipsis">
     
   
-    Contributing
+    Developer Guide
   
 
     
@@ -2151,6 +2201,144 @@
         
         <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Developer Guide
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="architecture-internals/controller-architecture/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Controller Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="architecture-internals/reconciliation-flow/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reconciliation Flow
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="architecture-internals/authentication-internals/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Authentication Internals
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_6_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_6_4" id="__nav_6_4_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contributing
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_6_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6_4">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -2183,6 +2371,42 @@
   
 
       </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="contributing/release-strategy/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Release Strategy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
     </li>
   
 
@@ -2471,6 +2695,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="reference/crds/tenant/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Tenant
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -2536,10 +2788,21 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#configuration-management" class="md-nav__link">
+  <a href="#user-guide" class="md-nav__link">
     <span class="md-ellipsis">
       
-        ⚙️ Configuration &amp; Management
+        👤 User Guide
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#administration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        ⚙️ Administration
       
     </span>
   </a>
@@ -2551,17 +2814,6 @@
     <span class="md-ellipsis">
       
         📋 Release Notes
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#advanced-administration" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        🔧 Advanced Administration
       
     </span>
   </a>
@@ -2625,29 +2877,31 @@
 <li><strong><a href="quickstart/">QuickStart Guide</a></strong> - Complete platform deployment instructions</li>
 <li><strong><a href="concepts/architecture/">Architecture</a></strong> - Overview of the MaaS Platform architecture</li>
 </ul>
-<h3 id="configuration-management">⚙️ Configuration &amp; Management</h3>
+<h3 id="user-guide">👤 User Guide</h3>
 <ul>
-<li><strong><a href="concepts/subscription-overview/">Access and Quota Overview</a></strong> - Policies (access) and subscriptions (quota) for model access</li>
-<li><strong><a href="configuration-and-management/subscription-known-issues/">Subscription limitations and known issues</a></strong> - Rate limits on shared routes, API keys, caching, and other planning notes</li>
-<li><strong><a href="configuration-and-management/model-setup/">Model Setup (On Cluster)</a></strong> - Setting up models for MaaS</li>
-<li><strong><a href="user-guide/self-service-model-access/">Self-Service Model Access</a></strong> - Managing model access and policies</li>
+<li><strong><a href="user-guide/api-key-management/">API Key Management</a></strong> - Creating and managing API keys</li>
+<li><strong><a href="user-guide/model-discovery/">Model Discovery</a></strong> - Listing available models</li>
+<li><strong><a href="user-guide/inference/">Inference</a></strong> - Making inference requests</li>
+</ul>
+<h3 id="administration">⚙️ Administration</h3>
+<ul>
+<li><strong><a href="concepts/subscription-overview/">Access and Quota Overview</a></strong> - Configuring policies and subscriptions</li>
+<li><strong><a href="configuration-and-management/model-setup/">Model Setup</a></strong> - Setting up models for MaaS</li>
+<li><strong><a href="configuration-and-management/api-key-administration/">API Key Administration</a></strong> - Bulk revocation and cleanup</li>
+<li><strong><a href="advanced-administration/observability/">Observability</a></strong> - Monitoring, metrics, and dashboards</li>
+<li><strong><a href="advanced-administration/limitador-persistence/">Limitador Persistence</a></strong> - Redis backend for rate-limit counters</li>
+<li><strong><a href="configuration-and-management/tls-configuration/">TLS Configuration</a></strong> - Configuring TLS</li>
+<li><strong><a href="configuration-and-management/gateway-patterns/">Gateway Patterns</a></strong> - Curated Gateway API deployment patterns</li>
 </ul>
 <h3 id="release-notes">📋 Release Notes</h3>
 <ul>
 <li><strong><a href="release-notes/">Release notes</a></strong> - Version highlights and known limitations by release</li>
 </ul>
-<h3 id="advanced-administration">🔧 Advanced Administration</h3>
-<ul>
-<li><strong><a href="advanced-administration/observability/">Observability</a></strong> - Monitoring, metrics, and dashboards</li>
-<li><strong><a href="advanced-administration/limitador-persistence/">Limitador Persistence</a></strong> - Redis backend for persistent rate-limit counters</li>
-<li><strong><a href="configuration-and-management/tls-configuration/">TLS Configuration</a></strong> - Configuring TLS for MaaS API, Authorino, and Gateway</li>
-<li><strong><a href="configuration-and-management/token-management/">Token Management</a></strong> - Token authentication system and lifecycle</li>
-</ul>
 <h3 id="installation-guide">📖 Installation Guide</h3>
 <ul>
-<li><strong><a href="install/prerequisites/">Prerequisites</a></strong> - Requirements and database setup</li>
+<li><strong><a href="install/prerequisites/">Prerequisites</a></strong> - Requirements, database setup, observability and GenAI Studio prerequisites</li>
 <li><strong><a href="install/platform-setup/">Platform Setup</a></strong> - Install ODH/RHOAI with MaaS</li>
-<li><strong><a href="install/maas-setup/">MaaS Setup</a></strong> - Gateway AuthPolicy and policies</li>
+<li><strong><a href="install/maas-setup/">MaaS Setup</a></strong> - Gateway, DataScienceCluster, OdhDashboardConfig feature flags</li>
 <li><strong><a href="install/validation/">Validation</a></strong> - Verify your deployment</li>
 </ul>
 <h3 id="migration">🔄 Migration</h3>
@@ -2676,7 +2930,7 @@
     <span class="md-icon" title="Last update">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M21 13.1c-.1 0-.3.1-.4.2l-1 1 2.1 2.1 1-1c.2-.2.2-.6 0-.8l-1.3-1.3c-.1-.1-.2-.2-.4-.2m-1.9 1.8-6.1 6V23h2.1l6.1-6.1zM12.5 7v5.2l4 2.4-1 1L11 13V7zM11 21.9c-5.1-.5-9-4.8-9-9.9C2 6.5 6.5 2 12 2c5.3 0 9.6 4.1 10 9.3-.3-.1-.6-.2-1-.2s-.7.1-1 .2C19.6 7.2 16.2 4 12 4c-4.4 0-8 3.6-8 8 0 4.1 3.1 7.5 7.1 7.9l-.1.2z"/></svg>
     </span>
-    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-date" title="April 17, 2026 02:14:44 UTC">April 17, 2026</span>
+    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-date" title="May 4, 2026 14:06:51 UTC">May 4, 2026</span>
   </span>
 
     
