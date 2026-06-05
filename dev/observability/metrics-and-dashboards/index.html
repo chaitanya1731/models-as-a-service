@@ -8,31 +8,31 @@
       
       
       
-        <link rel="canonical" href="https://opendatahub-io.github.io/models-as-a-service/dev/reference/crds/maas-model-ref/">
+        <link rel="canonical" href="https://opendatahub-io.github.io/models-as-a-service/dev/observability/metrics-and-dashboards/">
       
       
-        <link rel="prev" href="../../api-reference/">
+        <link rel="prev" href="../setup/">
       
       
-        <link rel="next" href="../external-model/">
+        <link rel="next" href="../operations/">
       
       
         
       
       
-      <link rel="icon" href="../../../assets/favicon.ico">
+      <link rel="icon" href="../../assets/favicon.ico">
       <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
     
     
       
-        <title>MaaSModelRef - ODH Models-as-a-Service Documentation</title>
+        <title>Metrics & Dashboards - ODH Models-as-a-Service Documentation</title>
       
     
     
-      <link rel="stylesheet" href="../../../assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.484c7ddc.min.css">
       
         
-        <link rel="stylesheet" href="../../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
       
       
 
@@ -51,7 +51,7 @@
       
     
     
-    <script>__md_scope=new URL("../../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
     
       
 
@@ -76,7 +76,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#maasmodelref" class="md-skip">
+        <a href="#metrics-and-dashboards" class="md-skip">
           Skip to content
         </a>
       
@@ -94,9 +94,9 @@
 
 <header class="md-header" data-md-component="header">
   <nav class="md-header__inner md-grid" aria-label="Header">
-    <a href="../../.." title="ODH Models-as-a-Service Documentation" class="md-header__button md-logo" aria-label="ODH Models-as-a-Service Documentation" data-md-component="logo">
+    <a href="../.." title="ODH Models-as-a-Service Documentation" class="md-header__button md-logo" aria-label="ODH Models-as-a-Service Documentation" data-md-component="logo">
       
-  <img src="../../../assets/favicon.ico" alt="logo">
+  <img src="../../assets/favicon.ico" alt="logo">
 
     </a>
     <label class="md-header__button md-icon" for="__drawer">
@@ -113,7 +113,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              MaaSModelRef
+              Metrics & Dashboards
             
           </span>
         </div>
@@ -233,7 +233,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../.." class="md-tabs__link">
+        <a href="../.." class="md-tabs__link">
           
   
   
@@ -253,7 +253,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../../concepts/architecture/" class="md-tabs__link">
+        <a href="../../concepts/architecture/" class="md-tabs__link">
           
   
   
@@ -273,7 +273,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../../quickstart/" class="md-tabs__link">
+        <a href="../../quickstart/" class="md-tabs__link">
           
   
   
@@ -300,7 +300,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../../configuration-and-management/quota-and-access-configuration/" class="md-tabs__link">
+        <a href="../../configuration-and-management/quota-and-access-configuration/" class="md-tabs__link">
           
   
   
@@ -319,11 +319,13 @@
   
   
   
+    
+  
   
     
     
-      <li class="md-tabs__item">
-        <a href="../../../observability/" class="md-tabs__link">
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="../" class="md-tabs__link">
           
   
   
@@ -343,7 +345,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../../user-guide/api-key-management/" class="md-tabs__link">
+        <a href="../../user-guide/api-key-management/" class="md-tabs__link">
           
   
   
@@ -363,7 +365,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../../architecture-internals/controller-architecture/" class="md-tabs__link">
+        <a href="../../architecture-internals/controller-architecture/" class="md-tabs__link">
           
   
   
@@ -379,13 +381,11 @@
   
   
   
-    
-  
   
     
     
-      <li class="md-tabs__item md-tabs__item--active">
-        <a href="../../maas-api-overview/" class="md-tabs__link">
+      <li class="md-tabs__item">
+        <a href="../../reference/maas-api-overview/" class="md-tabs__link">
           
   
   
@@ -419,9 +419,9 @@
 
 <nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
   <label class="md-nav__title" for="__drawer">
-    <a href="../../.." title="ODH Models-as-a-Service Documentation" class="md-nav__button md-logo" aria-label="ODH Models-as-a-Service Documentation" data-md-component="logo">
+    <a href="../.." title="ODH Models-as-a-Service Documentation" class="md-nav__button md-logo" aria-label="ODH Models-as-a-Service Documentation" data-md-component="logo">
       
-  <img src="../../../assets/favicon.ico" alt="logo">
+  <img src="../../assets/favicon.ico" alt="logo">
 
     </a>
     ODH Models-as-a-Service Documentation
@@ -502,7 +502,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../.." class="md-nav__link">
+      <a href="../.." class="md-nav__link">
         
   
   
@@ -530,7 +530,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../release-notes/" class="md-nav__link">
+      <a href="../../release-notes/" class="md-nav__link">
         
   
   
@@ -612,7 +612,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../migration/tier-to-subscription/" class="md-nav__link">
+      <a href="../../migration/tier-to-subscription/" class="md-nav__link">
         
   
   
@@ -640,7 +640,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../migration/upgrade-to-3.4/" class="md-nav__link">
+      <a href="../../migration/upgrade-to-3.4/" class="md-nav__link">
         
   
   
@@ -737,7 +737,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../concepts/architecture/" class="md-nav__link">
+      <a href="../../concepts/architecture/" class="md-nav__link">
         
   
   
@@ -765,7 +765,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../concepts/personas/" class="md-nav__link">
+      <a href="../../concepts/personas/" class="md-nav__link">
         
   
   
@@ -793,7 +793,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../concepts/subscription-overview/" class="md-nav__link">
+      <a href="../../concepts/subscription-overview/" class="md-nav__link">
         
   
   
@@ -821,7 +821,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../concepts/model-reference/" class="md-nav__link">
+      <a href="../../concepts/model-reference/" class="md-nav__link">
         
   
   
@@ -849,7 +849,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../concepts/api-key-authentication/" class="md-nav__link">
+      <a href="../../concepts/api-key-authentication/" class="md-nav__link">
         
   
   
@@ -877,7 +877,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../concepts/model-access-control/" class="md-nav__link">
+      <a href="../../concepts/model-access-control/" class="md-nav__link">
         
   
   
@@ -966,7 +966,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../quickstart/" class="md-nav__link">
+      <a href="../../quickstart/" class="md-nav__link">
         
   
   
@@ -1048,7 +1048,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../install/prerequisites/" class="md-nav__link">
+      <a href="../../install/prerequisites/" class="md-nav__link">
         
   
   
@@ -1076,7 +1076,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../install/platform-setup/" class="md-nav__link">
+      <a href="../../install/platform-setup/" class="md-nav__link">
         
   
   
@@ -1166,7 +1166,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../install/maas-setup/" class="md-nav__link">
+      <a href="../../install/maas-setup/" class="md-nav__link">
         
   
   
@@ -1194,7 +1194,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../install/model-setup/" class="md-nav__link">
+      <a href="../../install/model-setup/" class="md-nav__link">
         
   
   
@@ -1222,7 +1222,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../install/external-model-setup/" class="md-nav__link">
+      <a href="../../install/external-model-setup/" class="md-nav__link">
         
   
   
@@ -1250,7 +1250,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../install/validation/" class="md-nav__link">
+      <a href="../../install/validation/" class="md-nav__link">
         
   
   
@@ -1278,7 +1278,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../install/troubleshooting/" class="md-nav__link">
+      <a href="../../install/troubleshooting/" class="md-nav__link">
         
   
   
@@ -1429,7 +1429,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../configuration-and-management/quota-and-access-configuration/" class="md-nav__link">
+      <a href="../../configuration-and-management/quota-and-access-configuration/" class="md-nav__link">
         
   
   
@@ -1457,7 +1457,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../configuration-and-management/api-key-administration/" class="md-nav__link">
+      <a href="../../configuration-and-management/api-key-administration/" class="md-nav__link">
         
   
   
@@ -1485,7 +1485,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../configuration-and-management/namespace-rbac/" class="md-nav__link">
+      <a href="../../configuration-and-management/namespace-rbac/" class="md-nav__link">
         
   
   
@@ -1513,7 +1513,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../configuration-and-management/troubleshooting-external-model-rbac/" class="md-nav__link">
+      <a href="../../configuration-and-management/troubleshooting-external-model-rbac/" class="md-nav__link">
         
   
   
@@ -1541,7 +1541,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../configuration-and-management/tls-configuration/" class="md-nav__link">
+      <a href="../../configuration-and-management/tls-configuration/" class="md-nav__link">
         
   
   
@@ -1569,7 +1569,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../configuration-and-management/gateway-patterns/" class="md-nav__link">
+      <a href="../../configuration-and-management/gateway-patterns/" class="md-nav__link">
         
   
   
@@ -1659,7 +1659,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../configuration-and-management/model-setup/" class="md-nav__link">
+      <a href="../../configuration-and-management/model-setup/" class="md-nav__link">
         
   
   
@@ -1687,7 +1687,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../configuration-and-management/model-listing-flow/" class="md-nav__link">
+      <a href="../../configuration-and-management/model-listing-flow/" class="md-nav__link">
         
   
   
@@ -1777,7 +1777,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../advanced-administration/subscription-cardinality/" class="md-nav__link">
+      <a href="../../advanced-administration/subscription-cardinality/" class="md-nav__link">
         
   
   
@@ -1805,7 +1805,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../advanced-administration/limitador-persistence/" class="md-nav__link">
+      <a href="../../advanced-administration/limitador-persistence/" class="md-nav__link">
         
   
   
@@ -1833,7 +1833,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../configuration-and-management/authorino-caching/" class="md-nav__link">
+      <a href="../../configuration-and-management/authorino-caching/" class="md-nav__link">
         
   
   
@@ -1873,28 +1873,31 @@
       
   
   
+    
   
   
+  
     
     
     
     
+      
+        
+        
       
       
         
       
     
     
-    <li class="md-nav__item md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
       
         
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" checked>
         
           
-        
-        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5" >
-        
-          
-          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
             
   
   
@@ -1912,7 +1915,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="true">
           <label class="md-nav__title" for="__nav_5">
             <span class="md-nav__icon md-icon"></span>
             
@@ -1930,7 +1933,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../observability/" class="md-nav__link">
+      <a href="../" class="md-nav__link">
         
   
   
@@ -1958,7 +1961,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../observability/setup/" class="md-nav__link">
+      <a href="../setup/" class="md-nav__link">
         
   
   
@@ -1983,10 +1986,37 @@
                 
   
   
+    
   
   
-    <li class="md-nav__item">
-      <a href="../../../observability/metrics-and-dashboards/" class="md-nav__link">
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Metrics & Dashboards
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
         
   
   
@@ -2002,6 +2032,181 @@
   
 
       </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#key-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Key Metrics
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Key Metrics">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#token-and-request-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Token and Request Metrics
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#latency-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Latency Metrics
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#limitador-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Limitador Metrics
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#authorino-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Authorino Metrics
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#vllm-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        vLLM Metrics
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#common-queries" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Common Queries
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#grafana-dashboards" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Grafana Dashboards
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Grafana Dashboards">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#platform-admin-dashboard" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Platform Admin Dashboard
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#ai-engineer-dashboard" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        AI Engineer Dashboard
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#prerequisites" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Prerequisites
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#deploy-dashboards" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Deploy Dashboards
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#sample-dashboard-json" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sample Dashboard JSON
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
     </li>
   
 
@@ -2014,7 +2219,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../observability/operations/" class="md-nav__link">
+      <a href="../operations/" class="md-nav__link">
         
   
   
@@ -2103,7 +2308,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../user-guide/api-key-management/" class="md-nav__link">
+      <a href="../../user-guide/api-key-management/" class="md-nav__link">
         
   
   
@@ -2131,7 +2336,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../user-guide/model-discovery/" class="md-nav__link">
+      <a href="../../user-guide/model-discovery/" class="md-nav__link">
         
   
   
@@ -2159,7 +2364,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../user-guide/inference/" class="md-nav__link">
+      <a href="../../user-guide/inference/" class="md-nav__link">
         
   
   
@@ -2248,7 +2453,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../architecture-internals/controller-architecture/" class="md-nav__link">
+      <a href="../../architecture-internals/controller-architecture/" class="md-nav__link">
         
   
   
@@ -2276,7 +2481,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../architecture-internals/reconciliation-flow/" class="md-nav__link">
+      <a href="../../architecture-internals/reconciliation-flow/" class="md-nav__link">
         
   
   
@@ -2304,7 +2509,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../architecture-internals/authentication-internals/" class="md-nav__link">
+      <a href="../../architecture-internals/authentication-internals/" class="md-nav__link">
         
   
   
@@ -2386,7 +2591,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../contributing/testing-guide/" class="md-nav__link">
+      <a href="../../contributing/testing-guide/" class="md-nav__link">
         
   
   
@@ -2414,7 +2619,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../contributing/release-strategy/" class="md-nav__link">
+      <a href="../../contributing/release-strategy/" class="md-nav__link">
         
   
   
@@ -2454,31 +2659,28 @@
       
   
   
-    
   
   
-  
     
     
     
     
-      
-        
-        
       
       
         
       
     
     
-    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--nested">
       
         
-        
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8" checked>
         
           
-          <label class="md-nav__link" for="__nav_8" id="__nav_8_label" tabindex="">
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_8" >
+        
+          
+          <label class="md-nav__link" for="__nav_8" id="__nav_8_label" tabindex="0">
             
   
   
@@ -2496,7 +2698,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="true">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_8">
             <span class="md-nav__icon md-icon"></span>
             
@@ -2514,7 +2716,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../maas-api-overview/" class="md-nav__link">
+      <a href="../../reference/maas-api-overview/" class="md-nav__link">
         
   
   
@@ -2542,7 +2744,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../api-reference/" class="md-nav__link">
+      <a href="../../reference/api-reference/" class="md-nav__link">
         
   
   
@@ -2567,31 +2769,28 @@
                 
   
   
-    
   
   
-  
     
     
     
     
       
       
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
         
           
-          
         
-      
-    
-    
-    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
-      
-        
-        
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8_3" checked>
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_8_3" >
         
           
-          <label class="md-nav__link" for="__nav_8_3" id="__nav_8_3_label" tabindex="">
+          <label class="md-nav__link" for="__nav_8_3" id="__nav_8_3_label" tabindex="0">
             
   
   
@@ -2609,7 +2808,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_8_3_label" aria-expanded="true">
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_8_3_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_8_3">
             <span class="md-nav__icon md-icon"></span>
             
@@ -2624,37 +2823,10 @@
                 
   
   
-    
   
   
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-        <label class="md-nav__link md-nav__link--active" for="__toc">
-          
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    MaaSModelRef
-  
-
-    
-  </span>
-  
-  
-
-          <span class="md-nav__icon md-icon"></span>
-        </label>
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
+    <li class="md-nav__item">
+      <a href="../../reference/crds/maas-model-ref/" class="md-nav__link">
         
   
   
@@ -2670,193 +2842,6 @@
   
 
       </a>
-      
-        
-
-<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
-  
-  
-  
-    
-  
-  
-    <label class="md-nav__title" for="__toc">
-      <span class="md-nav__icon md-icon"></span>
-      Table of contents
-    </label>
-    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
-      
-        <li class="md-nav__item">
-  <a href="#spec" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Spec
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Spec">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#maasmodelrefspec" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        MaaSModelRefSpec
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#modelreference" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        ModelReference
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#supported-kinds" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Supported Kinds
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Supported Kinds">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#llminferenceservice" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        LLMInferenceService
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#externalmodel" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        ExternalModel
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#endpoint-override" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Endpoint Override
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#status" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Status
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Status">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#maasmodelrefstatus" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        MaaSModelRefStatus
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#annotations" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Annotations
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Annotations">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#example-with-annotations" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Example with annotations
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#api-response" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        API response
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#related-documentation" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Related Documentation
-      
-    </span>
-  </a>
-  
-</li>
-      
-    </ul>
-  
-</nav>
-      
     </li>
   
 
@@ -2869,7 +2854,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../external-model/" class="md-nav__link">
+      <a href="../../reference/crds/external-model/" class="md-nav__link">
         
   
   
@@ -2897,7 +2882,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../maas-auth-policy/" class="md-nav__link">
+      <a href="../../reference/crds/maas-auth-policy/" class="md-nav__link">
         
   
   
@@ -2925,7 +2910,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../maas-subscription/" class="md-nav__link">
+      <a href="../../reference/crds/maas-subscription/" class="md-nav__link">
         
   
   
@@ -2953,7 +2938,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../ai-tenant/" class="md-nav__link">
+      <a href="../../reference/crds/ai-tenant/" class="md-nav__link">
         
   
   
@@ -2981,7 +2966,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../tenant/" class="md-nav__link">
+      <a href="../../reference/crds/tenant/" class="md-nav__link">
         
   
   
@@ -3044,22 +3029,22 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#spec" class="md-nav__link">
+  <a href="#key-metrics" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Spec
+        Key Metrics
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="Spec">
+    <nav class="md-nav" aria-label="Key Metrics">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#maasmodelrefspec" class="md-nav__link">
+  <a href="#token-and-request-metrics" class="md-nav__link">
     <span class="md-ellipsis">
       
-        MaaSModelRefSpec
+        Token and Request Metrics
       
     </span>
   </a>
@@ -3067,10 +3052,43 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#modelreference" class="md-nav__link">
+  <a href="#latency-metrics" class="md-nav__link">
     <span class="md-ellipsis">
       
-        ModelReference
+        Latency Metrics
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#limitador-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Limitador Metrics
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#authorino-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Authorino Metrics
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#vllm-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        vLLM Metrics
       
     </span>
   </a>
@@ -3083,22 +3101,33 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#supported-kinds" class="md-nav__link">
+  <a href="#common-queries" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Supported Kinds
+        Common Queries
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="Supported Kinds">
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#grafana-dashboards" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Grafana Dashboards
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Grafana Dashboards">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#llminferenceservice" class="md-nav__link">
+  <a href="#platform-admin-dashboard" class="md-nav__link">
     <span class="md-ellipsis">
       
-        LLMInferenceService
+        Platform Admin Dashboard
       
     </span>
   </a>
@@ -3106,10 +3135,43 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#externalmodel" class="md-nav__link">
+  <a href="#ai-engineer-dashboard" class="md-nav__link">
     <span class="md-ellipsis">
       
-        ExternalModel
+        AI Engineer Dashboard
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#prerequisites" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Prerequisites
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#deploy-dashboards" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Deploy Dashboards
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#sample-dashboard-json" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sample Dashboard JSON
       
     </span>
   </a>
@@ -3118,95 +3180,6 @@
         
       </ul>
     </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#endpoint-override" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Endpoint Override
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#status" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Status
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Status">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#maasmodelrefstatus" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        MaaSModelRefStatus
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#annotations" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Annotations
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Annotations">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#example-with-annotations" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Example with annotations
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#api-response" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        API response
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#related-documentation" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Related Documentation
-      
-    </span>
-  </a>
   
 </li>
       
@@ -3230,254 +3203,404 @@
   
 
 
-<h1 id="maasmodelref">MaaSModelRef</h1>
-<p>Identifies an AI/ML model for the MaaS platform. The backend may be on-cluster (<code>LLMInferenceService</code>) or external (<code>ExternalModel</code> for providers like OpenAI, Anthropic, Azure OpenAI that run outside the cluster). Create MaaSModelRef in the <strong>same namespace</strong> as the backend resource.</p>
-<hr />
-<h2 id="spec">Spec</h2>
-<h3 id="maasmodelrefspec">MaaSModelRefSpec</h3>
+<h1 id="metrics-and-dashboards">Metrics and Dashboards</h1>
+<h2 id="key-metrics">Key Metrics</h2>
+<h3 id="token-and-request-metrics">Token and Request Metrics</h3>
 <table>
 <thead>
 <tr>
-<th>Field</th>
+<th>Metric</th>
 <th>Type</th>
-<th>Required</th>
+<th>Labels</th>
+<th>Use For</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>authorized_hits</code></td>
+<td>Counter</td>
+<td><code>user</code>, <code>subscription</code>, <code>model</code></td>
+<td><strong>Billing/Cost</strong> - Total tokens consumed (input + output)</td>
+</tr>
+<tr>
+<td><code>authorized_calls</code></td>
+<td>Counter</td>
+<td><code>user</code>, <code>subscription</code></td>
+<td><strong>API Usage</strong> - Number of API calls allowed</td>
+</tr>
+<tr>
+<td><code>limited_calls</code></td>
+<td>Counter</td>
+<td><code>user</code>, <code>subscription</code></td>
+<td><strong>Rate Limiting</strong> - Requests denied due to quotas</td>
+</tr>
+</tbody>
+</table>
+<div class="admonition note">
+<p class="admonition-title"><code>model</code> label availability</p>
+<p><code>model</code> label is only available on <code>authorized_hits</code>. <code>authorized_calls</code> and <code>limited_calls</code> carry <code>user</code> and <code>subscription</code> only.</p>
+</div>
+<div class="admonition note">
+<p class="admonition-title">Total tokens only</p>
+<p>Token consumption is reported as total tokens (prompt + completion) per request. Input/output split requires upstream Kuadrant wasm-shim changes.</p>
+</div>
+<h3 id="latency-metrics">Latency Metrics</h3>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Labels</th>
 <th>Description</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>modelRef</td>
-<td>ModelReference</td>
-<td>Yes</td>
-<td>Reference to the model backend (kind and name)</td>
+<td><code>istio_request_duration_milliseconds_bucket</code></td>
+<td><code>destination_service_name</code>, <code>subscription</code></td>
+<td>Gateway-level latency (subscription-only to bound cardinality)</td>
 </tr>
 <tr>
-<td>endpointOverride</td>
-<td>string</td>
-<td>No</td>
-<td>Optional override for the endpoint URL. See <a href="#endpoint-override">Endpoint Override</a> below.</td>
+<td><code>vllm:e2e_request_latency_seconds</code></td>
+<td><code>model_name</code></td>
+<td>Model inference end-to-end latency</td>
+</tr>
+<tr>
+<td><code>vllm:time_to_first_token_seconds</code></td>
+<td><code>model_name</code></td>
+<td>Time to First Token (TTFT)</td>
+</tr>
+<tr>
+<td><code>vllm:inter_token_latency_seconds</code></td>
+<td><code>model_name</code></td>
+<td>Inter-Token Latency (ITL)</td>
 </tr>
 </tbody>
 </table>
-<h3 id="modelreference">ModelReference</h3>
-<p><code>spec.modelRef</code> identifies the backend resource that serves the model—similar to <a href="https://gateway-api.sigs.k8s.io/reference/spec/#backendref">Gateway API BackendRef</a>:</p>
-<table>
-<thead>
-<tr>
-<th>Field</th>
-<th>Type</th>
-<th>Required</th>
-<th>Description</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>kind</td>
-<td>string</td>
-<td>Yes</td>
-<td>Backend type. One of: <code>LLMInferenceService</code>, <code>ExternalModel</code>. See <a href="#supported-kinds">Supported Kinds</a> below.</td>
-</tr>
-<tr>
-<td>name</td>
-<td>string</td>
-<td>Yes</td>
-<td>Name of the backend resource. Must be in the same namespace as the MaaSModelRef. Max length: 253 characters.</td>
-</tr>
-</tbody>
-</table>
-<hr />
-<h2 id="supported-kinds">Supported Kinds</h2>
-<h3 id="llminferenceservice">LLMInferenceService</h3>
-<p>References models deployed on the cluster via the LLMInferenceService CRD (e.g., vLLM, TGI via KServe).</p>
-<p>The controller:
-- Sets <code>status.endpoint</code> from the LLMInferenceService status
-- Sets <code>status.phase</code> based on LLMInferenceService readiness</p>
-<p><strong>Example:</strong>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">maas.opendatahub.io/v1alpha1</span>
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">MaaSModelRef</span>
+<p><strong>Per-Subscription Latency Tracking:</strong></p>
+<p>Istio Telemetry adds <code>subscription</code> dimension to gateway latency via <code>X-MaaS-Subscription</code> header injected by AuthPolicy:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">telemetry.istio.io/v1</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Telemetry</span>
 <a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="nt">metadata</span><span class="p">:</span>
-<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">granite-7b</span>
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="w">  </span><span class="nt">namespace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">models</span>
-<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="nt">spec</span><span class="p">:</span>
-<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="w">  </span><span class="nt">modelRef</span><span class="p">:</span>
-<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="w">    </span><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">LLMInferenceService</span>
-<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">granite-7b-instruct</span>
-</code></pre></div></p>
-<p>For complete setup instructions, see <a href="../../../configuration-and-management/model-setup/">Model Setup</a>.</p>
-<h3 id="externalmodel">ExternalModel</h3>
-<p>References external AI/ML providers (e.g., OpenAI, Anthropic, Azure OpenAI).</p>
-<p>The controller:
-- Fetches the ExternalModel CR from the same namespace
-- Validates the user-supplied HTTPRoute references the correct gateway
-- Derives <code>status.endpoint</code> from HTTPRoute hostnames or gateway addresses
-- Sets <code>status.phase</code> based on HTTPRoute acceptance</p>
-<p><strong>Example:</strong>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">maas.opendatahub.io/v1alpha1</span>
-<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">MaaSModelRef</span>
-<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="nt">metadata</span><span class="p">:</span>
-<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">gpt-4</span>
-<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="w">  </span><span class="nt">namespace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">external</span>
-<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="nt">spec</span><span class="p">:</span>
-<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="w">  </span><span class="nt">modelRef</span><span class="p">:</span>
-<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="w">    </span><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ExternalModel</span>
-<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">openai-gpt4</span>
-</code></pre></div></p>
-<p>For complete setup instructions, see <a href="../../../install/external-model-setup/">External Model Setup</a>.</p>
-<hr />
-<h2 id="endpoint-override">Endpoint Override</h2>
-<p>By default, the controller discovers the endpoint URL from the backend (LLMInferenceService status, Gateway, or HTTPRoute hostnames). Use <code>spec.endpointOverride</code> to specify a custom URL when:</p>
-<ul>
-<li>The controller picks the wrong gateway or hostname</li>
-<li>Your environment requires a specific URL</li>
-<li>You need to point the model at a custom proxy or load balancer</li>
-</ul>
-<p><strong>Example:</strong>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">maas.opendatahub.io/v1alpha1</span>
-<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">MaaSModelRef</span>
-<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="nt">metadata</span><span class="p">:</span>
-<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">my-model</span>
-<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="w">  </span><span class="nt">namespace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">llm</span>
-<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="nt">spec</span><span class="p">:</span>
-<a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a><span class="w">  </span><span class="nt">modelRef</span><span class="p">:</span>
-<a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="w">    </span><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">LLMInferenceService</span>
-<a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">my-model</span>
-<a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="w">  </span><span class="nt">endpointOverride</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;https://correct-hostname.example.com/my-model&quot;</span>
-</code></pre></div></p>
-<p>The override does not bypass backend validation. The controller still checks that the backend is ready (HTTPRoute accepted, LLMInferenceService ready, etc.). The override only determines the final value written to <code>status.endpoint</code> <strong>after</strong> the backend becomes ready. While the backend is not ready, the controller clears <code>status.endpoint</code> (sets it to empty string) and sets <code>status.phase</code> to <code>Pending</code>, regardless of the override value.</p>
-<hr />
-<h2 id="status">Status</h2>
-<h3 id="maasmodelrefstatus">MaaSModelRefStatus</h3>
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">latency-per-subscription</span>
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="nt">spec</span><span class="p">:</span>
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="w">  </span><span class="nt">metrics</span><span class="p">:</span>
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">overrides</span><span class="p">:</span>
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">match</span><span class="p">:</span>
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="w">        </span><span class="nt">metric</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">REQUEST_DURATION</span>
+<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="w">      </span><span class="nt">tagOverrides</span><span class="p">:</span>
+<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="w">        </span><span class="nt">subscription</span><span class="p">:</span>
+<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="w">          </span><span class="nt">value</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">request.headers[&quot;x-maas-subscription&quot;]</span>
+</code></pre></div>
+<h3 id="limitador-metrics">Limitador Metrics</h3>
 <table>
 <thead>
 <tr>
-<th>Field</th>
+<th>Metric</th>
 <th>Type</th>
 <th>Description</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>phase</td>
-<td>string</td>
-<td>One of: <code>Pending</code>, <code>Ready</code>, <code>Failed</code></td>
+<td><code>limitador_up</code></td>
+<td>Gauge</td>
+<td>Limitador running (1 = up)</td>
 </tr>
 <tr>
-<td>endpoint</td>
-<td>string</td>
-<td>Endpoint URL for the model (auto-discovered or from <code>endpointOverride</code>)</td>
+<td><code>datastore_partitioned</code></td>
+<td>Gauge</td>
+<td>Partitioned from datastore (0 = healthy)</td>
 </tr>
 <tr>
-<td>httpRouteName</td>
-<td>string</td>
-<td>Name of the HTTPRoute associated with this model</td>
-</tr>
-<tr>
-<td>httpRouteNamespace</td>
-<td>string</td>
-<td>Namespace of the HTTPRoute</td>
-</tr>
-<tr>
-<td>httpRouteGatewayName</td>
-<td>string</td>
-<td>Name of the Gateway that the HTTPRoute references</td>
-</tr>
-<tr>
-<td>httpRouteGatewayNamespace</td>
-<td>string</td>
-<td>Namespace of the Gateway that the HTTPRoute references</td>
-</tr>
-<tr>
-<td>httpRouteHostnames</td>
-<td>[]string</td>
-<td>Hostnames configured on the HTTPRoute</td>
-</tr>
-<tr>
-<td>conditions</td>
-<td>[]Condition</td>
-<td>Latest observations of the model's state</td>
+<td><code>datastore_latency</code></td>
+<td>Histogram</td>
+<td>Latency to backing datastore</td>
 </tr>
 </tbody>
 </table>
-<hr />
-<h2 id="annotations">Annotations</h2>
-<p>MaaSModelRef supports standard Kubernetes and OpenShift annotations. The MaaS API reads these annotations and returns them in the <code>modelDetails</code> field of the <code>GET /v1/models</code> response.</p>
+<p>See <a href="https://github.com/Kuadrant/limitador/blob/main/limitador-server/src/prometheus_metrics.rs">Limitador source</a>.</p>
+<h3 id="authorino-metrics">Authorino Metrics</h3>
+<p>Exposed on <code>/server-metrics</code> (port 8080):</p>
 <table>
 <thead>
 <tr>
-<th>Annotation</th>
+<th>Metric</th>
+<th>Type</th>
+<th>Labels</th>
 <th>Description</th>
-<th>Returned in API</th>
-<th>Example</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><code>openshift.io/display-name</code></td>
-<td>Human-readable model name</td>
-<td><code>modelDetails.displayName</code></td>
-<td><code>"Llama 2 7B Chat"</code></td>
+<td><code>auth_server_authconfig_total</code></td>
+<td>Counter</td>
+<td><code>namespace</code>, <code>authconfig</code></td>
+<td>Total AuthConfig evaluations</td>
 </tr>
 <tr>
-<td><code>openshift.io/description</code></td>
-<td>Model description</td>
-<td><code>modelDetails.description</code></td>
-<td><code>"A large language model optimized for chat"</code></td>
+<td><code>auth_server_authconfig_duration_seconds</code></td>
+<td>Histogram</td>
+<td><code>namespace</code>, <code>authconfig</code></td>
+<td>Auth evaluation latency</td>
 </tr>
 <tr>
-<td><code>opendatahub.io/genai-use-case</code></td>
-<td>GenAI use case category</td>
-<td><code>modelDetails.genaiUseCase</code></td>
-<td><code>"chat"</code></td>
+<td><code>auth_server_authconfig_response_status</code></td>
+<td>Counter</td>
+<td><code>namespace</code>, <code>authconfig</code>, <code>status</code></td>
+<td>Auth response status (OK, denied)</td>
 </tr>
 <tr>
-<td><code>opendatahub.io/context-window</code></td>
-<td>Context window size</td>
-<td><code>modelDetails.contextWindow</code></td>
-<td><code>"4096"</code></td>
+<td><code>auth_server_response_status</code></td>
+<td>Counter</td>
+<td><code>status</code></td>
+<td>Aggregate auth response status</td>
+</tr>
+<tr>
+<td><code>auth_server_evaluator_total</code></td>
+<td>Counter</td>
+<td><code>namespace</code>, <code>authconfig</code>, <code>evaluator_type</code>, <code>evaluator_name</code></td>
+<td>Per-evaluator runs (MaaS enables <code>metrics</code> on <strong><code>apiKeyValidation</code></strong> / <strong><code>subscription-info</code></strong>)</td>
+</tr>
+<tr>
+<td><code>auth_server_evaluator_cancelled</code></td>
+<td>Counter</td>
+<td>same</td>
+<td>Failures/cancellations (metadata alert below)</td>
 </tr>
 </tbody>
 </table>
-<h3 id="example-with-annotations">Example with annotations</h3>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">maas.opendatahub.io/v1alpha1</span>
-<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">MaaSModelRef</span>
-<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="nt">metadata</span><span class="p">:</span>
-<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">llama-2-7b-chat</span>
-<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="w">  </span><span class="nt">namespace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">opendatahub</span>
-<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="w">  </span><span class="nt">annotations</span><span class="p">:</span>
-<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="w">    </span><span class="nt">openshift.io/display-name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;Llama</span><span class="nv"> </span><span class="s">2</span><span class="nv"> </span><span class="s">7B</span><span class="nv"> </span><span class="s">Chat&quot;</span>
-<a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a><span class="w">    </span><span class="nt">openshift.io/description</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;A</span><span class="nv"> </span><span class="s">large</span><span class="nv"> </span><span class="s">language</span><span class="nv"> </span><span class="s">model</span><span class="nv"> </span><span class="s">optimized</span><span class="nv"> </span><span class="s">for</span><span class="nv"> </span><span class="s">chat</span><span class="nv"> </span><span class="s">use</span><span class="nv"> </span><span class="s">cases&quot;</span>
-<a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a><span class="w">    </span><span class="nt">opendatahub.io/genai-use-case</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;chat&quot;</span>
-<a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a><span class="w">    </span><span class="nt">opendatahub.io/context-window</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;4096&quot;</span>
-<a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a><span class="nt">spec</span><span class="p">:</span>
-<a id="__codelineno-3-12" name="__codelineno-3-12" href="#__codelineno-3-12"></a><span class="w">  </span><span class="nt">modelRef</span><span class="p">:</span>
-<a id="__codelineno-3-13" name="__codelineno-3-13" href="#__codelineno-3-13"></a><span class="w">    </span><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">LLMInferenceService</span>
-<a id="__codelineno-3-14" name="__codelineno-3-14" href="#__codelineno-3-14"></a><span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">llama-2-7b-chat</span>
+<div class="admonition note">
+<p class="admonition-title">Two endpoints</p>
+<p>Kuadrant <code>authorino-operator-monitor</code> scrapes <code>/metrics</code> (controller-runtime). MaaS <code>authorino-server-metrics</code> ServiceMonitor scrapes <code>/server-metrics</code> (auth evaluation).</p>
+</div>
+<div class="admonition note">
+<p class="admonition-title">Metadata evaluator metrics</p>
+<p>Query <code>evaluator_type="METADATA_GENERIC_HTTP"</code> and <code>evaluator_name=~"apiKeyValidation|subscription-info"</code>. Series appear after traffic hits each evaluator.</p>
+</div>
+<p><strong>Alert:</strong> <code>authorino-maas-metadata-evaluator-prometheusrule.yaml</code> — <strong><code>MaaSAuthorinoMetadataEvaluatorHighFailureRate</code></strong> (<code>cancelled</code>/<code>total</code> &gt; 10% over 5m, traffic guard, <strong><code>for: 5m</code></strong>). <strong>Remediate:</strong> maas-api health; Authorino → maas-api TLS/NetworkPolicy; confirm <strong><code>/server-metrics</code></strong> is scraped.</p>
+<h3 id="vllm-metrics">vLLM Metrics</h3>
+<p>Exposed on <code>/metrics</code> (port 8000). Supported backends: vLLM v0.7.x, llm-d v0.1.x, llm-d-inference-sim v0.8.2.</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>vllm:num_requests_running</code></td>
+<td>Gauge</td>
+<td>Requests currently processing</td>
+</tr>
+<tr>
+<td><code>vllm:num_requests_waiting</code></td>
+<td>Gauge</td>
+<td>Requests queued waiting</td>
+</tr>
+<tr>
+<td><code>vllm:request_prompt_tokens</code></td>
+<td>Histogram</td>
+<td>Per-request prompt token counts (<code>_sum</code> gives cumulative)</td>
+</tr>
+<tr>
+<td><code>vllm:request_generation_tokens</code></td>
+<td>Histogram</td>
+<td>Per-request generation token counts</td>
+</tr>
+<tr>
+<td><code>vllm:prompt_tokens_total</code></td>
+<td>Counter</td>
+<td>Total prompt tokens processed</td>
+</tr>
+<tr>
+<td><code>vllm:generation_tokens_total</code></td>
+<td>Counter</td>
+<td>Total generation tokens processed</td>
+</tr>
+<tr>
+<td><code>vllm:kv_cache_usage_perc</code></td>
+<td>Gauge</td>
+<td>KV-cache usage (0-1)</td>
+</tr>
+<tr>
+<td><code>vllm:request_queue_time_seconds</code></td>
+<td>Histogram</td>
+<td>Time in queue before processing (vLLM/llm-d only)</td>
+</tr>
+<tr>
+<td><code>vllm:request_success_total</code></td>
+<td>Counter</td>
+<td>Successful requests</td>
+</tr>
+<tr>
+<td><code>vllm:request_prefill_time_seconds</code></td>
+<td>Histogram</td>
+<td>Prefill phase time</td>
+</tr>
+<tr>
+<td><code>vllm:request_decode_time_seconds</code></td>
+<td>Histogram</td>
+<td>Decode phase time</td>
+</tr>
+</tbody>
+</table>
+<div class="admonition note">
+<p class="admonition-title">Counter <code>_total</code> suffix</p>
+<p>Python prometheus_client appends <code>_total</code> when exposing counters. The actual metric names are <code>vllm:prompt_tokens_total</code> and <code>vllm:generation_tokens_total</code>.</p>
+</div>
+<div class="admonition note">
+<p class="admonition-title">Lazily registered</p>
+<p>Some metrics only appear after first event (e.g., <code>request_queue_time_seconds</code> after first queued request). Dashboard panels show "No Data" until traffic is generated.</p>
+</div>
+<p>See <a href="https://docs.vllm.ai/en/stable/usage/metrics/">vLLM metrics docs</a>.</p>
+<h2 id="common-queries">Common Queries</h2>
+<p><strong>Token consumption (billing):</strong></p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="c1"># Total tokens per user</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="k">sum</span><span class="w"> </span><span class="k">by</span><span class="w"> </span><span class="o">(</span><span class="nv">user</span><span class="o">)</span><span class="w"> </span><span class="o">(</span><span class="nv">authorized_hits</span><span class="o">)</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="c1"># Token rate per model (tokens/sec)</span>
+<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="k">sum</span><span class="w"> </span><span class="k">by</span><span class="w"> </span><span class="o">(</span><span class="nv">model</span><span class="o">)</span><span class="w"> </span><span class="o">(</span><span class="kr">rate</span><span class="o">(</span><span class="nv">authorized_hits</span><span class="p">[</span><span class="s">5m</span><span class="p">]</span><span class="o">))</span>
+<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>
+<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="c1"># Top 10 users by tokens</span>
+<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="k">topk</span><span class="o">(</span><span class="mi">10</span><span class="p">,</span><span class="w"> </span><span class="k">sum</span><span class="w"> </span><span class="k">by</span><span class="w"> </span><span class="o">(</span><span class="nv">user</span><span class="o">)</span><span class="w"> </span><span class="o">(</span><span class="nv">authorized_hits</span><span class="o">))</span>
 </code></pre></div>
-<h3 id="api-response">API response</h3>
-<p>When annotations are set, the <code>GET /v1/models</code> response includes a <code>modelDetails</code> object:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="p">{</span>
-<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="w">  </span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;llama-2-7b-chat&quot;</span><span class="p">,</span>
-<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="w">  </span><span class="nt">&quot;object&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;model&quot;</span><span class="p">,</span>
-<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="w">  </span><span class="nt">&quot;created&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1672531200</span><span class="p">,</span>
-<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="w">  </span><span class="nt">&quot;owned_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;opendatahub&quot;</span><span class="p">,</span>
-<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="w">  </span><span class="nt">&quot;ready&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
-<a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="w">  </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://...&quot;</span><span class="p">,</span>
-<a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a><span class="w">  </span><span class="nt">&quot;modelDetails&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a><span class="w">    </span><span class="nt">&quot;displayName&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Llama 2 7B Chat&quot;</span><span class="p">,</span>
-<a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a><span class="w">    </span><span class="nt">&quot;description&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;A large language model optimized for chat use cases&quot;</span><span class="p">,</span>
-<a id="__codelineno-4-11" name="__codelineno-4-11" href="#__codelineno-4-11"></a><span class="w">    </span><span class="nt">&quot;genaiUseCase&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;chat&quot;</span><span class="p">,</span>
-<a id="__codelineno-4-12" name="__codelineno-4-12" href="#__codelineno-4-12"></a><span class="w">    </span><span class="nt">&quot;contextWindow&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;4096&quot;</span>
-<a id="__codelineno-4-13" name="__codelineno-4-13" href="#__codelineno-4-13"></a><span class="w">  </span><span class="p">}</span>
-<a id="__codelineno-4-14" name="__codelineno-4-14" href="#__codelineno-4-14"></a><span class="p">}</span>
+<p><strong>Request volume (capacity):</strong></p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="c1"># Request rate per subscription</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="k">sum</span><span class="w"> </span><span class="k">by</span><span class="w"> </span><span class="o">(</span><span class="nv">subscription</span><span class="o">)</span><span class="w"> </span><span class="o">(</span><span class="kr">rate</span><span class="o">(</span><span class="nv">authorized_calls</span><span class="p">[</span><span class="s">5m</span><span class="p">]</span><span class="o">))</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="c1"># Top 10 users by request count</span>
+<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="k">topk</span><span class="o">(</span><span class="mi">10</span><span class="p">,</span><span class="w"> </span><span class="k">sum</span><span class="w"> </span><span class="k">by</span><span class="w"> </span><span class="o">(</span><span class="nv">user</span><span class="o">)</span><span class="w"> </span><span class="o">(</span><span class="nv">authorized_calls</span><span class="o">))</span>
 </code></pre></div>
-<p>When no annotations are set (or all values are empty), <code>modelDetails</code> is omitted from the response.</p>
-<hr />
-<h2 id="related-documentation">Related Documentation</h2>
+<p><strong>Inference success rate:</strong></p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="c1"># Success rate (defaults to 100% when no data)</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="k">sum</span><span class="o">(</span><span class="kr">rate</span><span class="o">(</span><span class="nv">vllm</span><span class="err">:</span><span class="nv">request_success_total</span><span class="p">[</span><span class="s">5m</span><span class="p">]</span><span class="o">))</span><span class="w"> </span><span class="o">/</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">  </span><span class="k">sum</span><span class="o">(</span><span class="kr">rate</span><span class="o">(</span><span class="nv">vllm</span><span class="err">:</span><span class="nv">e2e_request_latency_seconds_count</span><span class="p">[</span><span class="s">5m</span><span class="p">]</span><span class="o">))</span><span class="w"> </span><span class="nv">OR</span><span class="w"> </span><span class="kr">vector</span><span class="o">(</span><span class="mi">1</span><span class="o">)</span>
+</code></pre></div>
+<p><strong>Rate limiting:</strong></p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="c1"># Rate limit ratio (% rejected)</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="o">(</span><span class="k">sum</span><span class="o">(</span><span class="nv">limited_calls</span><span class="o">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="o">(</span><span class="k">sum</span><span class="o">(</span><span class="nv">authorized_calls</span><span class="o">)</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="k">sum</span><span class="o">(</span><span class="nv">limited_calls</span><span class="o">)))</span><span class="w"> </span><span class="nv">OR</span><span class="w"> </span><span class="kr">vector</span><span class="o">(</span><span class="mi">0</span><span class="o">)</span>
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="c1"># Rate limit violations per second by subscription</span>
+<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="k">sum</span><span class="w"> </span><span class="k">by</span><span class="w"> </span><span class="o">(</span><span class="nv">subscription</span><span class="o">)</span><span class="w"> </span><span class="o">(</span><span class="kr">rate</span><span class="o">(</span><span class="nv">limited_calls</span><span class="p">[</span><span class="s">5m</span><span class="p">]</span><span class="o">))</span>
+</code></pre></div>
+<p><strong>Latency (per-subscription SLA):</strong></p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="c1"># P99 latency per subscription</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="kr">histogram_quantile</span><span class="o">(</span><span class="mf">0.99</span><span class="p">,</span><span class="w"> </span><span class="k">sum</span><span class="w"> </span><span class="k">by</span><span class="w"> </span><span class="o">(</span><span class="nv">subscription</span><span class="p">,</span><span class="w"> </span><span class="nv">le</span><span class="o">)</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="w">  </span><span class="o">(</span><span class="kr">rate</span><span class="o">(</span><span class="nv">istio_request_duration_milliseconds_bucket</span><span class="p">{</span><span class="nl">subscription</span><span class="o">!=</span><span class="p">&quot;&quot;}[</span><span class="s">5m</span><span class="p">]</span><span class="o">)))</span>
+<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>
+<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="c1"># P50 latency per subscription</span>
+<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="kr">histogram_quantile</span><span class="o">(</span><span class="mf">0.5</span><span class="p">,</span><span class="w"> </span><span class="k">sum</span><span class="w"> </span><span class="k">by</span><span class="w"> </span><span class="o">(</span><span class="nv">subscription</span><span class="p">,</span><span class="w"> </span><span class="nv">le</span><span class="o">)</span>
+<a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="w">  </span><span class="o">(</span><span class="kr">rate</span><span class="o">(</span><span class="nv">istio_request_duration_milliseconds_bucket</span><span class="p">{</span><span class="nl">subscription</span><span class="o">!=</span><span class="p">&quot;&quot;}[</span><span class="s">5m</span><span class="p">]</span><span class="o">)))</span>
+</code></pre></div>
+<h2 id="grafana-dashboards">Grafana Dashboards</h2>
+<p>MaaS includes two dashboards for different personas.</p>
+<h3 id="platform-admin-dashboard">Platform Admin Dashboard</h3>
+<table>
+<thead>
+<tr>
+<th>Section</th>
+<th>Metrics</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Component Health</strong></td>
+<td>Limitador up, Authorino pods, MaaS API pods, Gateway pods, Alerts</td>
+</tr>
+<tr>
+<td><strong>Key Metrics</strong></td>
+<td>Total Tokens, Total Requests, Token Rate, Request Rate, Success Rate, Active Users, P50 Latency, Rate Limit Ratio</td>
+</tr>
+<tr>
+<td><strong>Auth Evaluation</strong></td>
+<td>Auth Latency (P50/P95/P99), Auth Success/Deny Rate</td>
+</tr>
+<tr>
+<td><strong>Traffic Analysis</strong></td>
+<td>Token/Request Rate by Model, Error Rates (4xx, 5xx, 429), Token/Request by Subscription, P95 Latency</td>
+</tr>
+<tr>
+<td><strong>Model Metrics</strong></td>
+<td>vLLM queue depth, latency, KV cache, token throughput, prompt/gen ratio, queue wait, TTFT, ITL</td>
+</tr>
+<tr>
+<td><strong>Top Users</strong></td>
+<td>By token usage, by declined requests</td>
+</tr>
+<tr>
+<td><strong>Resource Allocation</strong></td>
+<td>CPU/Memory/GPU per model pod</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Template variables:</strong></p>
 <ul>
-<li><a href="../external-model/">ExternalModel CRD</a> - External provider configuration</li>
-<li><a href="../../../configuration-and-management/model-setup/">Model Setup</a> - LLMInferenceService deployment</li>
-<li><a href="../../../install/external-model-setup/">External Model Setup</a> - External provider integration</li>
+<li><code>$datasource</code>: <code>prometheus</code></li>
+<li><code>$maas_namespace</code>: Auto-detected from <code>kube_pod_info{pod=~"maas-api.*"}</code></li>
+<li><code>$kuadrant_namespace</code>: <code>kuadrant-system</code></li>
+<li><code>$gateway_namespace</code>: <code>openshift-ingress</code></li>
+<li><code>$llm_namespace</code>: <code>llm</code></li>
+<li><code>$model</code>: <code>All</code></li>
 </ul>
+<h3 id="ai-engineer-dashboard">AI Engineer Dashboard</h3>
+<table>
+<thead>
+<tr>
+<th>Section</th>
+<th>Metrics</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Usage Summary</strong></td>
+<td>My Total Tokens, My Total Requests, Token Rate, Request Rate, Rate Limit Ratio, Success Rate</td>
+</tr>
+<tr>
+<td><strong>Usage Trends</strong></td>
+<td>Token Usage by Model, Usage vs Rate Limited</td>
+</tr>
+<tr>
+<td><strong>Detailed Analysis</strong></td>
+<td>Token Volume by Model, Rate Limited by Subscription</td>
+</tr>
+</tbody>
+</table>
+<div class="admonition note">
+<p class="admonition-title">Inference Success Rate</p>
+<p>Dashboards use <code>rate()</code> on vLLM counters to handle pod restarts correctly. <code>NaN</code> (when no traffic) is filtered to default to 100%.</p>
+</div>
+<div class="admonition info">
+<p class="admonition-title">Tokens vs Requests</p>
+<p><strong>Token consumption</strong> (<code>authorized_hits</code>) for billing/cost. <strong>Request counts</strong> (<code>authorized_calls</code>) for capacity planning. Blue = requests, Green = tokens.</p>
+</div>
+<h3 id="prerequisites">Prerequisites</h3>
+<ul>
+<li><strong>Grafana</strong> installed (via observability team, centralized instance, or <a href="https://grafana.github.io/grafana-operator/docs/installation/">Grafana Operator</a>)</li>
+<li>Grafana instance has label <code>app=grafana</code></li>
+<li><strong>Prometheus datasource</strong> configured in Grafana</li>
+</ul>
+<h3 id="deploy-dashboards">Deploy Dashboards</h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>./scripts/observability/install-grafana-dashboards.sh
+</code></pre></div>
+<p><strong>Behavior:</strong> Discovers Grafana cluster-wide. Deploys to namespace if one instance found. Warns if none or multiple.</p>
+<p><strong>Target specific instance:</strong></p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>./scripts/observability/install-grafana-dashboards.sh<span class="w"> </span>--grafana-namespace<span class="w"> </span>maas-api
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>./scripts/observability/install-grafana-dashboards.sh<span class="w"> </span>--grafana-label<span class="w"> </span><span class="nv">app</span><span class="o">=</span>grafana
+</code></pre></div>
+<p><strong>Manual deployment:</strong></p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>kustomize<span class="w"> </span>build<span class="w"> </span>deployment/components/observability/grafana<span class="w"> </span><span class="p">|</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="w">  </span>sed<span class="w"> </span><span class="s2">&quot;s/namespace: maas-api/namespace: &lt;your-namespace&gt;/g&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="w">  </span>kubectl<span class="w"> </span>apply<span class="w"> </span>-f<span class="w"> </span>-
+</code></pre></div>
+<h3 id="sample-dashboard-json">Sample Dashboard JSON</h3>
+<p>For manual import: <a href="https://github.com/opendatahub-io/models-as-a-service/blob/main/docs/samples/dashboards/maas-token-metrics-dashboard.json">MaaS Token Metrics Dashboard</a></p>
+<ol>
+<li>Grafana → Dashboards → Import</li>
+<li>Upload JSON or paste content</li>
+<li>Select Prometheus datasource</li>
+</ol>
 
 
 
@@ -3500,7 +3623,7 @@
     <span class="md-icon" title="Last update">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M21 13.1c-.1 0-.3.1-.4.2l-1 1 2.1 2.1 1-1c.2-.2.2-.6 0-.8l-1.3-1.3c-.1-.1-.2-.2-.4-.2m-1.9 1.8-6.1 6V23h2.1l6.1-6.1zM12.5 7v5.2l4 2.4-1 1L11 13V7zM11 21.9c-5.1-.5-9-4.8-9-9.9C2 6.5 6.5 2 12 2c5.3 0 9.6 4.1 10 9.3-.3-.1-.6-.2-1-.2s-.7.1-1 .2C19.6 7.2 16.2 4 12 4c-4.4 0-8 3.6-8 8 0 4.1 3.1 7.5 7.1 7.9l-.1.2z"/></svg>
     </span>
-    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-date" title="May 1, 2026 20:21:15 UTC">May 1, 2026</span>
+    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-date" title="May 28, 2026 16:38:16 UTC">May 28, 2026</span>
   </span>
 
     
@@ -3510,7 +3633,7 @@
     <span class="md-icon" title="Created">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M14.47 15.08 11 13V7h1.5v5.25l3.08 1.83c-.41.28-.79.62-1.11 1m-1.39 4.84c-.36.05-.71.08-1.08.08-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8c0 .37-.03.72-.08 1.08.69.1 1.33.32 1.92.64.1-.56.16-1.13.16-1.72 0-5.5-4.5-10-10-10S2 6.5 2 12s4.47 10 10 10c.59 0 1.16-.06 1.72-.16-.32-.59-.54-1.23-.64-1.92M18 15v3h-3v2h3v3h2v-3h3v-2h-3v-3z"/></svg>
     </span>
-    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-date" title="March 18, 2026 15:47:11 UTC">March 18, 2026</span>
+    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-date" title="May 21, 2026 16:49:56 UTC">May 21, 2026</span>
   </span>
 
     
@@ -3565,10 +3688,10 @@
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../../..", "features": ["navigation.tabs", "navigation.sections", "navigation.expand", "navigation.top", "search.highlight", "search.share", "content.code.copy", "content.code.annotate", "search.suggest", "search.boost", "navigation.instant"], "search": "../../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"default": "latest", "provider": "mike"}}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.tabs", "navigation.sections", "navigation.expand", "navigation.top", "search.highlight", "search.share", "content.code.copy", "content.code.annotate", "search.suggest", "search.boost", "navigation.instant"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"default": "latest", "provider": "mike"}}</script>
     
     
-      <script src="../../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../../assets/javascripts/bundle.79ae519e.min.js"></script>
       
     
   </body>
