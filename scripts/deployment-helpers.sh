@@ -870,82 +870,6 @@ find_project_root() {
   fi
 }
 
-# _patch_params_env key value project_root
-#   Patches a key=value line in params.env. Creates a backup on first call.
-_patch_params_env() {
-  local key="$1" value="$2" project_root="$3"
-  local overlay="odh"
-  [[ "${DEV_MODE:-false}" == "true" ]] && overlay="dev"
-  export _MAAS_PARAMS_ENV="$project_root/deployment/overlays/$overlay/params.env"
-  [ -f "$_MAAS_PARAMS_ENV" ] || return 0
-  export _MAAS_PARAMS_ENV_BACKUP="${_MAAS_PARAMS_ENV}.backup"
-  if [ ! -f "$_MAAS_PARAMS_ENV_BACKUP" ]; then
-    cp "$_MAAS_PARAMS_ENV" "$_MAAS_PARAMS_ENV_BACKUP"
-  fi
-  local sed_cmd="sed"
-  [[ "$(uname -s)" == "Darwin" ]] && sed_cmd="gsed"
-  $sed_cmd -i "s|^${key}=.*|${key}=${value}|" "$_MAAS_PARAMS_ENV"
-}
-
-# _cleanup_params_env
-#   Restores params.env from backup. Safe to call multiple times.
-_cleanup_params_env() {
-  if [ -n "${_MAAS_PARAMS_ENV_BACKUP:-}" ] && [ -f "$_MAAS_PARAMS_ENV_BACKUP" ]; then
-    mv -f "$_MAAS_PARAMS_ENV_BACKUP" "$_MAAS_PARAMS_ENV" 2>/dev/null || true
-  fi
-}
-
-# set_maas_api_image
-#   Sets the MaaS API container image in base kustomization using MAAS_API_IMAGE env var.
-#   If MAAS_API_IMAGE is not set, does nothing.
-#   Creates a backup that must be restored by calling cleanup_maas_api_image.
-#
-# Environment:
-#   MAAS_API_IMAGE - Container image to use (e.g., quay.io/opendatahub/maas-api:pr-123)
-set_maas_api_image() {
-  if [ -z "${MAAS_API_IMAGE:-}" ]; then
-    return 0
-  fi
-  if [ -n "${_MAAS_API_IMAGE_SET:-}" ]; then
-    return 0
-  fi
-
-  local project_root
-  project_root="$(find_project_root)" || {
-    echo "Error: failed to find project root" >&2
-    return 1
-  }
-
-  export _MAAS_API_KUSTOMIZATION="$project_root/deployment/base/maas-api/core/kustomization.yaml"
-  export _MAAS_API_BACKUP="${_MAAS_API_KUSTOMIZATION}.backup"
-  export _MAAS_API_IMAGE_SET=1
-
-  echo "   Setting MaaS API image: ${MAAS_API_IMAGE}"
-  cp "$_MAAS_API_KUSTOMIZATION" "$_MAAS_API_BACKUP" || {
-    echo "Error: failed to create backup of kustomization.yaml" >&2
-    return 1
-  }
-  (cd "$(dirname "$_MAAS_API_KUSTOMIZATION")" && kustomize edit set image "maas-api=${MAAS_API_IMAGE}") || {
-    echo "Error: failed to set image in kustomization.yaml" >&2
-    mv -f "$_MAAS_API_BACKUP" "$_MAAS_API_KUSTOMIZATION" 2>/dev/null || true
-    return 1
-  }
-
-  # Patch params.env — kustomize replacements in shared-patches read from this
-  # file and override the base images: transformer set above.
-  _patch_params_env "maas-api-image" "$MAAS_API_IMAGE" "$project_root"
-}
-
-# cleanup_maas_api_image
-#   Restores the original kustomization.yaml and params.env from backup.
-#   Safe to call even if set_maas_api_image was not called or MAAS_API_IMAGE was not set.
-cleanup_maas_api_image() {
-  if [ -n "${_MAAS_API_BACKUP:-}" ] && [ -f "$_MAAS_API_BACKUP" ]; then
-    mv -f "$_MAAS_API_BACKUP" "$_MAAS_API_KUSTOMIZATION" 2>/dev/null || true
-  fi
-  _cleanup_params_env
-}
-
 # set_overlay_namespace overlay_dir namespace
 #   Sets the namespace in the overlay's kustomization.yaml before build.
 #   Creates a backup that must be restored by calling cleanup_overlay_namespace.
@@ -1601,6 +1525,60 @@ wait_authorino_ready() {
   done
 
   echo "  WARNING: Auth request verification timed out, continuing anyway"
+  return 0
+}
+
+# ==========================================
+# External OIDC / AuthPolicy alignment
+# ==========================================
+
+# verify_maas_api_oidc_authpolicy <namespace>
+# When OIDC_ISSUER_URL is set, verify the live maas-api-auth-policy matches
+# deploy/test expectations so Authorino jwt.issuerUrl equals the issuer used to
+# mint tokens (avoids endless HTTP 401 from issuer drift).
+# Optional: OIDC_CLIENT_ID must match oidc-client-bound azp pattern when present.
+# Returns 0 if skipped (no OIDC_ISSUER_URL) or match; 1 on failure.
+verify_maas_api_oidc_authpolicy() {
+  local ns="${1:-opendatahub}"
+  if [[ -z "${OIDC_ISSUER_URL:-}" ]]; then
+    return 0
+  fi
+  if ! command -v jq &>/dev/null; then
+    echo "verify_maas_api_oidc_authpolicy: jq not found; skipping OIDC issuer check" >&2
+    return 0
+  fi
+  local json
+  if ! json=$(kubectl get authpolicy maas-api-auth-policy -n "$ns" -o json 2>/dev/null); then
+    echo "verify_maas_api_oidc_authpolicy: could not read authpolicy/maas-api-auth-policy in namespace $ns" >&2
+    return 1
+  fi
+  local policy_issuer
+  policy_issuer=$(echo "$json" | jq -r '.spec.rules.authentication["oidc-identities"].jwt.issuerUrl // empty')
+  if [[ -z "$policy_issuer" ]]; then
+    echo "verify_maas_api_oidc_authpolicy: AuthPolicy has no spec.rules.authentication[\"oidc-identities\"].jwt.issuerUrl" >&2
+    echo "  External OIDC merge patch may be missing; deploy with --external-oidc and OIDC_ISSUER_URL set." >&2
+    return 1
+  fi
+  local exp got
+  exp="${OIDC_ISSUER_URL%/}"
+  got="${policy_issuer%/}"
+  if [[ "$exp" != "$got" ]]; then
+    echo "verify_maas_api_oidc_authpolicy: OIDC issuer mismatch." >&2
+    echo "  Expected (OIDC_ISSUER_URL):        $exp" >&2
+    echo "  Live AuthPolicy jwt.issuerUrl:    $got" >&2
+    echo "  Fix: ensure configure_maas_api_authpolicy in deploy.sh runs with the same OIDC_ISSUER_URL as tests." >&2
+    return 1
+  fi
+  if [[ -n "${OIDC_CLIENT_ID:-}" ]]; then
+    local policy_client
+    policy_client=$(echo "$json" | jq -r '.spec.rules.authorization["oidc-client-bound"].patternMatching.patterns[0].value // empty')
+    if [[ -n "$policy_client" && "$policy_client" != "${OIDC_CLIENT_ID}" ]]; then
+      echo "verify_maas_api_oidc_authpolicy: OIDC client id mismatch." >&2
+      echo "  Expected (OIDC_CLIENT_ID):     ${OIDC_CLIENT_ID}" >&2
+      echo "  Live oidc-client-bound value: $policy_client" >&2
+      return 1
+    fi
+  fi
   return 0
 }
 

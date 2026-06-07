@@ -29,7 +29,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -56,6 +55,8 @@ type TenantReconciler struct {
 	GatewayName string
 	// GatewayNamespace is the namespace of the Gateway resource resolved from cmd/manager flags.
 	GatewayNamespace string
+	// ClusterAudience is the OIDC audience resolved at startup (auto-detected issuer or default).
+	ClusterAudience string
 }
 
 // Tenant platform pipeline — resources the TenantReconciler creates and manages on behalf of maas-api.
@@ -152,7 +153,7 @@ func secretNamedMaaSDB() predicate.Predicate {
 func (r *TenantReconciler) inTenantWorkNamespaces() predicate.Predicate {
 	return predicate.NewPredicateFuncs(func(o client.Object) bool {
 		ns := o.GetNamespace()
-		return ns == r.AppNamespace || ns == r.operatorNamespace()
+		return ns == r.AppNamespace || ns == r.TenantNamespace || ns == r.operatorNamespace()
 	})
 }
 
@@ -166,24 +167,6 @@ func configResourceDefault() predicate.Predicate {
 	return predicate.NewPredicateFuncs(func(o client.Object) bool {
 		return o.GetName() == maasv1alpha1.ConfigInstanceName
 	})
-}
-
-// deletedConfigMapOnly mirrors ODH: unmanaged ConfigMaps are recreated when deleted.
-func deletedConfigMapOnly() predicate.Predicate {
-	return predicate.Funcs{
-		CreateFunc: func(event.CreateEvent) bool {
-			return false
-		},
-		UpdateFunc: func(event.UpdateEvent) bool {
-			return false
-		},
-		DeleteFunc: func(event.DeleteEvent) bool {
-			return true
-		},
-		GenericFunc: func(event.GenericEvent) bool {
-			return false
-		},
-	}
 }
 
 // SetupWithManager registers the Tenant controller.
@@ -218,11 +201,6 @@ func (r *TenantReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&extv1.CustomResourceDefinition{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueDefaultTenant),
 			builder.WithPredicates(crdInOptionalAPIGroup()),
-		).
-		Watches(
-			&corev1.ConfigMap{},
-			handler.EnqueueRequestsFromMapFunc(r.enqueueDefaultTenant),
-			builder.WithPredicates(deletedConfigMapOnly(), r.inTenantWorkNamespaces()),
 		).
 		Watches(
 			&corev1.Secret{},
