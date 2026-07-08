@@ -150,7 +150,7 @@ func (r *TenantReconciler) reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 	setDependenciesCondition(&tenant, true, "")
 
-	appNs := r.AppNamespace
+	appNs := r.appNamespaceForTenant(&tenant)
 	rep := tenantreconcile.CollectPrerequisiteReport(ctx, r.Client, appNs)
 	setPrerequisiteConditionsFromReport(&tenant, rep)
 	if len(rep.Blocking) > 0 {
@@ -171,7 +171,7 @@ func (r *TenantReconciler) reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{RequeueAfter: 45 * time.Second}, nil
 	}
 
-	runRes, err := tenantreconcile.RunPlatform(ctx, log, r.Client, r.Scheme, &tenant, r.ManifestPath, appNs, mcfg)
+	runRes, err := tenantreconcile.RunPlatform(ctx, log, r.Client, r.Scheme, &tenant, r.ManifestPath, appNs, r.ClusterAudience, mcfg)
 	if err != nil {
 		log.Error(err, "Tenant platform reconcile failed")
 		setDeploymentsAvailableCondition(&tenant, false, "PlatformReconcileFailed", err.Error())
@@ -274,6 +274,13 @@ func (r *TenantReconciler) operatorNamespace() string {
 		return ns
 	}
 	return os.Getenv("WATCH_NAMESPACE")
+}
+
+func (r *TenantReconciler) appNamespaceForTenant(tenant *maasv1alpha1.Tenant) string {
+	if r.AppNamespace != "" {
+		return r.AppNamespace
+	}
+	return tenant.Namespace
 }
 
 func (r *TenantReconciler) applyGatewayDefaults(tenant *maasv1alpha1.Tenant) error {
