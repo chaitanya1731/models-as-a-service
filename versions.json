@@ -6,5 +6,10 @@
     "properties": {
       "hidden": true
     }
+  },
+  {
+    "version": "v0.3.0-test",
+    "title": "v0.3.0-test",
+    "aliases": []
   }
 ]
