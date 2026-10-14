@@ -43,6 +43,7 @@ jobs:
           working-directory: ${{ env.PROJECT_DIR }}
   govulncheck:
     runs-on: ubuntu-latest
+    continue-on-error: ${{ vars.GOVULNCHECK_SOFT_FAIL == 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
 
@@ -52,8 +53,11 @@ jobs:
           cache: true
           cache-dependency-path: ${{ env.PROJECT_DIR }}/go.sum
 
-      - name: Run govulncheck (non-blocking until Go toolchain is bumped)
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./... || true
+      - name: Run govulncheck
+        run: |
+          echo "GOVULNCHECK_SOFT_FAIL=${{ vars.GOVULNCHECK_SOFT_FAIL }}"
+          echo "continue-on-error evaluated to: ${{ vars.GOVULNCHECK_SOFT_FAIL == 'true' }}"
+          go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 
   test:
     runs-on: ubuntu-latest
