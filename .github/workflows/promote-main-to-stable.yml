@@ -16,11 +16,6 @@ on:
     - cron: '0 0 * * 0'  # Every Sunday at midnight UTC
   workflow_dispatch:
 
-permissions:
-  contents: read
-  issues: write        # label operations go through the issues API
-  pull-requests: write
-
 env:
   GH_USER_NAME: github-actions[bot]
   GH_USER_EMAIL: github-actions[bot]@users.noreply.github.com
@@ -29,6 +24,10 @@ jobs:
   promote:
     name: Promote main to stable
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write        # label operations go through the issues API
+      pull-requests: write
 
     steps:
       - name: Checkout repository
