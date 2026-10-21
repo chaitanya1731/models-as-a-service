@@ -289,6 +289,9 @@ ENVIRONMENT VARIABLES:
   EXTERNAL_OIDC             Enable external OIDC on maas-api (true/false)
   OIDC_ISSUER_URL           External OIDC issuer URL for maas-api AuthPolicy patching
   OIDC_CLIENT_ID            External OIDC client ID for maas-api AuthPolicy patching (required with EXTERNAL_OIDC)
+  OIDC_AUDIENCE             Optional required token audience, set on the default AITenant spec.oidc.audience
+  OIDC_ACCESS_TOKEN_PURPOSE_CLAIM  Optional access-token purpose claim name (set with OIDC_ACCESS_TOKEN_PURPOSE)
+  OIDC_ACCESS_TOKEN_PURPOSE Optional required access-token purpose value (set with OIDC_ACCESS_TOKEN_PURPOSE_CLAIM)
   LOG_LEVEL                 Logging verbosity (DEBUG, INFO, WARN, ERROR)
   FORCE_OVERWRITE           When true, re-apply manifests even if the resource already exists (default: false)
   POSTGRES_CONNECTION       External PostgreSQL connection string (same as --postgres-connection)
@@ -1852,11 +1855,26 @@ configure_tenant_external_oidc() {
     return 1
   }
 
+  # Optional strict-contract fields. Delegated Grid administration requires all
+  # of them; the purpose claim and value are only meaningful together.
+  local oidc_audience="${OIDC_AUDIENCE:-}"
+  local oidc_purpose_claim="${OIDC_ACCESS_TOKEN_PURPOSE_CLAIM:-}"
+  local oidc_purpose="${OIDC_ACCESS_TOKEN_PURPOSE:-}"
+  if [[ -n "$oidc_purpose_claim" && -z "$oidc_purpose" ]] || [[ -z "$oidc_purpose_claim" && -n "$oidc_purpose" ]]; then
+    log_error "OIDC_ACCESS_TOKEN_PURPOSE_CLAIM and OIDC_ACCESS_TOKEN_PURPOSE must be set together"
+    return 1
+  fi
+
   local aitenant_patch
   aitenant_patch=$(jq -nc \
     --arg issuerUrl "$oidc_issuer_url" \
     --arg clientId "$oidc_client_id" \
-    '{spec:{oidc:{issuerUrl:$issuerUrl,clientId:$clientId}}}')
+    --arg audience "$oidc_audience" \
+    --arg purposeClaim "$oidc_purpose_claim" \
+    --arg purpose "$oidc_purpose" \
+    '{spec:{oidc:({issuerUrl:$issuerUrl,clientId:$clientId}
+      + (if $audience != "" then {audience:$audience} else {} end)
+      + (if $purposeClaim != "" then {accessTokenPurposeClaim:$purposeClaim,accessTokenPurpose:$purpose} else {} end))}}')
 
   if kubectl get aitenant "$aitenant_name" -n "$aitenant_ns" &>/dev/null; then
     log_info "  Patching AITenant '$aitenant_name' with external OIDC"

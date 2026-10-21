@@ -40,6 +40,9 @@
 #   INSECURE_HTTP  - Deploy without TLS and use HTTP for tests (default: false)
 #   EXTERNAL_OIDC - Enable external OIDC e2e coverage (default: false)
 #   OIDC_ISSUER_URL, OIDC_TOKEN_URL, OIDC_CLIENT_ID, OIDC_USERNAME, OIDC_PASSWORD
+#   OIDC_AUDIENCE, OIDC_ACCESS_TOKEN_PURPOSE_CLAIM, OIDC_ACCESS_TOKEN_PURPOSE - Optional strict
+#                   OIDC contract applied to the default AITenant by deploy.sh
+#   E2E_RUN_ONLY_OIDC_TESTS - Skip passes 1–2 and run only the OIDC tests (requires EXTERNAL_OIDC=true)
 #   OIDC_READINESS_STRICT - Exit if OIDC gateway readiness fails (default: true)
 #   DEPLOYMENT_NAMESPACE - Namespace of maas-controller (default: opendatahub)
 #   MAAS_SUBSCRIPTION_NAMESPACE - Namespace of MaaS CRs (default: models-as-a-service)
