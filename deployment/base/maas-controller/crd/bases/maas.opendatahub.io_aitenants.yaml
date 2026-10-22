@@ -186,6 +186,7 @@ spec:
                         description: Name of the Secret.
                         maxLength: 253
                         minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                         type: string
                     required:
                     - key
@@ -202,7 +203,11 @@ spec:
                       RefreshInterval is how often the consumer portal auth proxy refreshes the
                       session's access token. It must be shorter than the identity provider's
                       access token lifetime. Defaults to 4m when unset.
+                    pattern: ^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$
                     type: string
+                    x-kubernetes-validations:
+                    - message: refreshInterval must be a positive duration
+                      rule: duration(self) > duration('0s')
                   ttl:
                     default: 300
                     description: TTL is the JWKS cache duration in seconds.

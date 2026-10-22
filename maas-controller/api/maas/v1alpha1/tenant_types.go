@@ -140,6 +140,9 @@ type TenantExternalOIDCConfig struct {
 	// session's access token. It must be shorter than the identity provider's
 	// access token lifetime. Defaults to 4m when unset.
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$`
+	// +kubebuilder:validation:XValidation:rule="duration(self) > duration('0s')",message="refreshInterval must be a positive duration"
 	RefreshInterval *metav1.Duration `json:"refreshInterval,omitempty"`
 }
 
@@ -148,6 +151,7 @@ type OIDCClientSecretReference struct {
 	// Name of the Secret.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	Name string `json:"name"`
 
 	// Key in the Secret's data that holds the client secret.
