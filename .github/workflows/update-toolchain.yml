@@ -1,0 +1,161 @@
+# Update Go Toolchain
+#
+# Red Hat publishes UBI go-toolset images weeks after the corresponding
+# upstream Go releases, and the Konflux image builds run on those images.
+# This workflow bumps the Go toolchain only when UBI can actually build it:
+# it resolves the newest Go version published in the UBI go-toolset tags and,
+# when it is newer than the go directives, opens a single PR that bumps all
+# module go.mod directives, all Dockerfile GOLANG_VERSIONs and the
+# golangci-lint pins together (via .github/scripts/toolchain.sh).
+#
+# Usage:
+#   1. Runs weekly on schedule (no-op, no PR, when UBI has nothing newer)
+#   2. Or via Actions > Update Go Toolchain > Run workflow
+
+name: Update Go Toolchain
+
+on:
+  schedule:
+    - cron: "0 6 * * 2" # Tuesday 06:00 UTC, after Monday's dependabot run
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  GH_USER_NAME: github-actions[bot]
+  GH_USER_EMAIL: github-actions[bot]@users.noreply.github.com
+
+jobs:
+  update:
+    name: Update Go toolchain
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "${{ env.GH_USER_NAME }}"
+          git config user.email "${{ env.GH_USER_EMAIL }}"
+
+      - name: Resolve current and latest toolchain
+        id: versions
+        run: |
+          set -euo pipefail
+
+          chmod +x .github/scripts/toolchain.sh
+          CURRENT="$(sed -n 's/^go \(1\.[0-9]*\.[0-9]*\)$/\1/p' maas-api/go.mod | head -1)"
+          LATEST="$(.github/scripts/toolchain.sh latest || true)"
+
+          {
+            echo "current=${CURRENT}"
+            echo "latest=${LATEST}"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -z "$LATEST" ] || [ "$LATEST" = "$CURRENT" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Toolchain is up to date (go ${CURRENT})."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Updating Go toolchain: ${CURRENT} -> ${LATEST}"
+          fi
+
+      - name: Resolve latest golangci-lint release
+        if: steps.versions.outputs.skip != 'true'
+        id: golangci
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="$(gh api repos/golangci/golangci-lint/releases/latest --jq .tag_name)"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "golangci-lint: ${VERSION}"
+
+      - name: Bump toolchain
+        if: steps.versions.outputs.skip != 'true'
+        env:
+          GOTOOLCHAIN: auto
+        run: |
+          set -euo pipefail
+          .github/scripts/toolchain.sh bump \
+            "${{ steps.versions.outputs.latest }}" \
+            "${{ steps.golangci.outputs.version }}"
+
+      - name: Create or update PR
+        if: steps.versions.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT: ${{ steps.versions.outputs.current }}
+          LATEST: ${{ steps.versions.outputs.latest }}
+          GOLANGCI: ${{ steps.golangci.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          BRANCH="chore/bump-go-toolchain-${LATEST}"
+
+          git checkout -b "$BRANCH"
+          git add \
+            maas-api/go.mod maas-api/go.sum \
+            maas-common/go.mod maas-common/go.sum \
+            maas-controller/go.mod maas-controller/go.sum \
+            maas-discovery/go.mod maas-discovery/go.sum \
+            maas-api/Dockerfile maas-controller/Dockerfile maas-discovery/Dockerfile \
+            maas-api/tools.mk maas-controller/tools.mk maas-discovery/tools.mk
+          git commit -s \
+            -m "chore: bump Go toolchain to ${LATEST}" \
+            -m "Coupled bump of all module go directives, Dockerfile GOLANG_VERSIONs and golangci-lint pins (${GOLANGCI}). UBI go-toolset now publishes ${LATEST}, so Konflux image builds stay green."
+          git push --force-with-lease origin "$BRANCH"
+
+          BODY="## Update Go toolchain"
+          BODY="${BODY}"$'\n\n'"Automated coupled bump of the Go toolchain: all module \`go\` directives, all Dockerfile \`GOLANG_VERSION\`s and the golangci-lint pins move together."
+          BODY="${BODY}"$'\n\n'"| Detail | Value |"
+          BODY="${BODY}"$'\n'"| --- | --- |"
+          BODY="${BODY}"$'\n'"| Previous go directive | \`${CURRENT}\` |"
+          BODY="${BODY}"$'\n'"| New go directive | \`${LATEST}\` |"
+          BODY="${BODY}"$'\n'"| UBI builder | \`ubi9/go-toolset:$(echo "${LATEST}" | cut -d. -f1-2)\` |"
+          BODY="${BODY}"$'\n'"| golangci-lint | \`${GOLANGCI}\` |"
+          BODY="${BODY}"$'\n\n'"The UBI go-toolset image publishes this version, so Konflux image builds pass by construction. Dependabot PRs held by the ubi-toolchain-gate check can be rebased after this merges."
+
+          EXISTING_PR="$(gh pr list --head "$BRANCH" --state open --json number,url --jq '.[0] // empty')"
+          if [ -n "$EXISTING_PR" ]; then
+            PR_NUMBER="$(echo "$EXISTING_PR" | jq -r '.number')"
+            PR_URL="$(echo "$EXISTING_PR" | jq -r '.url')"
+            echo "$BODY" | gh pr edit "$PR_NUMBER" --title "chore: bump Go toolchain to ${LATEST}" --body-file -
+            echo "Updated existing PR #${PR_NUMBER}"
+          else
+            PR_URL="$(echo "$BODY" | gh pr create \
+              --base main \
+              --head "$BRANCH" \
+              --title "chore: bump Go toolchain to ${LATEST}" \
+              --body-file -)"
+            PR_NUMBER="${PR_URL##*/}"
+            echo "Created PR #${PR_NUMBER}"
+          fi
+
+          {
+            echo "## Go toolchain updated"
+            echo ""
+            echo "**PR:** [#${PR_NUMBER}](${PR_URL})"
+            echo ""
+            echo "| Detail | Value |"
+            echo "| --- | --- |"
+            echo "| Previous | \`${CURRENT}\` |"
+            echo "| New | \`${LATEST}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summary (already up to date)
+        if: steps.versions.outputs.skip == 'true'
+        env:
+          CURRENT: ${{ steps.versions.outputs.current }}
+        run: |
+          {
+            echo "## Go toolchain up to date"
+            echo ""
+            echo "No changes needed. Current go directive: \`${CURRENT}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

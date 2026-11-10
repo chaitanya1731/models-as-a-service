@@ -19,7 +19,21 @@ defaults:
     working-directory: maas-api
 
 jobs:
+  ubi-toolchain-gate:
+    # The Konflux image builds run on Red Hat's UBI go-toolset images, which
+    # trail upstream Go releases by weeks. Fail fast (and legibly) when a go
+    # directive cannot be built, instead of failing inside lint/build with
+    # cryptic toolchain errors.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+
+      - name: Check go directives against the UBI builder
+        working-directory: .
+        run: .github/scripts/toolchain.sh check
+
   lint:
+    needs: ubi-toolchain-gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
@@ -42,6 +56,7 @@ jobs:
           version: ${{ steps.golangci-version.outputs.version }}
           working-directory: ${{ env.PROJECT_DIR }}
   govulncheck:
+    needs: ubi-toolchain-gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
@@ -56,6 +71,7 @@ jobs:
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./... || true
 
   test:
+    needs: ubi-toolchain-gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
