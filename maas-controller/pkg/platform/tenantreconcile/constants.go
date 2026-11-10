@@ -1,26 +1,18 @@
 // Package tenantreconcile implements the Tenant platform reconcile pipeline
 // (initialize → dependencies → prerequisites → gateway → params → kustomize → post-render → apply → deployment status).
-// The pipeline stages mirror the ODH operator's component deploy pattern; the Tenant CR is the
+// The pipeline stages mirror the ODH operator's component deploy pattern; the MaasTenantConfig CR is the
 // runtime object that drives this lifecycle (DSC.modelsAsService controls enablement only).
 package tenantreconcile
 
 import (
+	"fmt"
+	"reflect"
+
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	maasv1alpha1 "github.com/opendatahub-io/models-as-a-service/maas-controller/api/maas/v1alpha1"
 )
-
-// OptionalAPIGroups lists API groups whose CRDs are installed by optional platform
-// components (e.g. COO for Perses). Resources in these groups are skipped gracefully
-// when their CRDs are not yet registered, instead of failing the Tenant reconcile.
-// The CRD watch in the controller re-triggers reconcile once the CRDs appear.
-var OptionalAPIGroups = map[string]bool{
-	"perses.dev": true, // Cluster Observability Operator (COO) — Perses dashboards and datasources
-}
-
-// isOptionalAPIGroup returns true when missing CRDs for the given group should not
-// fail the reconcile (i.e. the dependency is installed by an optional operator).
-func isOptionalAPIGroup(group string) bool {
-	return OptionalAPIGroups[group]
-}
 
 const (
 	// AnnotationManaged is the opt-out annotation key used by the ODH operator and MaaS
@@ -28,6 +20,90 @@ const (
 	// the write (create/update) and delete paths. This is the single source of truth;
 	// other packages that need the same key must reference this constant.
 	AnnotationManaged = "opendatahub.io/managed"
+
+	// AnnotationGatewayBodyBufferLimitMB configures the experimental Envoy
+	// listener buffer limit for a MaaS Gateway. The value is expressed in MB.
+	AnnotationGatewayBodyBufferLimitMB = "maas.opendatahub.io/experimental-body-buffer-limit-mb"
+
+	// DefaultGatewayBodyBufferLimitMB is the large-response mitigation applied
+	// when the experimental Gateway annotation is absent.
+	DefaultGatewayBodyBufferLimitMB int64 = 64
+	// MaxGatewayBodyBufferLimitMB bounds the experimental setting.
+	MaxGatewayBodyBufferLimitMB               int64 = 64
+	GatewayBodyBufferLimitEnvoyFilterBaseName       = "maas-gateway-body-buffer-limit"
+
+	// AnnotationMaaSAPIReplicas overrides the maas-api Deployment replica count for a tenant.
+	// spec.maasApi.replicas takes precedence when both are set.
+	AnnotationMaaSAPIReplicas = "maas.opendatahub.io/maas-api-replicas"
+
+	// AnnotationPayloadProcessingReplicas overrides the payload-processing Deployment replica count for a tenant.
+	// When autoscaling is enabled via spec.payloadProcessing.autoscaling, this value sets HPA minReplicas instead.
+	//
+	// Deprecated: prefer spec.payloadProcessing.replicas on MaasTenantConfig/Tenant.
+	AnnotationPayloadProcessingReplicas = "maas.opendatahub.io/payload-processing-replicas"
+
+	// AnnotationPayloadPreProcessingReplicas overrides the payload-pre-processing Deployment replica count for a tenant.
+	// When autoscaling is enabled via spec.payloadPreProcessing.autoscaling, this value sets HPA minReplicas instead.
+	//
+	// Deprecated: prefer spec.payloadPreProcessing.replicas on MaasTenantConfig/Tenant.
+	AnnotationPayloadPreProcessingReplicas = "maas.opendatahub.io/payload-pre-processing-replicas"
+
+	// AnnotationPayloadProcessingStatus coordinates the payload-processing backend
+	// swap handshake between maas-controller (legacy IPP) and ai-gateway-controller
+	// (praxis). It lives only on MaasTenantConfig — never mirrored to/from AITenant.
+	//
+	// From maas-controller's perspective these values matter:
+	//   - PayloadProcessingStatusCleanupComplete ("cleanup-complete"): clear to claim.
+	//     When legacy is selected, CAS-claim by deleting the annotation (back to absent)
+	//     then deploy. When praxis is selected (SkipIPP), IPP cleanup is complete and
+	//     accepted API-translation migration risk warnings must remain visible.
+	//   - PayloadProcessingStatusSteady ("steady"): Praxis owns the pipeline; keep any
+	//     accepted API-translation migration risk warning visible without re-running cleanup.
+	//   - absent: legacy owns / may deploy when legacy is selected (existing tenants are
+	//     assumed to run legacy IPP). When praxis is selected, absent means we still need
+	//     to clean up legacy IPP and then write cleanup-complete.
+	//   - any other value (e.g. praxis's own claim sentinel): not our turn — wait when
+	//     legacy is selected; do not overwrite when SkipIPP. maas-controller does not
+	//     interpret peer-specific values.
+	//
+	// Every new MaasTenantConfig is seeded with cleanup-complete at creation time
+	// (see AITenantReconciler.ensureTenantConfig's mutateCreate hook) so a brand-new
+	// tenant's first-ever deploy is never blocked by absent.
+	//
+	// The switch-off party deletes its bundle first, then sets cleanup-complete only
+	// after full cleanup success. Transitioning-in parties claim via optimistic-
+	// concurrency Update (resourceVersion-checked), not a blind merge-patch.
+	AnnotationPayloadProcessingStatus = "maas.opendatahub.io/payload-processing-status"
+
+	// PayloadProcessingStatusCleanupComplete means peer cleanup finished; the
+	// selected party may claim.
+	PayloadProcessingStatusCleanupComplete = "cleanup-complete"
+
+	// PayloadProcessingStatusSteady means Praxis owns and serves the tenant pipeline.
+	PayloadProcessingStatusSteady = "steady"
+
+	// AnnotationForcePayloadProcessingMigration is the operator opt-in that allows
+	// IPP→Praxis migration when the live payload-processing-plugins ConfigMap is
+	// non-standard (RHOAIENG-98846). Value must be "true".
+	AnnotationForcePayloadProcessingMigration = "maas.opendatahub.io/force-payload-processing-migration"
+
+	// AnnotationPayloadProcessingMigration surfaces migration-gate state on
+	// MaasTenantConfig. Value PayloadProcessingMigrationBlocked means automatic
+	// migration is paused until the force annotation is applied (or the
+	// ConfigMap is restored to a known-good baseline).
+	AnnotationPayloadProcessingMigration = "maas.opendatahub.io/payload-processing-migration"
+
+	// PayloadProcessingMigrationBlocked is the AnnotationPayloadProcessingMigration
+	// value when the plugins ConfigMap gate refuses automatic migration.
+	PayloadProcessingMigrationBlocked = "blocked"
+
+	// AnnotationAPITranslationMigrationRisk records an operator-accepted loss of
+	// legacy IPP behavior. It remains on MaasTenantConfig after one-shot cleanup
+	// so status can continue to describe an active compatibility risk.
+	AnnotationAPITranslationMigrationRisk = "maas.opendatahub.io/api-translation-migration-risk"
+
+	APITranslationMigrationRiskExplicitFalse = "explicit-false"
+	APITranslationMigrationRiskForced        = "forced"
 
 	// ComponentName is the ODH component label key suffix (app.opendatahub.io/<name>).
 	// This is the DSC component identifier, not a standalone CR kind.
@@ -38,21 +114,99 @@ const (
 	LabelTenantName      = "maas.opendatahub.io/tenant-name"
 	LabelTenantNamespace = "maas.opendatahub.io/tenant-namespace"
 
-	GatewayDefaultAuthPolicyName               = "gateway-default-auth"
-	GatewayTokenRateLimitDefaultDenyPolicyName = "gateway-default-deny"
-	MaaSAPIAuthPolicyName                      = "maas-api-auth-policy"
-	GatewayDestinationRuleName                 = "maas-api-backend-tls"
-	TelemetryPolicyName                        = "maas-telemetry"
-	IstioTelemetryName                         = "latency-per-subscription"
-	MaaSParametersConfigMapName                = "maas-parameters"
-	MaaSAPIDeploymentName                      = "maas-api"
+	// LabelAIGatewayTenant is the ADR-defined tenant marker on tenant admin namespaces.
+	LabelAIGatewayTenant = "ai-gateway.opendatahub.io/tenant"
+
+	// LabelManagedByAITenant is set to "true" on namespaces created/adopted
+	// by the AITenant reconciler (S11). The subscription/auth-policy controllers
+	// use this label to discover tenant namespaces dynamically.
+	LabelManagedByAITenant = "maas.opendatahub.io/managed-by-aitenant"
+
+	// LabelGatewayAccess is set to "true" on tenant namespaces so that the MaaS Gateway
+	// allowedRoutes selector accepts HTTPRoutes from those namespaces.
+	LabelGatewayAccess = "maas.opendatahub.io/gateway-access"
+
+	// DefaultAITenantNamespace is the default namespace where AITenant CRs are created.
+	DefaultAITenantNamespace = "ai-tenants"
+
+	// DefaultAITenantName is the AITenant that represents the legacy/default
+	// models-as-a-service installation during single-tenant to multi-tenant migration.
+	DefaultAITenantName = "models-as-a-service"
+
+	// DefaultInfraNamespace is the fallback infrastructure namespace when --infra-namespace flag is not specified.
+	// AUTO = automatically derive from controller namespace (namespace separation enabled by default).
+	// Note: PostgreSQL can be external - only maas-api and the connection secret deploy here.
+	// Production deployments use this default. ROSA deployments must override to "" (empty) to disable separation.
+	DefaultInfraNamespace = "AUTO"
+
+	DefaultMaaSAPIImage                = "quay.io/opendatahub/maas-api:latest"
+	DefaultPayloadProcessingImage      = "quay.io/opendatahub/odh-ai-gateway-payload-processing:odh-stable"
+	DefaultMaaSAPIKeyCleanupImage      = "registry.redhat.io/ubi9/ubi-minimal:9.7"
+	DefaultAPIKeyMaxExpirationDays     = "90"
+	DefaultAPIKeyDeletionRetentionDays = "90"
+
+	// DefaultOTLPCollectorService is the platform DSCI OpenTelemetry collector Service name.
+	DefaultOTLPCollectorService = "data-science-collector-collector"
+	// DefaultOTLPCollectorPodLabelKey labels OpenTelemetry operator collector pods.
+	DefaultOTLPCollectorPodLabelKey = "app.kubernetes.io/name"
+	// DefaultOTLPCollectorComponentLabelKey labels OpenTelemetry operator collector pods.
+	DefaultOTLPCollectorComponentLabelKey = "app.kubernetes.io/component"
+	// DefaultOTLPCollectorComponentLabelValue is the component label on DSCI collector pods.
+	DefaultOTLPCollectorComponentLabelValue = "opentelemetry-collector"
+	// DefaultOTLPCollectorPort is the gRPC OTLP ingest port on the platform collector.
+	DefaultOTLPCollectorPort int32 = 4317
+	// DefaultOTELTracesSampler is the sampler accepted by the pinned llm-d build.
+	DefaultOTELTracesSampler = "parentbased_traceidratio"
+	// DefaultOTELTracesSamplerArg samples all traces on dev/CI clusters (use 0.1 in prod).
+	DefaultOTELTracesSamplerArg = "1.0"
+
+	// Resource name base constants for multi-tenant resources.
+	// These are used with tenant identifiers to create unique resource names per tenant.
+	// For legacy/default tenant (empty tenantID), these values are used as-is.
+	baseGatewayTokenRateLimitDefaultDenyPolicyName = "gateway-default-deny"
+	baseMaaSAPIAuthPolicyName                      = "maas-api-auth-policy"
+	baseMaaSAPIRouteName                           = "maas-api-route"
+	baseMaaSAPIKeyCleanupCronJobName               = "maas-api-key-cleanup" //nolint:gosec // Kubernetes resource name, not a credential
+	baseGatewayDestinationRuleName                 = "maas-api-backend-tls"
+	baseTelemetryPolicyName                        = "maas-telemetry"
+	baseIstioTelemetryName                         = "latency-per-subscription"
+	baseMaaSAPIDeploymentName                      = "maas-api"
+	baseMaaSAPIServiceName                         = "maas-api"
+	baseMaaSAPIKeyCleanupScriptConfigMapName       = "maas-api-key-cleanup-script" //nolint:gosec // Kubernetes resource name, not a credential
+	baseMaaSAPIDeploymentNSNetworkPolicyName       = "maas-api-allow-deployment-ns"
+	baseMaaSAPIGatewayNetworkPolicyName            = "maas-api-allow-gateway"
+	baseMaaSAPIEgressRestrictNetworkPolicyName     = "maas-api-egress-restrict"
+	baseMaaSAPIServingCertName                     = "maas-api-serving-cert"
+	baseUsageLogsEnvoyFilterName                   = "maas-model-access-logs"
+
+	// Base IPP resource names in kustomize manifests. Per-tenant deployments suffix
+	// these with "-{tenantID}" (default tenant keeps unsuffixed names).
+	PayloadProcessingName                         = "payload-processing"
+	PayloadPreProcessingName                      = "payload-pre-processing"
+	PayloadProcessingPluginsConfigMapName         = "payload-processing-plugins"
+	PayloadProcessingReaderClusterRoleBindingName = "payload-processing-reader"
+	// PayloadProcessingEnvoyFilterPriority runs after Kuadrant's default-priority (0)
+	// EnvoyFilter so RHCL's envoy.filters.http.wasm anchor exists when we INSERT_*.
+	PayloadProcessingEnvoyFilterPriority int64 = 10
+
+	// LabelTenantInstance distinguishes pods when multiple IPP stacks share a gateway namespace.
+	LabelTenantInstance = "maas.opendatahub.io/tenant-instance"
 	// MaaSControllerDeploymentName matches deployment/base/maas-controller/manager/manager.yaml.
 	MaaSControllerDeploymentName = "maas-controller"
 	MaaSDBSecretName             = "maas-db-config" //nolint:gosec // secret name reference, not a credential
 	MaaSDBSecretKey              = "DB_CONNECTION_URL"
 
-	MonitoringNamespace         = "openshift-monitoring"
-	ClusterMonitoringConfigName = "cluster-monitoring-config"
+	// LokiReadSecretName is the Secret in the app namespace whose presence
+	// enables the maas-api read-only Loki proxy (GET /v1/logs*). Its absence
+	// leaves LOKI_READ_ENDPOINT unset, which disables the proxy.
+	LokiReadSecretName = "usage-logs-loki" //nolint:gosec // secret name reference, not a credential
+	// LokiReadSecretKey holds the Loki read API base URL injected as the
+	// LOKI_READ_ENDPOINT env var on the maas-api container.
+	LokiReadSecretKey = "LOKI_READ_ENDPOINT" //nolint:gosec // secret key reference, not a credential
+	// LokiReadTokenSecretKey holds the service account token injected as the
+	// LOKI_READ_TOKEN env var on the maas-api container (via secretKeyRef, so
+	// the token value never lands in the Deployment spec).
+	LokiReadTokenSecretKey = "LOKI_READ_TOKEN" //nolint:gosec // secret key reference, not a credential
 
 	// Condition types aligned with ODH internal/controller/status for DSC aggregation parity.
 	ConditionDependenciesAvailable      = "DependenciesAvailable"
@@ -62,26 +216,253 @@ const (
 	ReadyConditionType                  = "Ready"
 )
 
-// ImageParamKeys maps params.env keys to RELATED_IMAGE_* env vars (same layout as the ODH operator component support).
-var ImageParamKeys = map[string]string{
-	"maas-api-image":             "RELATED_IMAGE_ODH_MAAS_API_IMAGE",
-	"maas-controller-image":      "RELATED_IMAGE_ODH_MAAS_CONTROLLER_IMAGE",
-	"payload-processing-image":   "RELATED_IMAGE_ODH_AI_GATEWAY_PAYLOAD_PROCESSING_IMAGE",
-	"maas-api-key-cleanup-image": "RELATED_IMAGE_UBI_MINIMAL_IMAGE",
-}
+// maasAPIDashboardDeploymentLabelValues lists deployment labels for pods that call maas-api
+// from the controller namespace (ODH/RHOAI dashboard + maas-ui BFF).
+var maasAPIDashboardDeploymentLabelValues = []string{"odh-dashboard", "rhods-dashboard", "maas-ui"}
 
 // GVKs used for post-render and readiness (mirrors opendatahub-operator/pkg/cluster/gvk selections).
 var (
-	GVKConfigMap            = schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"}
 	GVKDeployment           = schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
+	GVKHTTPRoute            = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"}
+	GVKCronJob              = schema.GroupVersionKind{Group: "batch", Version: "v1", Kind: "CronJob"}
 	GVKAuthPolicy           = schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1", Kind: "AuthPolicy"}
 	GVKTokenRateLimitPolicy = schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1alpha1", Kind: "TokenRateLimitPolicy"}
 	GVKDestinationRule      = schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule"}
+	GVKServiceEntry         = schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "ServiceEntry"}
 	GVKTelemetryPolicy      = schema.GroupVersionKind{Group: "extensions.kuadrant.io", Version: "v1alpha1", Kind: "TelemetryPolicy"}
 	GVKEnvoyFilter          = schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilter"}
 	GVKIstioTelemetry       = schema.GroupVersionKind{Group: "telemetry.istio.io", Version: "v1", Kind: "Telemetry"}
 	GVKAuthConfig           = schema.GroupVersionKind{Group: "authorino.kuadrant.io", Version: "v1beta3", Kind: "AuthConfig"}
 	GVKAuthorino            = schema.GroupVersionKind{Group: "operator.authorino.kuadrant.io", Version: "v1beta1", Kind: "Authorino"}
+	GVKService              = schema.GroupVersionKind{Version: "v1", Kind: "Service"}
+	GVKServiceAccount       = schema.GroupVersionKind{Version: "v1", Kind: "ServiceAccount"}
+	GVKConfigMap            = schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}
+	GVKClusterRoleBinding   = schema.GroupVersionKind{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRoleBinding"}
+	GVKNetworkPolicy        = schema.GroupVersionKind{Group: "networking.k8s.io", Version: "v1", Kind: "NetworkPolicy"}
 	GVKPersesDashboard      = schema.GroupVersionKind{Group: "perses.dev", Version: "v1alpha1", Kind: "PersesDashboard"}
 	GVKPersesDatasource     = schema.GroupVersionKind{Group: "perses.dev", Version: "v1alpha1", Kind: "PersesDatasource"}
+	GVKCertificate          = schema.GroupVersionKind{Group: "cert-manager.io", Version: "v1", Kind: "Certificate"}
+	GVKHPA                  = schema.GroupVersionKind{Group: "autoscaling", Version: "v2", Kind: "HorizontalPodAutoscaler"}
 )
+
+// Resource naming functions for multi-tenant deployment.
+// Each function accepts a tenantID string and returns the appropriate resource name.
+//
+// Tenant identifier behavior:
+// - Empty string ("") = default/legacy tenant (preserves existing names for backward compatibility)
+//   TODO: When database tenant_id filtering is implemented in maas-api, migrate empty string
+//   to "models-as-a-service" for consistency with ADR and database tenant_id column.
+// - Non-empty string = AITenant-managed tenant (e.g., "redteam" from AITenant.metadata.name)
+//
+// Resource naming pattern:
+// - Default tenant (tenantID=""): Returns base name as-is (e.g., "maas-api")
+// - AITenant tenant (tenantID="redteam"): Returns "{base}-{tenantID}" (e.g., "maas-api-redteam")
+//
+// Name length constraints:
+// - Kubernetes resources (Service, ConfigMap, etc.) have a 63-character limit
+// - Longest base name is "maas-api-auth-policy" (21 chars)
+// - Max tenant name: 63 - 21 - 1 (separator) = 41 chars
+// - AITenant CRD enforces this 41-char limit via XValidation
+
+func resourceNameForTenant(baseName, tenantID string) string {
+	if tenantID == "" {
+		return baseName
+	}
+	return baseName + "-" + tenantID
+}
+
+// GatewayBodyBufferLimitEnvoyFilterName returns a stable name for the filter
+// serving one tenant Gateway. The default tenant keeps the historical name.
+func GatewayBodyBufferLimitEnvoyFilterName(tenantID string) string {
+	if tenantID == "" {
+		return GatewayBodyBufferLimitEnvoyFilterBaseName
+	}
+	return resourceNameForTenant("maas-gateway-buffer", tenantID)
+}
+
+func GatewayTokenRateLimitDefaultDenyPolicyName(tenantID string) string {
+	return resourceNameForTenant(baseGatewayTokenRateLimitDefaultDenyPolicyName, tenantID)
+}
+
+func MaaSAPIAuthPolicyName(tenantID string) string {
+	return resourceNameForTenant(baseMaaSAPIAuthPolicyName, tenantID)
+}
+
+func MaaSAPIRouteName(tenantID string) string {
+	return resourceNameForTenant(baseMaaSAPIRouteName, tenantID)
+}
+
+func MaaSAPIKeyCleanupCronJobName(tenantID string) string {
+	return resourceNameForTenant(baseMaaSAPIKeyCleanupCronJobName, tenantID)
+}
+
+func GatewayDestinationRuleName(tenantID string) string {
+	return resourceNameForTenant(baseGatewayDestinationRuleName, tenantID)
+}
+
+func MaaSAPIGatewayNetworkPolicyName(tenantID string) string {
+	if tenantID == "" {
+		return baseMaaSAPIGatewayNetworkPolicyName + "--default"
+	}
+	return resourceNameForTenant(baseMaaSAPIGatewayNetworkPolicyName, tenantID)
+}
+
+func TelemetryPolicyName(tenantID string) string {
+	return resourceNameForTenant(baseTelemetryPolicyName, tenantID)
+}
+
+func IstioTelemetryName(tenantID string) string {
+	return resourceNameForTenant(baseIstioTelemetryName, tenantID)
+}
+
+func MaaSAPIDeploymentName(tenantID string) string {
+	return resourceNameForTenant(baseMaaSAPIDeploymentName, tenantID)
+}
+
+func MaaSAPIServiceName(tenantID string) string {
+	return resourceNameForTenant(baseMaaSAPIServiceName, tenantID)
+}
+
+func PayloadProcessingDeploymentName(tenantID string) string {
+	return resourceNameForTenant(PayloadProcessingName, tenantID)
+}
+
+func PayloadPreProcessingDeploymentName(tenantID string) string {
+	return resourceNameForTenant(PayloadPreProcessingName, tenantID)
+}
+
+func PayloadProcessingServiceName(tenantID string) string {
+	return resourceNameForTenant(PayloadProcessingName, tenantID)
+}
+
+func PayloadPreProcessingServiceName(tenantID string) string {
+	return resourceNameForTenant(PayloadPreProcessingName, tenantID)
+}
+
+func PayloadProcessingEnvoyFilterName(tenantID string) string {
+	return resourceNameForTenant(PayloadProcessingName, tenantID)
+}
+
+func PayloadProcessingPluginsConfigMapForTenant(tenantID string) string {
+	return resourceNameForTenant(PayloadProcessingPluginsConfigMapName, tenantID)
+}
+
+func PayloadProcessingServiceAccountName(tenantID string) string {
+	return resourceNameForTenant(PayloadProcessingName, tenantID)
+}
+
+func PayloadProcessingNetworkPolicyName(tenantID string) string {
+	return resourceNameForTenant(PayloadProcessingName, tenantID)
+}
+
+func PayloadProcessingHPAName(tenantID string) string {
+	return resourceNameForTenant(PayloadProcessingName, tenantID)
+}
+
+func PayloadPreProcessingHPAName(tenantID string) string {
+	return resourceNameForTenant(PayloadPreProcessingName, tenantID)
+}
+
+func MaaSAPIServingCertName(tenantID string) string {
+	return resourceNameForTenant(baseMaaSAPIServingCertName, tenantID)
+}
+
+func PayloadProcessingReaderClusterRoleBindingNameForTenant(tenantID string) string {
+	return resourceNameForTenant(PayloadProcessingReaderClusterRoleBindingName, tenantID)
+}
+
+func UsageLogsEnvoyFilterName(tenantID string) string {
+	return resourceNameForTenant(baseUsageLogsEnvoyFilterName, tenantID)
+}
+
+// isIPPResource reports whether a kustomize base resource belongs to the IPP stack.
+func isIPPResource(gvk schema.GroupVersionKind, name string) bool {
+	switch {
+	case (gvk == GVKDeployment || gvk == GVKService || gvk == GVKDestinationRule) &&
+		(name == PayloadProcessingName || name == PayloadPreProcessingName):
+		return true
+	case gvk == GVKEnvoyFilter && name == PayloadProcessingName:
+		return true
+	case gvk == GVKServiceAccount && name == PayloadProcessingName:
+		return true
+	case gvk == GVKConfigMap && name == PayloadProcessingPluginsConfigMapName:
+		return true
+	case gvk == GVKNetworkPolicy && name == PayloadProcessingName:
+		return true
+	case gvk == GVKClusterRoleBinding && name == PayloadProcessingReaderClusterRoleBindingName:
+		return true
+	}
+	return false
+}
+
+// TenantIdentifierFor extracts the tenant identifier from a tenant config object.
+//
+// Returns:
+//   - Empty string ("") for the default/legacy config, whether unlabeled or managed
+//     by AITenant/models-as-a-service (preserves legacy resource names)
+//   - Tenant name (e.g., "redteam") for non-default AITenant-managed tenants
+//   - Error if LabelManagedByAITenant is true but LabelTenantName is missing
+//
+// The tenant identifier is used to generate unique per-tenant resource names.
+func TenantIdentifierFor(obj client.Object) (string, error) {
+	if isNilObject(obj) {
+		return "", nil
+	}
+
+	labels := obj.GetLabels()
+	if labels != nil && labels[LabelManagedByAITenant] == "true" {
+		tenantName := labels[LabelTenantName]
+		if tenantName == "" {
+			return "", fmt.Errorf("tenant %s/%s has %s=true but %s is missing or empty",
+				obj.GetNamespace(), obj.GetName(), LabelManagedByAITenant, LabelTenantName)
+		}
+		if tenantName == DefaultAITenantName {
+			if obj.GetName() != maasv1alpha1.MaasTenantConfigInstanceName {
+				return "", fmt.Errorf("tenant config %s/%s has %s=%q but is not the default tenant config resource %q",
+					obj.GetNamespace(), obj.GetName(), LabelTenantName, DefaultAITenantName, maasv1alpha1.MaasTenantConfigInstanceName)
+			}
+			if labels[LabelTenantNamespace] == "" || labels[LabelTenantNamespace] != obj.GetNamespace() {
+				return "", fmt.Errorf("tenant config %s/%s has %s=%q but %s must match the tenant config namespace",
+					obj.GetNamespace(), obj.GetName(), LabelTenantName, DefaultAITenantName, LabelTenantNamespace)
+			}
+			return "", nil
+		}
+		return tenantName, nil
+	}
+
+	return "", nil
+}
+
+// TenantNameFor returns the tenant name used for database queries, AuthPolicy headers,
+// and maas-api TENANT_NAME environment variable. This is distinct from TenantIdentifierFor,
+// which is used for resource naming.
+//
+// Returns:
+//   - "models-as-a-service" for the default tenant (matches DB default and TENANT_NAME env var)
+//   - The tenant name for AITenant-managed tenants
+func TenantNameFor(obj client.Object) (string, error) {
+	if isNilObject(obj) {
+		return "models-as-a-service", nil
+	}
+
+	labels := obj.GetLabels()
+	if labels != nil && labels[LabelManagedByAITenant] == "true" {
+		tenantName := labels[LabelTenantName]
+		if tenantName == "" {
+			return "", fmt.Errorf("tenant %s/%s has %s=true but %s is missing or empty",
+				obj.GetNamespace(), obj.GetName(), LabelManagedByAITenant, LabelTenantName)
+		}
+		return tenantName, nil
+	}
+
+	// Default tenant uses "models-as-a-service" for database/headers
+	return "models-as-a-service", nil
+}
+
+func isNilObject(obj client.Object) bool {
+	if obj == nil {
+		return true
+	}
+	value := reflect.ValueOf(obj)
+	return value.Kind() == reflect.Pointer && value.IsNil()
+}

@@ -23,6 +23,8 @@ import (
 	"testing"
 
 	"github.com/go-logr/logr"
+	llmdv1alpha2 "github.com/llm-d/llm-d-router/apix/v1alpha2"
+	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -34,15 +36,21 @@ import (
 	gatewayapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	maasv1alpha1 "github.com/opendatahub-io/models-as-a-service/maas-controller/api/maas/v1alpha1"
+	"github.com/opendatahub-io/models-as-a-service/maas-controller/pkg/modelnaming"
 )
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(gatewayapiv1.Install(scheme))
 	utilruntime.Must(maasv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(llmdv1alpha2.Install(scheme))
 }
 
 var scheme = runtime.NewScheme()
+
+func legacyNamespace(name string) *corev1.Namespace {
+	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name}}
+}
 
 // nsRestScope implements apimeta.RESTScope for namespace-scoped resources.
 type nsRestScope struct{}
@@ -57,11 +65,13 @@ func testRESTMapper() apimeta.RESTMapper {
 	m.Add(schema.GroupVersionKind{Group: "maas.opendatahub.io", Version: "v1alpha1", Kind: "MaaSModel"}, ns)
 	m.Add(schema.GroupVersionKind{Group: "maas.opendatahub.io", Version: "v1alpha1", Kind: "MaaSAuthPolicy"}, ns)
 	m.Add(schema.GroupVersionKind{Group: "maas.opendatahub.io", Version: "v1alpha1", Kind: "MaaSSubscription"}, ns)
+	m.Add(schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "Gateway"}, ns)
 	m.Add(schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"}, ns)
 	m.Add(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1", Kind: "AuthPolicy"}, ns)
 	m.Add(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1", Kind: "AuthPolicyList"}, ns)
 	m.Add(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1alpha1", Kind: "TokenRateLimitPolicy"}, ns)
 	m.Add(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1alpha1", Kind: "TokenRateLimitPolicyList"}, ns)
+	m.Add(inferenceExternalModelGVK, ns)
 	return m
 }
 
@@ -71,6 +81,10 @@ func newHTTPRoute(name, ns string) *gatewayapiv1.HTTPRoute {
 	return &gatewayapiv1.HTTPRoute{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 	}
+}
+
+func newExternalModelHTTPRoute(modelName, ns string) *gatewayapiv1.HTTPRoute {
+	return newHTTPRoute(modelnaming.ExternalModelResourceName(modelName), ns)
 }
 
 // newMaaSSubscription creates a MaaSSubscription with a single owner group and a single
@@ -227,15 +241,15 @@ func TestFindHTTPRouteForModel_ExternalModel_Success(t *testing.T) {
 		},
 	}
 	route := &gatewayapiv1.HTTPRoute{
-		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "maas-foo", Namespace: "default"},
 	}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(model, route).Build()
 	routeName, routeNS, err := findHTTPRouteForModel(ctx, c, "default", "foo")
 	if err != nil {
 		t.Fatalf("findHTTPRouteForModel: %v", err)
 	}
-	if routeName != "foo" || routeNS != "default" {
-		t.Errorf("findHTTPRouteForModel: got (%q, %q), want (\"foo\", \"default\")", routeName, routeNS)
+	if routeName != "maas-foo" || routeNS != "default" {
+		t.Errorf("findHTTPRouteForModel: got (%q, %q), want (\"maas-foo\", \"default\")", routeName, routeNS)
 	}
 }
 

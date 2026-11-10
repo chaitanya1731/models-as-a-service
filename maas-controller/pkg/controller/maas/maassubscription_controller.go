@@ -22,12 +22,17 @@ import (
 	"fmt"
 	"reflect"
 	"regexp"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/go-logr/logr"
+	kservev1alpha2 "github.com/kserve/kserve/pkg/apis/serving/v1alpha2"
+	llmdv1alpha2 "github.com/llm-d/llm-d-router/apix/v1alpha2"
+	batcv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -36,36 +41,79 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 	gatewayapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	maasv1alpha1 "github.com/opendatahub-io/models-as-a-service/maas-controller/api/maas/v1alpha1"
+	"github.com/opendatahub-io/models-as-a-service/maas-controller/pkg/oteljson"
+	"github.com/opendatahub-io/models-as-a-service/maas-controller/pkg/platform/tenantreconcile"
 )
 
 // MaaSSubscriptionReconciler reconciles a MaaSSubscription object
 type MaaSSubscriptionReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// APIReader bypasses the cache for cleanup Job reads. The controller does
+	// not watch Jobs and therefore must not require list/watch permission.
+	// Finalizer cleanup also lists InferenceObjectives with it, so an objective
+	// the cache has not seen yet is not missed.
+	APIReader client.Reader
+	// AppNamespace is where per-tenant maas-api Services and cleanup Jobs run.
+	AppNamespace string
+	// Recorder emits Kubernetes events for API-key cleanup and InferenceObjective failures.
+	Recorder events.EventRecorder
+
+	// DefaultTenantNamespace is the legacy single-tenant namespace (default
+	// "models-as-a-service"). Used together with the AITenant label to decide
+	// whether a namespace is a valid tenant namespace.
+	DefaultTenantNamespace string
+	// TenantNamespaceDiscoveryEnabled enables AITenant-labeled tenant namespaces.
+	TenantNamespaceDiscoveryEnabled bool
+	// GatewayName and GatewayNamespace are used as the legacy fallback when a
+	// Tenant does not yet carry spec.gatewayRef.
+	GatewayName      string
+	GatewayNamespace string
+	// MaxConcurrentReconciles is the maximum number of concurrent Reconciles which can be run.
+	// Defaults to 1 if not set.
+	MaxConcurrentReconciles int
+	// inferenceObjectivesUnavailable is set while the InferenceObjective CRD is not
+	// installed, so reconciles skip the InferenceObjective pass.
+	inferenceObjectivesUnavailable atomic.Bool
 }
 
+//+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+//+kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups=maas.opendatahub.io,resources=maassubscriptions,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=maas.opendatahub.io,resources=maassubscriptions/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=maas.opendatahub.io,resources=maassubscriptions/finalizers,verbs=update
 //+kubebuilder:rbac:groups=maas.opendatahub.io,resources=maasmodelrefs,verbs=get;list;watch
+//+kubebuilder:rbac:groups=maas.opendatahub.io,resources=aitenants,verbs=get;list;watch
 //+kubebuilder:rbac:groups=kuadrant.io,resources=tokenratelimitpolicies,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=get;list;watch
 //+kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes/finalizers,verbs=update
+//+kubebuilder:rbac:groups=llm-d.ai,resources=inferenceobjectives,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=serving.kserve.io,resources=llminferenceservices,verbs=get;list;watch
+//+kubebuilder:rbac:groups=maas.opendatahub.io,resources=maastenantconfigs;tenants,verbs=get;list;watch
 
 const (
 	maasSubscriptionFinalizer = "maas.opendatahub.io/subscription-cleanup"
+	// retainAPIKeysOnDeleteAnnotation lets an external owner retain API keys
+	// when a projected copy is removed from one cluster. It must be present
+	// before deletion starts; it is not a cancellation token for a revocation
+	// Job that has already been created.
+	retainAPIKeysOnDeleteAnnotation = "maas.opendatahub.io/retain-api-keys-on-delete" //nolint:gosec // Annotation name, not a credential.
 	// modelRefIndexKey is the field index key for looking up MaaSSubscriptions by model reference.
 	// The index value format is "namespace/name" of the model.
 	modelRefIndexKey = "spec.modelRef"
@@ -78,6 +126,11 @@ const (
 	// unreasonably large windows from reaching Kuadrant. 8784h fits the CRD pattern
 	// ^[1-9]\d{0,3}(s|m|h)$.
 	maxWindowSeconds int64 = 366 * 24 * 3600 // 366 days (leap year) in seconds
+
+	trlpLabelModel            = "maas.opendatahub.io/model"
+	trlpLabelModelNamespace   = "maas.opendatahub.io/model-namespace"
+	trlpLabelGatewayName      = "maas.opendatahub.io/gateway-name"
+	trlpLabelGatewayNamespace = "maas.opendatahub.io/gateway-namespace"
 )
 
 var windowPattern = regexp.MustCompile(`^[1-9]\d{0,3}(s|m|h)$`)
@@ -122,7 +175,72 @@ func validateTokenRateLimit(limit int64, window string) error {
 	return nil
 }
 
-// ConditionSpecPriorityDuplicate is set True when another MaaSSubscription shares the same spec.priority
+// errNoTokenBudget reports a model reference with neither tokenRateLimits nor
+// unlimited set. The CRD rejects such a reference, so it only reaches the
+// controller when that validation was bypassed.
+var errNoTokenBudget = errors.New("model reference sets neither tokenRateLimits nor unlimited")
+
+// modelRefTokenRates returns the TRLP rates for a model reference, or
+// unlimited=true when it has no token budget.
+//
+// The CRD makes unlimited and tokenRateLimits mutually exclusive. Should a
+// reference bypass that validation, the declared limits win as the
+// restrictive choice.
+func modelRefTokenRates(mRef maasv1alpha1.ModelSubscriptionRef) (rates []any, unlimited bool, err error) {
+	if len(mRef.TokenRateLimits) == 0 {
+		if mRef.Unlimited {
+			return nil, true, nil
+		}
+		return nil, false, errNoTokenBudget
+	}
+	for _, trl := range mRef.TokenRateLimits {
+		if err := validateTokenRateLimit(trl.Limit, trl.Window); err != nil {
+			return nil, false, err
+		}
+		rates = append(rates, map[string]any{"limit": trl.Limit, "window": trl.Window})
+	}
+	return rates, false, nil
+}
+
+// unlimitedLimitName is the TRLP limit key shared by the unlimited
+// subscriptions of a model. Rate-group keys are "tokens-<limit>-per-<window>"
+// with a positive numeric limit, so it cannot collide with one.
+const unlimitedLimitName = "tokens-unlimited"
+
+// unlimitedTokenLimit returns the TRLP limit matching the given
+// subscriptions' rate-limit identities (short selected_subscription_id for
+// new CRs, selected_subscription_key for legacy ones).
+//
+// Without rates, Limitador enforces nothing and keeps no counters, but the
+// wasm-shim still sends check and report calls for matching requests, and
+// those produce the authorized_hits usage metric. Kuadrant copies every limit
+// into every ActionSet of the gateway's WasmPlugin, so one shared limit costs a
+// predicate clause per unlimited subscription instead of a whole limit
+// (RHOAIENG-95277). It also keeps the TRLP non-empty when every subscription
+// on the model is unlimited: Kuadrant rejects a TRLP without limits, and a
+// route without one falls back to gateway-default-deny.
+//
+// Mixed legacy/short members share this limit: there are no counters to
+// preserve, so splitting would only grow the wasm config.
+//
+// rates and counters stay unset: a nil slice is written as null, which the API
+// server drops, so the no-op update check would never match.
+func unlimitedTokenLimit(members []subInfo) map[string]any {
+	matches := make([]string, 0, len(members))
+	for _, si := range members {
+		matches = append(matches, subscriptionSelectClause(si))
+	}
+	sort.Strings(matches)
+	return map[string]any{
+		"when": []any{
+			map[string]any{
+				"predicate": fmt.Sprintf(`(%s) && !request.path.endsWith("/v1/models")`, strings.Join(matches, " || ")),
+			},
+		},
+	}
+}
+
+// ConditionSpecPriorityDuplicate is set True when another MaaSSubscription in the same namespace shares the same spec.priority
 // (API key mint and selector use deterministic tie-break; admins should set distinct priorities).
 const ConditionSpecPriorityDuplicate = "SpecPriorityDuplicate"
 
@@ -169,6 +287,15 @@ func (r *MaaSSubscriptionReconciler) validateModelRefs(ctx context.Context, subs
 func (r *MaaSSubscriptionReconciler) checkTokenRateLimitHealth(ctx context.Context, subscription *maasv1alpha1.MaaSSubscription) []maasv1alpha1.TokenRateLimitStatus {
 	statuses := make([]maasv1alpha1.TokenRateLimitStatus, 0, len(subscription.Spec.ModelRefs))
 	seen := make(map[string]struct{})
+	gatewayRef, gatewayErr := tenantGatewayRefForNamespace(
+		ctx,
+		r.Client,
+		subscription.Namespace,
+		r.DefaultTenantNamespace,
+		r.GatewayName,
+		r.GatewayNamespace,
+		r.TenantNamespaceDiscoveryEnabled,
+	)
 
 	for _, ref := range subscription.Spec.ModelRefs {
 		key := ref.Namespace + "/" + ref.Name
@@ -187,7 +314,7 @@ func (r *MaaSSubscriptionReconciler) checkTokenRateLimitHealth(ctx context.Conte
 		}
 
 		// Find the TRLP for this model (TRLP lives in HTTPRoute namespace)
-		_, httpRouteNS, err := findHTTPRouteForModel(ctx, r.Client, ref.Namespace, ref.Name)
+		httpRouteName, httpRouteNS, err := findHTTPRouteForModel(ctx, r.Client, ref.Namespace, ref.Name)
 		if err != nil {
 			// Record status even when HTTPRoute not found - makes diagnosing issues easier
 			status.Ready = false
@@ -203,6 +330,38 @@ func (r *MaaSSubscriptionReconciler) checkTokenRateLimitHealth(ctx context.Conte
 		}
 		status.Namespace = httpRouteNS
 
+		if gatewayErr != nil {
+			status.Ready = false
+			status.Reason = maasv1alpha1.ReasonGetFailed
+			status.Message = fmt.Sprintf("failed to resolve tenant gateway for subscription namespace %s: %v", subscription.Namespace, gatewayErr)
+			statuses = append(statuses, status)
+			continue
+		}
+		if err := validateHTTPRouteReferencesGateway(ctx, r.Client, httpRouteName, httpRouteNS, gatewayRef); err != nil {
+			status.Ready = false
+			if errors.Is(err, ErrHTTPRouteNotOnTenantGateway) {
+				status.Reason = maasv1alpha1.ReasonBackendNotReady
+				status.Message = fmt.Sprintf("HTTPRoute is not attached to the subscription tenant gateway: %v", err)
+			} else {
+				status.Reason = maasv1alpha1.ReasonGetFailed
+				status.Message = fmt.Sprintf("failed to validate HTTPRoute against tenant gateway: %v", err)
+			}
+			statuses = append(statuses, status)
+			continue
+		}
+
+		gatewaySuffix := ""
+		if gateway, ok, err := selectedGatewayForModel(ctx, r.Client, ref.Namespace, ref.Name); err == nil && ok {
+			gatewaySuffix = fmt.Sprintf(" on gateway %s/%s", gateway.Namespace, gateway.Name)
+		} else {
+			route := &gatewayapiv1.HTTPRoute{}
+			if err := r.Get(ctx, types.NamespacedName{Name: httpRouteName, Namespace: httpRouteNS}, route); err == nil {
+				if gateway, ok := routeGatewayForTRLP(route); ok {
+					gatewaySuffix = fmt.Sprintf(" on gateway %s/%s", gateway.Namespace, gateway.Name)
+				}
+			}
+		}
+
 		trlp := &unstructured.Unstructured{}
 		trlp.SetGroupVersionKind(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1alpha1", Kind: "TokenRateLimitPolicy"})
 
@@ -210,7 +369,7 @@ func (r *MaaSSubscriptionReconciler) checkTokenRateLimitHealth(ctx context.Conte
 			if apierrors.IsNotFound(err) {
 				status.Ready = false
 				status.Reason = maasv1alpha1.ReasonNotFound
-				status.Message = "TokenRateLimitPolicy not created yet"
+				status.Message = "TokenRateLimitPolicy not created yet" + gatewaySuffix
 			} else {
 				status.Ready = false
 				status.Reason = maasv1alpha1.ReasonGetFailed
@@ -224,7 +383,7 @@ func (r *MaaSSubscriptionReconciler) checkTokenRateLimitHealth(ctx context.Conte
 				status.Reason = maasv1alpha1.ReasonAccepted
 			} else {
 				status.Reason = maasv1alpha1.ReasonNotAccepted
-				status.Message = message
+				status.Message = message + gatewaySuffix
 			}
 		}
 		statuses = append(statuses, status)
@@ -324,7 +483,8 @@ func deriveFinalPhase(modelStatuses []maasv1alpha1.ModelRefStatus, trlpStatuses 
 
 // Reconcile is part of the main kubernetes reconciliation loop
 func (r *MaaSSubscriptionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := logr.FromContextOrDiscard(ctx).WithValues("MaaSSubscription", req.NamespacedName)
+	ctx = oteljson.IntoContext(ctx)
+	log := oteljson.FromContext(ctx).WithValues("MaaSSubscription", req.NamespacedName)
 
 	subscription := &maasv1alpha1.MaaSSubscription{}
 	if err := r.Get(ctx, req.NamespacedName, subscription); err != nil {
@@ -335,24 +495,44 @@ func (r *MaaSSubscriptionReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, err
 	}
 
-	// Handle deletion
+	// Handle deletion before tenant namespace gating. A namespace may lose its
+	// discovery label while a CR is terminating; finalizer cleanup must still run.
 	if !subscription.GetDeletionTimestamp().IsZero() {
 		return r.handleDeletion(ctx, log, subscription)
+	}
+
+	isTenantNS, err := tenantNamespaceAllowed(ctx, r.Client, req.Namespace, r.DefaultTenantNamespace, r.TenantNamespaceDiscoveryEnabled)
+	if err != nil {
+		log.Error(err, "failed to check tenant namespace")
+		return ctrl.Result{}, err
+	}
+	if !isTenantNS {
+		log.V(1).Info("ignoring MaaSSubscription in non-tenant namespace", "namespace", req.Namespace)
+		return ctrl.Result{}, nil
 	}
 
 	// Handle no spec (e.g. legacy resources created before spec was required).
 	// No finalizer needed — there are no TRLPs to clean up.
 	if reflect.DeepEqual(subscription.Spec, maasv1alpha1.MaaSSubscriptionSpec{}) {
 		statusSnapshot := subscription.Status.DeepCopy()
-		r.updateStatus(ctx, subscription, maasv1alpha1.PhaseInvalid, "spec is required", statusSnapshot)
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, r.updateStatus(ctx, subscription, maasv1alpha1.PhaseInvalid, "spec is required", statusSnapshot)
 	}
 
-	// Add finalizer if not present
+	// Classify sticky rate-limit identity before AddFinalizer so a brand-new
+	// CR is not mistaken for an upgrade survivor. Persist the result on
+	// status (GitOps-safe) before TRLP work so maas-api and peer reconciles
+	// see the same scheme.
+	wantIdentity := classifiedRateLimitIdentity(subscription)
 	if !controllerutil.ContainsFinalizer(subscription, maasSubscriptionFinalizer) {
 		controllerutil.AddFinalizer(subscription, maasSubscriptionFinalizer)
 		if err := r.Update(ctx, subscription); err != nil {
 			return ctrl.Result{}, err
+		}
+	}
+	if subscription.Status.RateLimitIdentity != wantIdentity {
+		subscription.Status.RateLimitIdentity = wantIdentity
+		if err := r.Status().Update(ctx, subscription); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to persist rateLimitIdentity: %w", err)
 		}
 	}
 
@@ -361,6 +541,20 @@ func (r *MaaSSubscriptionReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// Validate model references and populate per-model status
 	modelStatuses := r.validateModelRefs(ctx, subscription)
 	subscription.Status.ModelRefStatuses = modelStatuses
+
+	// Reconcile InferenceObjectives before TokenRateLimitPolicies, so a TokenRateLimitPolicy
+	// failure does not block them, and set their status for every status write below.
+	io, ioErr := r.reconcileInferenceObjectives(ctx, log, subscription)
+	if ioErr != nil {
+		log.Error(ioErr, "failed to reconcile InferenceObjectives, will retry")
+	}
+	subscription.Status.FlowControlStatuses = io.Statuses
+	ioCondition, ioDegraded, ioRequested := inferenceObjectivesCondition(subscription, io.Statuses)
+	if ioRequested {
+		apimeta.SetStatusCondition(&subscription.Status.Conditions, ioCondition)
+	} else {
+		apimeta.RemoveStatusCondition(&subscription.Status.Conditions, maasv1alpha1.ConditionInferenceObjectivesReady)
+	}
 
 	// Check if we have any valid models to proceed with TRLP reconciliation
 	hasValidModels := false
@@ -378,15 +572,19 @@ func (r *MaaSSubscriptionReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		if err := r.reconcileTokenRateLimitPolicies(ctx, log, subscription); err != nil {
 			log.Error(err, "failed to reconcile TokenRateLimitPolicies")
 			subscription.Status.Phase = maasv1alpha1.PhaseFailed
-			r.updateStatus(ctx, subscription, maasv1alpha1.PhaseFailed, fmt.Sprintf("failed to reconcile TokenRateLimitPolicies: %v", err), statusSnapshot)
-			return ctrl.Result{}, err
+			if statusErr := r.updateStatus(ctx, subscription, maasv1alpha1.PhaseFailed, fmt.Sprintf("failed to reconcile TokenRateLimitPolicies: %v", err), statusSnapshot); statusErr != nil {
+				log.Error(statusErr, "failed to persist reconcile failure")
+			}
+			return ctrl.Result{}, errors.Join(err, ioErr)
 		}
 	} else {
 		// No valid models - clean up any stale TRLPs from previous reconciliations
 		if err := r.cleanupStaleTRLPs(ctx, log, subscription); err != nil {
 			log.Error(err, "failed to clean up stale TokenRateLimitPolicies")
-			r.updateStatus(ctx, subscription, maasv1alpha1.PhaseFailed, fmt.Sprintf("failed to clean up stale TokenRateLimitPolicies: %v", err), statusSnapshot)
-			return ctrl.Result{}, err
+			if statusErr := r.updateStatus(ctx, subscription, maasv1alpha1.PhaseFailed, fmt.Sprintf("failed to clean up stale TokenRateLimitPolicies: %v", err), statusSnapshot); statusErr != nil {
+				log.Error(statusErr, "failed to persist reconcile failure")
+			}
+			return ctrl.Result{}, errors.Join(err, ioErr)
 		}
 	}
 
@@ -419,8 +617,18 @@ func (r *MaaSSubscriptionReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	// Derive final phase based on model and TRLP health
 	phase, message := deriveFinalPhase(modelStatuses, trlpStatuses)
-	r.updateStatus(ctx, subscription, phase, message, statusSnapshot)
-
+	// Request priority can degrade an Active subscription but never fail it.
+	if phase == maasv1alpha1.PhaseActive && ioDegraded {
+		phase, message = maasv1alpha1.PhaseDegraded, ioCondition.Message
+	}
+	if err := errors.Join(r.updateStatus(ctx, subscription, phase, message, statusSnapshot), ioErr); err != nil {
+		// controller-runtime ignores the result when an error is returned.
+		return ctrl.Result{}, err
+	}
+	if io.Conflict {
+		// A foreign object holds an InferenceObjective name; the watch does not see it.
+		return ctrl.Result{RequeueAfter: inferenceObjectiveConflictRequeue}, nil
+	}
 	return ctrl.Result{}, nil
 }
 
@@ -455,6 +663,7 @@ func (r *MaaSSubscriptionReconciler) reconcileTRLPForModel(ctx context.Context, 
 	if err != nil {
 		return fmt.Errorf("failed to list subscriptions for model %s/%s: %w", modelNamespace, modelName, err)
 	}
+	allSubs = filterSubscriptionsByTenantNamespace(ctx, r.Client, allSubs, r.DefaultTenantNamespace, r.TenantNamespaceDiscoveryEnabled)
 
 	// Resolve HTTPRoute early to check if model/route exist
 	httpRouteName, httpRouteNS, err := findHTTPRouteForModel(ctx, r.Client, modelNamespace, modelName)
@@ -474,6 +683,15 @@ func (r *MaaSSubscriptionReconciler) reconcileTRLPForModel(ctx context.Context, 
 			return nil
 		}
 		return fmt.Errorf("failed to resolve HTTPRoute for model %s/%s: %w", modelNamespace, modelName, err)
+	}
+	allSubs, skipped, err := r.validateSubscriptionTenantGatewaysForRoute(ctx, allSubs, httpRouteName, httpRouteNS, modelNamespace, modelName)
+	if err != nil {
+		return err
+	}
+	if len(skipped) > 0 {
+		log.Info("Skipping subscriptions not attached to the model route tenant gateway",
+			"model", modelNamespace+"/"+modelName,
+			"skippedSubscriptions", skipped)
 	}
 
 	// Check if existing TRLP is opted-out before doing any expensive work
@@ -506,44 +724,37 @@ func (r *MaaSSubscriptionReconciler) reconcileTRLPForModel(ctx context.Context, 
 		return fmt.Errorf("failed to fetch HTTPRoute %s/%s: %w", httpRouteNS, httpRouteName, err)
 	}
 
-	limitsMap := map[string]any{}
-	var subNames []string
-
-	type subInfo struct {
-		sub   maasv1alpha1.MaaSSubscription
-		mRef  maasv1alpha1.ModelSubscriptionRef
-		rates []any
+	trlpGatewayName := ""
+	trlpGatewayNamespace := ""
+	if gateway, ok, err := gatewayIdentityForTRLP(ctx, r.Client, modelNamespace, modelName, route); err != nil {
+		return fmt.Errorf("failed to resolve selected gateway for model %s/%s: %w", modelNamespace, modelName, err)
+	} else if ok {
+		trlpGatewayName = gateway.Name
+		trlpGatewayNamespace = gateway.Namespace
 	}
+
 	var subs []subInfo
 	for _, sub := range allSubs {
 		for _, mRef := range sub.Spec.ModelRefs {
 			if mRef.Namespace != modelNamespace || mRef.Name != modelName {
 				continue
 			}
-			var rates []any
-			var hasInvalidLimits bool
-			if len(mRef.TokenRateLimits) > 0 {
-				for _, trl := range mRef.TokenRateLimits {
-					if err := validateTokenRateLimit(trl.Limit, trl.Window); err != nil {
-						log.Error(err, "Skipping subscription with invalid token rate limit — fix the spec to include it in TRLP",
-							"subscription", sub.Name, "model", modelNamespace+"/"+modelName,
-							"limit", trl.Limit, "window", trl.Window)
-						hasInvalidLimits = true
-						break
-					}
-					rates = append(rates, map[string]any{"limit": trl.Limit, "window": trl.Window})
-				}
-			} else {
-				rates = append(rates, map[string]any{"limit": int64(100), "window": "1m"})
-			}
-			if hasInvalidLimits {
+			rates, unlimited, err := modelRefTokenRates(mRef)
+			if err != nil {
 				// Skip this subscription to prevent poisoning the aggregated TRLP.
-				// The subscription is already marked Degraded/Failed by validateModelRefs(),
-				// and maas-api's subscription selector rejects non-Active subscriptions,
-				// so the invalid subscription cannot be used for API key minting.
+				log.Error(err, "Skipping subscription with invalid token budget - fix the spec to include it in TRLP",
+					"subscription", sub.Name, "model", modelNamespace+"/"+modelName)
 				continue
 			}
-			subs = append(subs, subInfo{sub: sub, mRef: mRef, rates: rates})
+			subs = append(subs, subInfo{
+				subNamespace: sub.Namespace,
+				subName:      sub.Name,
+				rates:        rates,
+				unlimited:    unlimited,
+				modelScoped:  fmt.Sprintf("%s/%s@%s/%s", sub.Namespace, sub.Name, mRef.Namespace, mRef.Name),
+				groupKey:     rateGroupKey(rates),
+				legacy:       classifiedRateLimitIdentity(&sub) == RateLimitIdentityLegacy,
+			})
 			break
 		}
 	}
@@ -556,44 +767,19 @@ func (r *MaaSSubscriptionReconciler) reconcileTRLPForModel(ctx context.Context, 
 		return r.deleteModelTRLP(ctx, log, modelNamespace, modelName)
 	}
 
-	// Trust auth.identity.selected_subscription_key from AuthPolicy.
-	// AuthPolicy has already validated subscription selection via /v1/subscriptions/select,
-	// which handles:
-	//  - Validating subscription exists and user has access (groups/users match)
-	//  - Auto-selecting if user has exactly one subscription
-	//  - Returning 403 Forbidden for invalid scenarios (wrong header, no access, multiple without header)
-	// TokenRateLimitPolicy simply applies the rate limit for the validated subscription.
+	// New subscriptions match auth.identity.selected_subscription_id (16-hex
+	// SHA-256 of {subNS}/{subName}@{modelNS}/{modelName}). Subscriptions that
+	// already existed at upgrade keep selected_subscription_key matching and
+	// counters so Limitador quotas are not reset. The long key stays on the
+	// identity for telemetry either way.
 	//
-	// The selected_subscription_key format is: {subNamespace}/{subName}@{modelNamespace}/{modelName}
-	// This ensures proper isolation between subscriptions in different namespaces and across models.
-	for _, si := range subs {
-		subNames = append(subNames, si.sub.Name)
-
-		// Build subscription reference: namespace/name
-		subRef := fmt.Sprintf("%s/%s", si.sub.Namespace, si.sub.Name)
-		// Build model-scoped reference: subscription@model
-		modelScopedRef := fmt.Sprintf("%s@%s/%s", subRef, si.mRef.Namespace, si.mRef.Name)
-
-		// TRLP limit key must be safe for YAML (no slashes)
-		safeKey := strings.ReplaceAll(subRef, "/", "-")
-		limitsMap[fmt.Sprintf("%s-%s-tokens", safeKey, si.mRef.Name)] = map[string]any{
-			"rates": si.rates,
-			"when": []any{
-				map[string]any{
-					// Exempt /v1/models endpoint from token rate limiting.
-					// This endpoint is used for model discovery/metadata and does not consume inference tokens.
-					// Users should be able to query model capabilities even when their token quota is exhausted.
-					"predicate": fmt.Sprintf(`auth.identity.selected_subscription_key == "%s" && !request.path.endsWith("/v1/models")`, modelScopedRef),
-				},
-			},
-			"counters": []any{
-				map[string]any{"expression": "auth.identity.userid"},
-			},
-		}
-	}
-
-	// Sort subscription names for stable annotation value across reconciles
-	sort.Strings(subNames)
+	// Subscriptions sharing identical rates share one limit instead of one each, so the TRLP
+	// (and the EnvoyFilter/WasmPlugin Kuadrant renders from it, which repeats every limit per
+	// route match) grows with the number of distinct rate sets, not with the number of
+	// subscriptions behind them (RHOAIENG-95277) — except a mixed legacy/short group of the
+	// same rate splits into two limits because the counter expressions differ. See
+	// buildGroupedLimits.
+	limitsMap, subNames := buildGroupedLimits(subs)
 
 	// Build the aggregated TokenRateLimitPolicy (one per model, covering all subscriptions)
 	// policyName already declared during early opt-out check
@@ -601,19 +787,24 @@ func (r *MaaSSubscriptionReconciler) reconcileTRLPForModel(ctx context.Context, 
 	policy.SetGroupVersionKind(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1alpha1", Kind: "TokenRateLimitPolicy"})
 	policy.SetName(policyName)
 	policy.SetNamespace(httpRouteNS)
-	policy.SetLabels(map[string]string{
-		"maas.opendatahub.io/model":           modelName,
-		"maas.opendatahub.io/model-namespace": modelNamespace,
-		"app.kubernetes.io/managed-by":        "maas-controller",
-		"app.kubernetes.io/part-of":           "maas-subscription",
-		"app.kubernetes.io/component":         "token-rate-limit-policy",
-	})
+	labels := map[string]string{
+		trlpLabelModel:                 modelName,
+		trlpLabelModelNamespace:        modelNamespace,
+		"app.kubernetes.io/managed-by": "maas-controller",
+		"app.kubernetes.io/part-of":    "maas-subscription",
+		"app.kubernetes.io/component":  "token-rate-limit-policy",
+	}
+	if trlpGatewayName != "" && trlpGatewayNamespace != "" {
+		labels[trlpLabelGatewayName] = trlpGatewayName
+		labels[trlpLabelGatewayNamespace] = trlpGatewayNamespace
+	}
+	policy.SetLabels(labels)
 	policy.SetAnnotations(map[string]string{
 		"maas.opendatahub.io/subscriptions": strings.Join(subNames, ","),
 	})
 
 	// Set HTTPRoute as owner for garbage collection (TRLP deleted when route is deleted)
-	if err := controllerutil.SetControllerReference(route, policy, r.Scheme); err != nil {
+	if err := setHTTPRouteControllerOwner(route, policy, r.Scheme); err != nil {
 		return fmt.Errorf("failed to set owner reference on TokenRateLimitPolicy %s/%s: %w", policy.GetNamespace(), policy.GetName(), err)
 	}
 
@@ -643,49 +834,161 @@ func (r *MaaSSubscriptionReconciler) reconcileTRLPForModel(ctx context.Context, 
 	} else {
 		// Double-check managed status as a safety check for races (TRLP could have been
 		// opted-out between the early check and now).
-		if !isManaged(existing) {
-			log.Info("TokenRateLimitPolicy opted out during reconciliation, skipping update", "name", policyName)
-		} else {
-			// Ensure owner reference is set on managed existing policy.
-			if err := controllerutil.SetControllerReference(route, existing, r.Scheme); err != nil {
-				return fmt.Errorf("failed to set owner reference on existing TokenRateLimitPolicy %s/%s: %w", existing.GetNamespace(), existing.GetName(), err)
-			}
-			// Snapshot the existing object before modifications so we can detect
-			// no-op updates.
-			snapshot := existing.DeepCopy()
-
-			mergedAnnotations := existing.GetAnnotations()
-			if mergedAnnotations == nil {
-				mergedAnnotations = make(map[string]string)
-			}
-			for k, v := range policy.GetAnnotations() {
-				mergedAnnotations[k] = v
-			}
-			existing.SetAnnotations(mergedAnnotations)
-
-			mergedLabels := existing.GetLabels()
-			if mergedLabels == nil {
-				mergedLabels = make(map[string]string)
-			}
-			for k, v := range policy.GetLabels() {
-				mergedLabels[k] = v
-			}
-			existing.SetLabels(mergedLabels)
-			if err := unstructured.SetNestedMap(existing.Object, spec, "spec"); err != nil {
-				return fmt.Errorf("failed to update spec: %w", err)
-			}
-
-			if equality.Semantic.DeepEqual(snapshot.Object, existing.Object) {
-				log.Info("TokenRateLimitPolicy unchanged, skipping update", "name", policyName, "model", modelNamespace+"/"+modelName, "subscriptionCount", len(subNames))
-			} else {
-				if err := r.Update(ctx, existing); err != nil {
-					return fmt.Errorf("failed to update TokenRateLimitPolicy for model %s/%s: %w", modelNamespace, modelName, err)
-				}
-				log.Info("TokenRateLimitPolicy updated", "name", policyName, "model", modelNamespace+"/"+modelName, "subscriptionCount", len(subNames), "subscriptions", subNames)
-			}
+		if err := r.updateExistingTRLP(ctx, log, route, policy, spec, policyName, modelNamespace, modelName, subNames); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// updateExistingTRLP merges the desired spec and metadata into the existing managed
+// TokenRateLimitPolicy.
+//
+// The Kuadrant operator writes the TRLP's status (Enforced conditions) on this same
+// object while we write spec/metadata, so a plain Update can lose the resourceVersion
+// race and 409. Failing the whole reconcile here requeues with backoff and delays the
+// rebuild; instead re-read and retry the merge so subscription churn converges promptly.
+func (r *MaaSSubscriptionReconciler) updateExistingTRLP(
+	ctx context.Context,
+	log logr.Logger,
+	route *gatewayapiv1.HTTPRoute,
+	policy *unstructured.Unstructured,
+	spec map[string]any,
+	policyName, modelNamespace, modelName string,
+	subNames []string,
+) error {
+	updateErr := retry.OnError(retry.DefaultBackoff, apierrors.IsConflict, func() error {
+		existing := &unstructured.Unstructured{}
+		existing.SetGroupVersionKind(policy.GroupVersionKind())
+		// Read through the APIReader: after a conflict the informer cache can
+		// still serve the stale resourceVersion that just lost the race, which
+		// would make every retry conflict again.
+		reader := r.APIReader
+		if reader == nil {
+			reader = r.Client
+		}
+		if err := reader.Get(ctx, client.ObjectKeyFromObject(policy), existing); err != nil {
+			return err
+		}
+		if !isManaged(existing) {
+			log.Info("TokenRateLimitPolicy opted out during reconciliation, skipping update", "name", policyName)
+			return nil
+		}
+		// Snapshot before any mutation (including owner updates), so owner-only
+		// transitions are persisted.
+		snapshot := existing.DeepCopy()
+		// Ensure owner reference is set on managed existing policy.
+		if err := setHTTPRouteControllerOwner(route, existing, r.Scheme); err != nil {
+			return fmt.Errorf("failed to set owner reference on existing TokenRateLimitPolicy %s/%s: %w", existing.GetNamespace(), existing.GetName(), err)
+		}
+
+		mergedAnnotations := existing.GetAnnotations()
+		if mergedAnnotations == nil {
+			mergedAnnotations = make(map[string]string)
+		}
+		for k, v := range policy.GetAnnotations() {
+			mergedAnnotations[k] = v
+		}
+		existing.SetAnnotations(mergedAnnotations)
+
+		mergedLabels := existing.GetLabels()
+		if mergedLabels == nil {
+			mergedLabels = make(map[string]string)
+		}
+		for k, v := range policy.GetLabels() {
+			mergedLabels[k] = v
+		}
+		existing.SetLabels(mergedLabels)
+		if err := unstructured.SetNestedMap(existing.Object, spec, "spec"); err != nil {
+			return fmt.Errorf("failed to update spec: %w", err)
+		}
+
+		if equality.Semantic.DeepEqual(snapshot.Object, existing.Object) {
+			log.Info("TokenRateLimitPolicy unchanged, skipping update", "name", policyName, "model", modelNamespace+"/"+modelName, "subscriptionCount", len(subNames))
+			return nil
+		}
+		if err := r.Update(ctx, existing); err != nil {
+			return err
+		}
+		log.Info("TokenRateLimitPolicy updated", "name", policyName, "model", modelNamespace+"/"+modelName, "subscriptionCount", len(subNames), "subscriptions", subNames)
+		return nil
+	})
+	if updateErr != nil {
+		return fmt.Errorf("failed to update TokenRateLimitPolicy for model %s/%s: %w", modelNamespace, modelName, updateErr)
+	}
+	return nil
+}
+
+func (r *MaaSSubscriptionReconciler) validateSubscriptionTenantGatewaysForRoute(
+	ctx context.Context,
+	subscriptions []maasv1alpha1.MaaSSubscription,
+	httpRouteName string,
+	httpRouteNS string,
+	modelNamespace string,
+	modelName string,
+) ([]maasv1alpha1.MaaSSubscription, map[string]string, error) {
+	// Every effective subscription for this model must come from a tenant whose
+	// Gateway matches the model HTTPRoute. This preserves the existing one
+	// TRLP-per-route behavior while preventing a tenant namespace from attaching
+	// policy to another tenant's Gateway. Subscriptions from mismatched tenant
+	// gateways are skipped rather than failing all contributors for the model.
+	validatedTenantNamespaces := make(map[string]struct{})
+	validatedGateways := make(map[string]error)
+	skippedNamespaces := make(map[string]string)
+	for _, sub := range subscriptions {
+		if _, ok := validatedTenantNamespaces[sub.Namespace]; ok {
+			continue
+		}
+		validatedTenantNamespaces[sub.Namespace] = struct{}{}
+
+		gatewayRef, err := tenantGatewayRefForNamespace(
+			ctx,
+			r.Client,
+			sub.Namespace,
+			r.DefaultTenantNamespace,
+			r.GatewayName,
+			r.GatewayNamespace,
+			r.TenantNamespaceDiscoveryEnabled,
+		)
+		if err != nil {
+			if errors.Is(err, ErrDiscoveredTenantConfigNotFound) {
+				skippedNamespaces[sub.Namespace] = fmt.Sprintf("model %s/%s is skipping subscription %s: %v",
+					modelNamespace, modelName, qualifiedName(sub.Namespace, sub.Name), err)
+				continue
+			}
+			return nil, nil, err
+		}
+		gatewayKey := qualifiedName(gatewayRef.Namespace, gatewayRef.Name)
+		if gatewayErr, ok := validatedGateways[gatewayKey]; ok {
+			if gatewayErr != nil {
+				skippedNamespaces[sub.Namespace] = fmt.Sprintf("model %s/%s is not attached to tenant gateway for subscription %s: %v",
+					modelNamespace, modelName, qualifiedName(sub.Namespace, sub.Name), gatewayErr)
+			}
+			continue
+		}
+
+		if err := validateHTTPRouteReferencesGateway(ctx, r.Client, httpRouteName, httpRouteNS, gatewayRef); err != nil {
+			if errors.Is(err, ErrHTTPRouteNotOnTenantGateway) {
+				validatedGateways[gatewayKey] = err
+				skippedNamespaces[sub.Namespace] = fmt.Sprintf("model %s/%s is not attached to tenant gateway for subscription %s: %v",
+					modelNamespace, modelName, qualifiedName(sub.Namespace, sub.Name), err)
+				continue
+			}
+			return nil, nil, fmt.Errorf("model %s/%s is not attached to tenant gateway for subscription %s: %w",
+				modelNamespace, modelName, qualifiedName(sub.Namespace, sub.Name), err)
+		}
+		validatedGateways[gatewayKey] = nil
+	}
+
+	valid := make([]maasv1alpha1.MaaSSubscription, 0, len(subscriptions))
+	for _, sub := range subscriptions {
+		if _, skipped := skippedNamespaces[sub.Namespace]; skipped {
+			continue
+		}
+		valid = append(valid, sub)
+	}
+
+	return valid, skippedNamespaces, nil
 }
 
 // cleanupStaleTRLPs deletes aggregated TokenRateLimitPolicies for models that this
@@ -716,15 +1019,21 @@ func (r *MaaSSubscriptionReconciler) cleanupStaleTRLPs(ctx context.Context, log 
 		if modelName == "" {
 			continue
 		}
-		modelKey := trlp.GetNamespace() + "/" + modelName
+		modelNamespace := trlp.GetLabels()["maas.opendatahub.io/model-namespace"]
+		if modelNamespace == "" {
+			modelNamespace = trlp.GetNamespace()
+		}
+		modelKey := modelNamespace + "/" + modelName
 		if currentModels[modelKey] {
 			continue
 		}
-		if !slices.Contains(strings.Split(trlp.GetAnnotations()["maas.opendatahub.io/subscriptions"], ","), subscription.Name) {
+		owners := trlp.GetAnnotations()["maas.opendatahub.io/subscriptions"]
+		if !annotationListContains(owners, qualifiedName(subscription.Namespace, subscription.Name)) &&
+			!annotationListContains(owners, subscription.Name) {
 			continue
 		}
 		log.Info("Cleaning up stale TokenRateLimitPolicy for removed modelRef", "model", modelKey, "trlp", trlp.GetName())
-		if err := r.deleteModelTRLP(ctx, log, trlp.GetNamespace(), modelName); err != nil {
+		if err := r.deleteModelTRLP(ctx, log, modelNamespace, modelName); err != nil {
 			return fmt.Errorf("failed to clean up stale TokenRateLimitPolicy for removed model %s: %w", modelKey, err)
 		}
 	}
@@ -742,10 +1051,10 @@ func (r *MaaSSubscriptionReconciler) deleteModelTRLP(ctx context.Context, log lo
 	policyList := &unstructured.UnstructuredList{}
 	policyList.SetGroupVersionKind(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1alpha1", Kind: "TokenRateLimitPolicyList"})
 	labelSelector := client.MatchingLabels{
-		"maas.opendatahub.io/model":           modelName,
-		"maas.opendatahub.io/model-namespace": modelNamespace,
-		"app.kubernetes.io/managed-by":        "maas-controller",
-		"app.kubernetes.io/part-of":           "maas-subscription",
+		trlpLabelModel:                 modelName,
+		trlpLabelModelNamespace:        modelNamespace,
+		"app.kubernetes.io/managed-by": "maas-controller",
+		"app.kubernetes.io/part-of":    "maas-subscription",
 	}
 	if err := r.List(ctx, policyList, labelSelector); err != nil {
 		if apierrors.IsNotFound(err) || apimeta.IsNoMatchError(err) {
@@ -767,8 +1076,82 @@ func (r *MaaSSubscriptionReconciler) deleteModelTRLP(ctx context.Context, log lo
 	return nil
 }
 
+// routeGatewayForTRLP returns the first HTTPRoute parentRef that targets a Gateway,
+// with an omitted namespace defaulting to the route namespace.
+func routeGatewayForTRLP(route *gatewayapiv1.HTTPRoute) (types.NamespacedName, bool) {
+	for _, parentRef := range route.Spec.ParentRefs {
+		if !parentRefTargetsGateway(parentRef) {
+			continue
+		}
+		return routeParentGateway(route, parentRef), true
+	}
+	return types.NamespacedName{}, false
+}
+
+// selectedGatewayForModel returns the model's currently selected gateway from status,
+// if available.
+func selectedGatewayForModel(ctx context.Context, c client.Reader, modelNamespace, modelName string) (types.NamespacedName, bool, error) {
+	model := &maasv1alpha1.MaaSModelRef{}
+	if err := c.Get(ctx, types.NamespacedName{Name: modelName, Namespace: modelNamespace}, model); err != nil {
+		if apierrors.IsNotFound(err) {
+			return types.NamespacedName{}, false, nil
+		}
+		return types.NamespacedName{}, false, fmt.Errorf("get MaaSModelRef %s/%s: %w", modelNamespace, modelName, err)
+	}
+	if model.Status.HTTPRouteGatewayName == "" || model.Status.HTTPRouteGatewayNamespace == "" {
+		return types.NamespacedName{}, false, nil
+	}
+	return types.NamespacedName{
+		Name:      model.Status.HTTPRouteGatewayName,
+		Namespace: model.Status.HTTPRouteGatewayNamespace,
+	}, true, nil
+}
+
+// gatewayIdentityForTRLP returns the gateway identity to label/report on for the
+// model's TRLP, preferring the model's selected gateway and falling back to the
+// route's first gateway parentRef.
+func gatewayIdentityForTRLP(ctx context.Context, c client.Reader, modelNamespace, modelName string, route *gatewayapiv1.HTTPRoute) (types.NamespacedName, bool, error) {
+	if gateway, ok, err := selectedGatewayForModel(ctx, c, modelNamespace, modelName); err != nil {
+		return types.NamespacedName{}, false, err
+	} else if ok {
+		return gateway, true, nil
+	}
+	gateway, ok := routeGatewayForTRLP(route)
+	return gateway, ok, nil
+}
+
+// setHTTPRouteControllerOwner records the HTTPRoute as controller owner. Managed TRLPs can
+// move between routes when attachments transition, so an existing HTTPRoute controller owner
+// is replaced with the new one.
+func setHTTPRouteControllerOwner(route *gatewayapiv1.HTTPRoute, obj client.Object, scheme *runtime.Scheme) error {
+	ownerRefs := obj.GetOwnerReferences()
+	updated := make([]metav1.OwnerReference, 0, len(ownerRefs))
+	for _, ownerRef := range ownerRefs {
+		if ownerRef.Controller != nil && *ownerRef.Controller &&
+			ownerRef.APIVersion == gatewayapiv1.GroupVersion.String() && ownerRef.Kind == "HTTPRoute" {
+			continue
+		}
+		updated = append(updated, ownerRef)
+	}
+	obj.SetOwnerReferences(updated)
+	return controllerutil.SetControllerReference(route, obj, scheme)
+}
+
 func (r *MaaSSubscriptionReconciler) handleDeletion(ctx context.Context, log logr.Logger, subscription *maasv1alpha1.MaaSSubscription) (ctrl.Result, error) {
 	if controllerutil.ContainsFinalizer(subscription, maasSubscriptionFinalizer) {
+		keysRevoked, err := r.ensureSubscriptionAPIKeysRevoked(ctx, log, subscription)
+		if err != nil {
+			log.Error(err, "failed to revoke subscription API keys; will retry", "subscription", subscription.Name)
+			if r.Recorder != nil {
+				r.Recorder.Eventf(subscription, nil, corev1.EventTypeWarning, "APIKeyCleanupFailed", "InvalidateAPIKeys",
+					"failed to invalidate API keys for subscription %s: %v", subscription.Name, err)
+			}
+			return ctrl.Result{}, err
+		}
+		if !keysRevoked {
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+
 		// For each model referenced by this subscription, rebuild the aggregated TokenRateLimitPolicy
 		// without the deleted subscription's limits. If no other subscriptions reference the model,
 		// the TRLP will be deleted. This ensures zero-downtime rate limiting during subscription removal.
@@ -790,6 +1173,14 @@ func (r *MaaSSubscriptionReconciler) handleDeletion(ctx context.Context, log log
 		if err := r.cleanupStaleTRLPs(ctx, log, subscription); err != nil {
 			return ctrl.Result{}, err
 		}
+		// Delete every InferenceObjective this subscription owns. Label-based only, so a
+		// broken tenant or gateway config cannot block deletion.
+		if !r.inferenceObjectivesUnavailable.Load() {
+			if err := r.deleteOwnedInferenceObjectives(ctx, log, subscription); err != nil {
+				log.Error(err, "failed to delete InferenceObjectives during deletion, will retry")
+				return ctrl.Result{}, err
+			}
+		}
 		controllerutil.RemoveFinalizer(subscription, maasSubscriptionFinalizer)
 		if err := r.Update(ctx, subscription); err != nil {
 			return ctrl.Result{}, err
@@ -799,12 +1190,146 @@ func (r *MaaSSubscriptionReconciler) handleDeletion(ctx context.Context, log log
 	return ctrl.Result{}, nil
 }
 
-func (r *MaaSSubscriptionReconciler) updateStatus(ctx context.Context, subscription *maasv1alpha1.MaaSSubscription, phase maasv1alpha1.Phase, message string, statusSnapshot *maasv1alpha1.MaaSSubscriptionStatus) {
-	// Status-only updates do not bump metadata.generation, so this reconcile may not re-queue.
+func (r *MaaSSubscriptionReconciler) ensureSubscriptionAPIKeysRevoked(ctx context.Context, log logr.Logger, subscription *maasv1alpha1.MaaSSubscription) (bool, error) {
+	if subscription.Annotations[retainAPIKeysOnDeleteAnnotation] == "true" {
+		log.Info("Skipping subscription API-key cleanup because API keys are retained on delete",
+			"subscription", subscription.Namespace+"/"+subscription.Name)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(subscription, nil, corev1.EventTypeNormal, "APIKeyCleanupSkipped", "InvalidateAPIKeys",
+				"Skipping API-key cleanup for MaaSSubscription %s/%s because API keys are retained on delete",
+				subscription.Namespace, subscription.Name)
+		}
+		return true, nil
+	}
+
+	if strings.TrimSpace(r.AppNamespace) == "" {
+		return false, errors.New("application namespace is required for MaaSSubscription API-key cleanup")
+	}
+
+	tenant, err := fetchTenantForNamespace(ctx, r.Client, subscription.Namespace)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			log.Info("Skipping subscription API-key cleanup because the tenant configuration no longer exists",
+				"subscription", subscription.Namespace+"/"+subscription.Name)
+			if r.Recorder != nil {
+				r.Recorder.Eventf(subscription, nil, corev1.EventTypeWarning, "APIKeyCleanupSkipped", "InvalidateAPIKeys",
+					"Skipping API-key cleanup for MaaSSubscription %s/%s because its tenant configuration no longer exists",
+					subscription.Namespace, subscription.Name)
+			}
+			return true, nil
+		}
+		return false, fmt.Errorf("resolve tenant for MaaSSubscription %s/%s: %w", subscription.Namespace, subscription.Name, err)
+	}
+	retain, err := r.owningAITenantRequestsRetention(ctx, tenant.config)
+	if err != nil {
+		return false, fmt.Errorf("resolve owning AITenant for MaaSSubscription %s/%s: %w", subscription.Namespace, subscription.Name, err)
+	}
+	if retain {
+		log.Info("Skipping subscription API-key cleanup because the owning AITenant retains API keys on delete",
+			"subscription", subscription.Namespace+"/"+subscription.Name)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(subscription, nil, corev1.EventTypeNormal, "APIKeyCleanupSkipped", "InvalidateAPIKeys",
+				"Skipping API-key cleanup for MaaSSubscription %s/%s because its owning AITenant retains API keys on delete",
+				subscription.Namespace, subscription.Name)
+		}
+		return true, nil
+	}
+	tenantID, err := tenant.identifier()
+	if err != nil {
+		return false, fmt.Errorf("resolve tenant identifier for MaaSSubscription %s/%s: %w", subscription.Namespace, subscription.Name, err)
+	}
+	tenantName := tenantID
+	if tenantName == "" {
+		tenantName = tenantreconcile.DefaultAITenantName
+	}
+
+	job := subscriptionAPIKeyRevocationJob(subscription, tenantName, tenantID, r.AppNamespace)
+	var existing batcv1.Job
+	jobReader := r.APIReader
+	if jobReader == nil {
+		jobReader = r.Client
+	}
+	if err := jobReader.Get(ctx, client.ObjectKeyFromObject(job), &existing); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return false, fmt.Errorf("get subscription API-key cleanup Job %s/%s: %w", job.Namespace, job.Name, err)
+		}
+		if err := r.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
+			return false, fmt.Errorf("create subscription API-key cleanup Job %s/%s: %w", job.Namespace, job.Name, err)
+		}
+		return false, nil
+	}
+
+	if !apiKeyRevocationJobMatchesUID(&existing, string(subscription.UID)) {
+		if err := r.Delete(ctx, &existing, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
+			return false, fmt.Errorf("delete stale subscription API-key cleanup Job %s/%s: %w", existing.Namespace, existing.Name, err)
+		}
+		return false, nil
+	}
+	if jobComplete(&existing) {
+		return true, nil
+	}
+	if jobFailed(&existing) {
+		if err := r.Delete(ctx, &existing, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
+			return false, fmt.Errorf("delete failed subscription API-key cleanup Job %s/%s: %w", existing.Namespace, existing.Name, err)
+		}
+		return false, fmt.Errorf("subscription API-key cleanup Job %s/%s failed", existing.Namespace, existing.Name)
+	}
+	log.Info("Waiting for subscription API-key cleanup Job", "job", existing.Namespace+"/"+existing.Name)
+	return false, nil
+}
+
+func (r *MaaSSubscriptionReconciler) owningAITenantRequestsRetention(ctx context.Context, config *maasv1alpha1.MaasTenantConfig) (bool, error) {
+	if config == nil {
+		return false, nil
+	}
+
+	annotations := config.Annotations
+	aitenantName := annotations[aitenantNameAnnotation]
+	aitenantNamespace := annotations[aitenantNamespaceAnnotation]
+	if aitenantName == "" || aitenantNamespace == "" {
+		return false, nil
+	}
+
+	aitenant := &maasv1alpha1.AITenant{}
+	key := types.NamespacedName{Name: aitenantName, Namespace: aitenantNamespace}
+	if err := r.Get(ctx, key, aitenant); err != nil {
+		if apierrors.IsNotFound(err) {
+			return tenantConfigRecordsAPIKeysRetention(config), nil
+		}
+		return false, fmt.Errorf("get AITenant %s: %w", key.String(), err)
+	}
+	if !ownedByAITenant(config, aitenant) {
+		return false, nil
+	}
+	if aitenant.DeletionTimestamp.IsZero() {
+		return false, nil
+	}
+
+	return aitenant.Annotations[retainAPIKeysOnDeleteAnnotation] == "true", nil
+}
+
+func subscriptionAPIKeyRevocationJob(subscription *maasv1alpha1.MaaSSubscription, tenantName, tenantID, namespace string) *batcv1.Job {
+	return apiKeyRevocationJob(subscriptionAPIKeyRevocationJobName(subscription), subscription.Name, subscription.Namespace, string(subscription.UID),
+		tenantName, subscription.Name, tenantID, namespace)
+}
+
+func subscriptionAPIKeyRevocationJobName(subscription *maasv1alpha1.MaaSSubscription) string {
+	const maxJobNameForGeneratedPods = 57
+	return aitenantBoundedName("maas-api-revoke-sub-", subscription.Namespace+"-"+subscription.Name, string(subscription.UID), maxJobNameForGeneratedPods)
+}
+
+// updateStatus returns the status write error so Reconcile can hand it to controller-runtime.
+// The For() watch drops status-only events, so a failed write (typically a conflict with
+// scanForDuplicatePriority) is only retried through that error-driven requeue.
+func (r *MaaSSubscriptionReconciler) updateStatus(ctx context.Context, subscription *maasv1alpha1.MaaSSubscription, phase maasv1alpha1.Phase, message string, statusSnapshot *maasv1alpha1.MaaSSubscriptionStatus) error {
 	// Merge SpecPriorityDuplicate from the API server so we do not clobber the async duplicate-priority scan.
+	statusTarget := subscription
+	currentStatus := *statusSnapshot
 	latest := &maasv1alpha1.MaaSSubscription{}
 	if err := r.Get(ctx, client.ObjectKeyFromObject(subscription), latest); err == nil {
-		if dup := apimeta.FindStatusCondition(latest.Status.Conditions, ConditionSpecPriorityDuplicate); dup != nil {
+		statusTarget = latest
+		currentStatus = statusTarget.Status
+		if dup := apimeta.FindStatusCondition(statusTarget.Status.Conditions, ConditionSpecPriorityDuplicate); dup != nil {
 			apimeta.SetStatusCondition(&subscription.Status.Conditions, *dup)
 		}
 	}
@@ -839,25 +1364,27 @@ func (r *MaaSSubscriptionReconciler) updateStatus(ctx context.Context, subscript
 		ObservedGeneration: subscription.GetGeneration(),
 	})
 
-	if equality.Semantic.DeepEqual(*statusSnapshot, subscription.Status) {
-		return
+	if equality.Semantic.DeepEqual(currentStatus, subscription.Status) {
+		return nil
 	}
 
-	if err := r.Status().Update(ctx, subscription); err != nil {
-		log := logr.FromContextOrDiscard(ctx)
-		log.Error(err, "failed to update MaaSSubscription status", "name", subscription.Name)
+	statusTarget.Status = subscription.Status
+	if err := r.Status().Update(ctx, statusTarget); err != nil {
+		return fmt.Errorf("failed to update MaaSSubscription status: %w", err)
 	}
+	return nil
 }
 
 // scanForDuplicatePriority lists live MaaSSubscriptions and sets SpecPriorityDuplicate
 // on each. Triggered on create, delete, or when spec.priority changes (see SetupWithManager).
 func (r *MaaSSubscriptionReconciler) scanForDuplicatePriority(ctx context.Context) {
-	log := logr.FromContextOrDiscard(ctx).WithName("MaaSSubscriptionDuplicatePriority")
+	log := oteljson.FromContext(ctx).WithName("MaaSSubscriptionDuplicatePriority")
 	var list maasv1alpha1.MaaSSubscriptionList
 	if err := r.List(ctx, &list); err != nil {
 		log.Error(err, "failed to list MaaSSubscriptions for duplicate priority scan")
 		return
 	}
+	list.Items = filterSubscriptionsByTenantNamespace(ctx, r.Client, list.Items, r.DefaultTenantNamespace, r.TenantNamespaceDiscoveryEnabled)
 
 	liveIdx := make([]int, 0, len(list.Items))
 	for i := range list.Items {
@@ -866,26 +1393,31 @@ func (r *MaaSSubscriptionReconciler) scanForDuplicatePriority(ctx context.Contex
 		}
 	}
 
-	byPriority := make(map[int32][]string)
+	type priorityScope struct {
+		namespace string
+		priority  int32
+	}
+
+	byPriority := make(map[priorityScope][]string)
 	for _, i := range liveIdx {
 		s := &list.Items[i]
-		p := s.Spec.Priority
 		k := s.Namespace + "/" + s.Name
-		byPriority[p] = append(byPriority[p], k)
+		scope := priorityScope{namespace: s.Namespace, priority: s.Spec.Priority}
+		byPriority[scope] = append(byPriority[scope], k)
 	}
-	for p := range byPriority {
-		sort.Strings(byPriority[p])
+	for scope := range byPriority {
+		sort.Strings(byPriority[scope])
 	}
 
 	var duplicateDetails []string
-	for p, keys := range byPriority {
+	for scope, keys := range byPriority {
 		if len(keys) > 1 {
-			duplicateDetails = append(duplicateDetails, fmt.Sprintf("priority=%d:%v", p, keys))
+			duplicateDetails = append(duplicateDetails, fmt.Sprintf("namespace=%s priority=%d:%v", scope.namespace, scope.priority, keys))
 		}
 	}
 	sort.Strings(duplicateDetails)
 	if len(duplicateDetails) > 0 {
-		log.Info("duplicate MaaSSubscription spec.priority groups — resolve ties for predictable API key mint / subscription selection",
+		log.Info("duplicate MaaSSubscription spec.priority groups within a namespace — resolve ties for predictable API key mint / subscription selection",
 			"groups", duplicateDetails)
 	}
 
@@ -893,7 +1425,7 @@ func (r *MaaSSubscriptionReconciler) scanForDuplicatePriority(ctx context.Contex
 		s := &list.Items[i]
 		selfKey := s.Namespace + "/" + s.Name
 		p := s.Spec.Priority
-		keys := byPriority[p]
+		keys := byPriority[priorityScope{namespace: s.Namespace, priority: p}]
 		var peers []string
 		for _, k := range keys {
 			if k != selfKey {
@@ -953,6 +1485,12 @@ func conditionsSemanticallyEqual(a, b *metav1.Condition) bool {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *MaaSSubscriptionReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if strings.TrimSpace(r.AppNamespace) == "" {
+		return errors.New("application namespace is required for MaaSSubscription cleanup")
+	}
+	if r.Recorder == nil {
+		r.Recorder = mgr.GetEventRecorder("maas-subscription-controller")
+	}
 	// Register field indexer for efficient lookup of MaaSSubscriptions by model reference.
 	// This avoids cluster-wide scans when finding subscriptions for a specific model.
 	if err := mgr.GetFieldIndexer().IndexField(
@@ -975,11 +1513,8 @@ func (r *MaaSSubscriptionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return fmt.Errorf("failed to setup field indexer for MaaSSubscription: %w", err)
 	}
 
-	// Watch generated TokenRateLimitPolicies so we re-reconcile when someone manually edits them.
-	generatedTRLP := &unstructured.Unstructured{}
-	generatedTRLP.SetGroupVersionKind(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1alpha1", Kind: "TokenRateLimitPolicy"})
-
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
+		WithOptions(controller.Options{MaxConcurrentReconciles: max(1, r.MaxConcurrentReconciles)}).
 		For(&maasv1alpha1.MaaSSubscription{}, builder.WithPredicates(predicate.Or(
 			predicate.GenerationChangedPredicate{},
 			predicate.Funcs{UpdateFunc: deletionTimestampSet},
@@ -995,16 +1530,165 @@ func (r *MaaSSubscriptionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// (fixes race condition where MaaSSubscription is created before HTTPRoute exists).
 		Watches(&gatewayapiv1.HTTPRoute{}, handler.EnqueueRequestsFromMapFunc(
 			r.mapHTTPRouteToMaaSSubscriptions,
-		)).
+		), builder.WithPredicates(httpRouteChangedForSubscription())).
 		// Watch MaaSModelRefs so we re-reconcile when a model is created or deleted.
 		Watches(&maasv1alpha1.MaaSModelRef{}, handler.EnqueueRequestsFromMapFunc(
 			r.mapMaaSModelRefToMaaSSubscriptions,
 		)).
-		// Watch generated TokenRateLimitPolicies so manual edits get overwritten by the controller.
-		Watches(generatedTRLP, handler.EnqueueRequestsFromMapFunc(
-			r.mapGeneratedTRLPToParent,
+		// Watch AITenants so gateway/OIDC platform-context changes refresh subscription
+		// gateway validation for the affected tenant namespace.
+		Watches(&maasv1alpha1.AITenant{}, handler.EnqueueRequestsFromMapFunc(
+			r.mapAITenantToMaaSSubscriptions,
 		)).
-		Complete(r)
+		// Watch tenant configs: the tenant name is part of each InferenceObjective name, and
+		// the tenant gateway decides which models get one.
+		Watches(&maasv1alpha1.MaasTenantConfig{}, handler.EnqueueRequestsFromMapFunc(
+			r.mapTenantConfigToMaaSSubscriptions,
+		), builder.WithPredicates(predicate.Or(predicate.LabelChangedPredicate{}, predicate.GenerationChangedPredicate{}))).
+		Watches(&maasv1alpha1.Tenant{}, handler.EnqueueRequestsFromMapFunc(
+			r.mapTenantConfigToMaaSSubscriptions,
+		), builder.WithPredicates(predicate.Or(predicate.LabelChangedPredicate{}, predicate.GenerationChangedPredicate{})))
+
+	// Watch LLMInferenceServices so InferencePool changes refresh InferenceObjectives.
+	// If the KServe CRD is not registered at startup, the watch is added when it appears.
+	const llmisvcCRD = "llminferenceservices.serving.kserve.io"
+	llmisvcExists := crdExists(context.Background(), mgr.GetAPIReader(), llmisvcCRD)
+	if llmisvcExists {
+		b = b.Watches(&kservev1alpha2.LLMInferenceService{},
+			handler.EnqueueRequestsFromMapFunc(r.mapLLMISvcToMaaSSubscriptions),
+			builder.WithPredicates(llmisvcRouterStatusChangedPredicate{}),
+		)
+	}
+
+	// Watch generated InferenceObjectives so edits and deletions are reverted. Reconcile
+	// reads them through the same cache. If the CRD is not registered at startup, the InferenceObjective pass is
+	// skipped until it appears.
+	ioExists := crdExists(context.Background(), mgr.GetAPIReader(), inferenceObjectiveCRD)
+	r.inferenceObjectivesUnavailable.Store(!ioExists)
+	if ioExists {
+		b = b.Watches(&llmdv1alpha2.InferenceObjective{},
+			handler.EnqueueRequestsFromMapFunc(mapInferenceObjectiveToSubscription),
+			builder.WithPredicates(ownedInferenceObjectivePredicate()),
+		)
+	} else {
+		ctrl.Log.Info("InferenceObjective CRD not yet registered; request priority is skipped until it appears")
+	}
+
+	// Watch generated TokenRateLimitPolicies — Kuadrant CRD must be present for this watch to succeed.
+	// If not yet registered at startup, the watch is added dynamically when the CRD appears.
+	const trlpCRD = "tokenratelimitpolicies.kuadrant.io"
+	trlpExists := crdExists(context.Background(), mgr.GetAPIReader(), trlpCRD)
+	if trlpExists {
+		generatedTRLP := &unstructured.Unstructured{}
+		generatedTRLP.SetGroupVersionKind(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1alpha1", Kind: "TokenRateLimitPolicy"})
+		b = b.Watches(generatedTRLP, handler.EnqueueRequestsFromMapFunc(
+			r.mapGeneratedTRLPToParent,
+		), builder.WithPredicates(predicate.Or(
+			predicate.GenerationChangedPredicate{},
+			unstructuredConditionsChangedPredicate{},
+		)))
+	} else {
+		ctrl.Log.Info("TokenRateLimitPolicy CRD not yet registered; watch will be added dynamically when Kuadrant is ready")
+	}
+
+	if r.TenantNamespaceDiscoveryEnabled {
+		// Watch Namespaces so that subscriptions in newly labeled tenant
+		// namespaces are discovered without a controller restart.
+		b = b.Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(
+			r.mapNamespaceToMaaSSubscriptions,
+		), builder.WithPredicates(predicate.LabelChangedPredicate{}))
+	}
+
+	c, err := b.Build(r)
+	if err != nil {
+		return err
+	}
+
+	if !trlpExists {
+		if err := registerWatchWhenCRDAppears(c, mgr, trlpCRD, func() source.Source {
+			trlp := &unstructured.Unstructured{}
+			trlp.SetGroupVersionKind(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1alpha1", Kind: "TokenRateLimitPolicy"})
+			return source.Kind(mgr.GetCache(), trlp,
+				handler.TypedFuncs[*unstructured.Unstructured, reconcile.Request]{
+					CreateFunc: func(ctx context.Context, e event.TypedCreateEvent[*unstructured.Unstructured], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+						for _, req := range r.mapGeneratedTRLPToParent(ctx, e.Object) {
+							q.Add(req)
+						}
+					},
+					UpdateFunc: func(ctx context.Context, e event.TypedUpdateEvent[*unstructured.Unstructured], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+						if e.ObjectOld == nil || e.ObjectNew == nil {
+							return
+						}
+						if e.ObjectOld.GetGeneration() == e.ObjectNew.GetGeneration() &&
+							unstructuredConditionSignature(e.ObjectOld) == unstructuredConditionSignature(e.ObjectNew) {
+							return
+						}
+						for _, req := range r.mapGeneratedTRLPToParent(ctx, e.ObjectNew) {
+							q.Add(req)
+						}
+					},
+					DeleteFunc: func(ctx context.Context, e event.TypedDeleteEvent[*unstructured.Unstructured], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+						for _, req := range r.mapGeneratedTRLPToParent(ctx, e.Object) {
+							q.Add(req)
+						}
+					},
+				},
+			)
+		}); err != nil {
+			return fmt.Errorf("failed to register CRD watcher for TokenRateLimitPolicy: %w", err)
+		}
+	}
+	if !llmisvcExists {
+		if err := registerWatchWhenCRDAppears(c, mgr, llmisvcCRD, func() source.Source {
+			// Typed, matching the static path and the InferenceObjective watch below.
+			// See the equivalent comment in maasmodelref_controller.go for the full
+			// explanation: an unstructured watch and typed reads use separate informers,
+			// so events and reads have independent lag.
+			return source.Kind(mgr.GetCache(), client.Object(&kservev1alpha2.LLMInferenceService{}),
+				handler.EnqueueRequestsFromMapFunc(r.mapLLMISvcToMaaSSubscriptions),
+				llmisvcRouterStatusChangedPredicate{},
+			)
+		}); err != nil {
+			return fmt.Errorf("failed to register CRD watcher for LLMInferenceService: %w", err)
+		}
+	}
+	if !ioExists {
+		if err := registerWatchWhenCRDEstablished(c, mgr, inferenceObjectiveCRD, func() source.Source {
+			return source.Kind(mgr.GetCache(), client.Object(&llmdv1alpha2.InferenceObjective{}),
+				handler.EnqueueRequestsFromMapFunc(mapInferenceObjectiveToSubscription),
+				ownedInferenceObjectivePredicate(),
+			)
+		}, func(ctx context.Context) ([]reconcile.Request, error) {
+			// Runs only after the watch is registered, so no objective edit goes unseen.
+			r.inferenceObjectivesUnavailable.Store(false)
+			return r.subscriptionsWithInferencePriority(ctx)
+		}); err != nil {
+			return fmt.Errorf("failed to register CRD watcher for InferenceObjective: %w", err)
+		}
+	}
+	return nil
+}
+
+func (r *MaaSSubscriptionReconciler) mapAITenantToMaaSSubscriptions(ctx context.Context, obj client.Object) []reconcile.Request {
+	aitenant, ok := obj.(*maasv1alpha1.AITenant)
+	if !ok {
+		return nil
+	}
+	tenantNamespace := tenantreconcile.TenantNamespaceForAITenant(aitenant.Name, r.DefaultTenantNamespace)
+	subList := &maasv1alpha1.MaaSSubscriptionList{}
+	if err := r.List(ctx, subList, client.InNamespace(tenantNamespace)); err != nil {
+		oteljson.FromContext(ctx).Error(err, "failed to list MaaSSubscription resources for AITenant change",
+			"tenantNamespace", tenantNamespace,
+			"aitenant", obj.GetNamespace()+"/"+obj.GetName())
+		return nil
+	}
+	subList.Items = filterSubscriptionsByTenantNamespace(ctx, r.Client, subList.Items, r.DefaultTenantNamespace, r.TenantNamespaceDiscoveryEnabled)
+
+	requests := make([]reconcile.Request, len(subList.Items))
+	for i, sub := range subList.Items {
+		requests[i] = reconcile.Request{NamespacedName: types.NamespacedName{Name: sub.Name, Namespace: sub.Namespace}}
+	}
+	return requests
 }
 
 // duplicatePriorityScanHandler runs a full duplicate-priority scan without enqueuing reconciles.
@@ -1038,9 +1722,28 @@ func duplicatePriorityScanPredicate() predicate.Predicate {
 	}
 }
 
-// mapGeneratedTRLPToParent maps a generated TokenRateLimitPolicy back to any
-// MaaSSubscription that references the same model. The TokenRateLimitPolicy is per-model (aggregated),
-// so we use the model label to find a subscription to trigger reconciliation.
+// mapNamespaceToMaaSSubscriptions enqueues all MaaSSubscription resources in a
+// namespace when that namespace's labels change (e.g. AITenant label added or removed).
+func (r *MaaSSubscriptionReconciler) mapNamespaceToMaaSSubscriptions(ctx context.Context, obj client.Object) []reconcile.Request {
+	ns := obj.GetName()
+	if ns != r.DefaultTenantNamespace && !r.TenantNamespaceDiscoveryEnabled {
+		return nil
+	}
+	subList := &maasv1alpha1.MaaSSubscriptionList{}
+	if err := r.List(ctx, subList, client.InNamespace(ns)); err != nil {
+		oteljson.FromContext(ctx).Error(err, "failed to list MaaSSubscription for namespace label change", "namespace", ns)
+		return nil
+	}
+	requests := make([]reconcile.Request, len(subList.Items))
+	for i, s := range subList.Items {
+		requests[i] = reconcile.Request{NamespacedName: types.NamespacedName{Name: s.Name, Namespace: s.Namespace}}
+	}
+	return requests
+}
+
+// mapGeneratedTRLPToParent maps a generated TokenRateLimitPolicy back to every
+// MaaSSubscription that references the same model. The TokenRateLimitPolicy is per-model
+// and aggregated, so all contributing subscriptions need a status refresh.
 func (r *MaaSSubscriptionReconciler) mapGeneratedTRLPToParent(ctx context.Context, obj client.Object) []reconcile.Request {
 	labels := obj.GetLabels()
 	if labels["app.kubernetes.io/managed-by"] != "maas-controller" {
@@ -1050,14 +1753,31 @@ func (r *MaaSSubscriptionReconciler) mapGeneratedTRLPToParent(ctx context.Contex
 	if modelName == "" {
 		return nil
 	}
-	modelNamespace := obj.GetNamespace()
-	sub := findAnySubscriptionForModel(ctx, r.Client, modelNamespace, modelName)
-	if sub == nil {
+	modelNamespace := labels["maas.opendatahub.io/model-namespace"]
+	if modelNamespace == "" {
+		modelNamespace = obj.GetNamespace()
+	}
+	modelKey := modelNamespace + "/" + modelName
+	var subscriptions maasv1alpha1.MaaSSubscriptionList
+	if err := r.List(ctx, &subscriptions, client.MatchingFields{modelRefIndexKey: modelKey}); err != nil {
 		return nil
 	}
-	return []reconcile.Request{{
-		NamespacedName: types.NamespacedName{Name: sub.Name, Namespace: sub.Namespace},
-	}}
+	subscriptions.Items = filterSubscriptionsByTenantNamespace(ctx, r.Client, subscriptions.Items, r.DefaultTenantNamespace, r.TenantNamespaceDiscoveryEnabled)
+
+	seen := make(map[types.NamespacedName]struct{}, len(subscriptions.Items))
+	requests := make([]reconcile.Request, 0, len(subscriptions.Items))
+	for _, sub := range subscriptions.Items {
+		if !sub.GetDeletionTimestamp().IsZero() {
+			continue
+		}
+		key := types.NamespacedName{Name: sub.Name, Namespace: sub.Namespace}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		requests = append(requests, reconcile.Request{NamespacedName: key})
+	}
+	return requests
 }
 
 // mapMaaSModelRefToMaaSSubscriptions returns reconcile requests for all MaaSSubscriptions
@@ -1073,6 +1793,7 @@ func (r *MaaSSubscriptionReconciler) mapMaaSModelRefToMaaSSubscriptions(ctx cont
 	if err := r.List(ctx, &subscriptions, client.MatchingFields{modelRefIndexKey: modelKey}); err != nil {
 		return nil
 	}
+	subscriptions.Items = filterSubscriptionsByTenantNamespace(ctx, r.Client, subscriptions.Items, r.DefaultTenantNamespace, r.TenantNamespaceDiscoveryEnabled)
 	// Deduplicate requests (same subscription shouldn't be queued multiple times)
 	seen := make(map[types.NamespacedName]struct{}, len(subscriptions.Items))
 	var requests []reconcile.Request
@@ -1085,6 +1806,19 @@ func (r *MaaSSubscriptionReconciler) mapMaaSModelRefToMaaSSubscriptions(ctx cont
 		requests = append(requests, reconcile.Request{NamespacedName: key})
 	}
 	return requests
+}
+
+// httpRouteChangedForSubscription drops HTTPRoute status writes, which gateway and
+// Kuadrant controllers make as policies attach. MaaSSubscription reconcile resolves a
+// model's route by existence, name and labels, checks spec.parentRefs against the tenant
+// Gateway and owns the TokenRateLimitPolicy by the route; it never reads route status.
+// TokenRateLimitPolicy status reaches it through the TokenRateLimitPolicy watch.
+func httpRouteChangedForSubscription() predicate.Predicate {
+	return predicate.Or(
+		predicate.GenerationChangedPredicate{},
+		predicate.LabelChangedPredicate{},
+		predicate.Funcs{UpdateFunc: uidChanged},
+	)
 }
 
 // mapHTTPRouteToMaaSSubscriptions returns reconcile requests for all MaaSSubscriptions
@@ -1111,6 +1845,7 @@ func (r *MaaSSubscriptionReconciler) mapHTTPRouteToMaaSSubscriptions(ctx context
 		if err := r.List(ctx, &subscriptions, client.MatchingFields{modelRefIndexKey: modelKey}); err != nil {
 			continue // skip this model on error, don't fail entire mapping
 		}
+		subscriptions.Items = filterSubscriptionsByTenantNamespace(ctx, r.Client, subscriptions.Items, r.DefaultTenantNamespace, r.TenantNamespaceDiscoveryEnabled)
 		for _, s := range subscriptions.Items {
 			key := types.NamespacedName{Name: s.Name, Namespace: s.Namespace}
 			if _, exists := seen[key]; exists {

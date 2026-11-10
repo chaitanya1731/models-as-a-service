@@ -20,10 +20,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/go-logr/logr"
-	kservev1alpha1 "github.com/kserve/kserve/pkg/apis/serving/v1alpha1"
+	kservev1alpha2 "github.com/kserve/kserve/pkg/apis/serving/v1alpha2"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -32,18 +37,23 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/util/workqueue"
 	"knative.dev/pkg/apis"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 	gatewayapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	maasv1alpha1 "github.com/opendatahub-io/models-as-a-service/maas-controller/api/maas/v1alpha1"
+	"github.com/opendatahub-io/models-as-a-service/maas-controller/pkg/oteljson"
 )
 
 // MaaSModelRefReconciler reconciles a MaaSModelRef object
@@ -54,6 +64,17 @@ type MaaSModelRefReconciler struct {
 	// GatewayName and GatewayNamespace identify the Gateway used for model HTTPRoutes (configurable via flags).
 	GatewayName      string
 	GatewayNamespace string
+
+	// DefaultTenantNamespace is the legacy single-tenant namespace.
+	DefaultTenantNamespace string
+	// TenantNamespaceDiscoveryEnabled enables AITenant-labeled tenant namespaces.
+	TenantNamespaceDiscoveryEnabled bool
+
+	// AITenantNamespace is the infrastructure namespace where AITenant CRs live.
+	AITenantNamespace string
+
+	// Recorder emits Kubernetes events for model identity conflict warnings.
+	Recorder events.EventRecorder
 }
 
 func (r *MaaSModelRefReconciler) gatewayName() string {
@@ -69,6 +90,7 @@ func (r *MaaSModelRefReconciler) gatewayNamespace() string {
 //+kubebuilder:rbac:groups=maas.opendatahub.io,resources=maasmodelrefs/finalizers,verbs=update
 //+kubebuilder:rbac:groups=maas.opendatahub.io,resources=maassubscriptions,verbs=get;list;watch
 //+kubebuilder:rbac:groups=maas.opendatahub.io,resources=maasauthpolicies,verbs=get;list;watch
+//+kubebuilder:rbac:groups=maas.opendatahub.io,resources=aitenants,verbs=get;list;watch
 //+kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways,verbs=get;list;watch
 //+kubebuilder:rbac:groups=kuadrant.io,resources=authpolicies,verbs=get;list;watch;create;update;patch;delete
@@ -88,9 +110,53 @@ func modelRefNameIndexer(obj client.Object) []string {
 	return []string{model.Spec.ModelRef.Name}
 }
 
+const tenantAssociationIndex = ".tenantAssociation"
+const tenantAssociationUnresolved = "_unresolved_"
+
+// tenantAssociationIndexer indexes MaaSModelRefs by their effective tenant:
+//   - spec.tenantRef if set (explicit reference)
+//   - status.resolvedTenantRef if spec.tenantRef is empty (auto-resolved)
+//   - sentinel "_unresolved_" if both are empty (not yet resolved)
+func tenantAssociationIndexer(obj client.Object) []string {
+	model, ok := obj.(*maasv1alpha1.MaaSModelRef)
+	if !ok {
+		return nil
+	}
+	if model.Spec.TenantRef != "" {
+		return []string{model.Spec.TenantRef}
+	}
+	if model.Status.ResolvedTenantRef != "" {
+		return []string{model.Status.ResolvedTenantRef}
+	}
+	return []string{tenantAssociationUnresolved}
+}
+
+// backendNotReadyRequeueInterval is how often a model whose backend is not yet
+// ready is re-checked without an event.
+//
+// The LLMInferenceService watch normally delivers the Ready transition, but the
+// dynamic (late-CRD) path registers the watch asynchronously and may miss the
+// event if the backend becomes ready in the narrow window before the watch is
+// established. This backstop closes that gap. It is deliberately narrow: it
+// fires only while the backend itself is not ready, not for models that are
+// intentionally not Ready because governance is missing or the HTTPRoute has
+// not appeared yet — those have their own watches and do not need polling.
+const backendNotReadyRequeueInterval = 10 * time.Second
+
+// requeueWhileBackendNotReady returns a timed re-check when the backend is not
+// yet ready, so a dropped LLMInferenceService Ready event cannot strand the
+// phase. Returns an empty Result (event-only) once the backend is ready.
+func requeueWhileBackendNotReady(runtimeReady bool) ctrl.Result {
+	if runtimeReady {
+		return ctrl.Result{}
+	}
+	return ctrl.Result{RequeueAfter: backendNotReadyRequeueInterval}
+}
+
 // Reconcile is part of the main kubernetes reconciliation loop
 func (r *MaaSModelRefReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := logr.FromContextOrDiscard(ctx).WithValues("MaaSModelRef", req.NamespacedName)
+	ctx = oteljson.IntoContext(ctx)
+	log := oteljson.FromContext(ctx).WithValues("MaaSModelRef", req.NamespacedName)
 
 	model := &maasv1alpha1.MaaSModelRef{}
 	if err := r.Get(ctx, req.NamespacedName, model); err != nil {
@@ -110,8 +176,7 @@ func (r *MaaSModelRefReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// No finalizer needed — there are no generated resources to clean up.
 	if reflect.DeepEqual(model.Spec, maasv1alpha1.MaaSModelSpec{}) {
 		statusSnapshot := model.Status.DeepCopy()
-		r.updateStatus(ctx, model, "Invalid", "spec is required", statusSnapshot)
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, r.updateStatus(ctx, model, "Invalid", "spec is required", statusSnapshot)
 	}
 
 	// Add finalizer if not present
@@ -128,24 +193,27 @@ func (r *MaaSModelRefReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	handler := GetBackendHandler(kind, r)
 	if handler == nil {
 		log.Error(nil, "unknown modelRef kind", "kind", kind)
-		r.updateStatus(ctx, model, "Failed", fmt.Sprintf("unknown kind: %s", kind), statusSnapshot)
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, r.updateStatus(ctx, model, "Failed", fmt.Sprintf("unknown kind: %s", kind), statusSnapshot)
 	}
 
 	if err := handler.ReconcileRoute(ctx, log, model); err != nil {
 		if errors.Is(err, ErrKindNotImplemented) {
-			r.updateStatusWithReason(ctx, model, "Failed", fmt.Sprintf("kind not implemented: %s", kind), "Unsupported", statusSnapshot)
-			return ctrl.Result{}, nil
+			return ctrl.Result{}, r.updateStatusWithReason(ctx, model, "Failed", fmt.Sprintf("kind not implemented: %s", kind), "Unsupported", statusSnapshot)
 		}
 		if errors.Is(err, ErrHTTPRouteNotFound) {
-			// HTTPRoute doesn't exist yet - this is normal during startup.
-			// Set status to Pending (not Failed). The HTTPRoute watch will trigger reconciliation when the route is created.
+			// HTTPRoute doesn't exist yet — normal during startup. The HTTPRoute
+			// watch re-enqueues this model when the route is created.
 			model.Status.Endpoint = ""
-			r.updateStatus(ctx, model, "Pending", "Waiting for HTTPRoute to be created", statusSnapshot)
-			return ctrl.Result{}, nil
+			return ctrl.Result{}, r.updateStatus(ctx, model, "Pending", "Waiting for HTTPRoute to be created", statusSnapshot)
+		}
+		if errors.Is(err, ErrTenantResolutionPending) {
+			model.Status.Endpoint = ""
+			return ctrl.Result{}, r.updateStatus(ctx, model, "Pending", "Waiting for tenant resolution: "+err.Error(), statusSnapshot)
 		}
 		log.Error(err, "failed to reconcile HTTPRoute")
-		r.updateStatus(ctx, model, "Failed", fmt.Sprintf("Failed to reconcile HTTPRoute: %v", err), statusSnapshot)
+		if statusErr := r.updateStatus(ctx, model, "Failed", fmt.Sprintf("Failed to reconcile HTTPRoute: %v", err), statusSnapshot); statusErr != nil {
+			log.Error(statusErr, "failed to persist reconcile failure")
+		}
 		return ctrl.Result{}, err
 	}
 
@@ -154,13 +222,14 @@ func (r *MaaSModelRefReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		if errors.Is(err, ErrKindNotImplemented) {
 			model.Status.Endpoint = ""
 			model.Status.Phase = "Failed"
-			r.updateStatusWithReason(ctx, model, "Failed", fmt.Sprintf("kind not implemented: %s", kind), "Unsupported", statusSnapshot)
-			return ctrl.Result{}, nil
+			return ctrl.Result{}, r.updateStatusWithReason(ctx, model, "Failed", fmt.Sprintf("kind not implemented: %s", kind), "Unsupported", statusSnapshot)
 		}
 		log.Error(err, "failed to update model status")
 		model.Status.Endpoint = ""
 		model.Status.Phase = "Failed"
-		r.updateStatus(ctx, model, "Failed", fmt.Sprintf("Failed to update model status: %v", err), statusSnapshot)
+		if statusErr := r.updateStatus(ctx, model, "Failed", fmt.Sprintf("Failed to update model status: %v", err), statusSnapshot); statusErr != nil {
+			log.Error(statusErr, "failed to persist reconcile failure")
+		}
 		return ctrl.Result{}, err
 	}
 	if model.Spec.EndpointOverride != "" {
@@ -169,28 +238,70 @@ func (r *MaaSModelRefReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		model.Status.Endpoint = endpoint
 	}
 
+	// Only update ResolvedModelAlias when a non-empty alias is returned.
+	// An empty result with no error means the backing resource is not yet ready
+	// (addresses not yet populated). An error indicates a transient API failure.
+	// In both cases, preserve the existing alias so reverse lookups remain valid.
+	if alias, err := handler.ResolveModelAlias(ctx, log, model); err != nil {
+		log.Error(err, "failed to resolve model alias, keeping existing value")
+	} else if alias != "" {
+		model.Status.ResolvedModelAlias = alias
+	}
+
 	governed := r.checkGovernanceAttached(ctx, model)
 	r.setGovernanceCondition(model, governed)
-	r.setRuntimeReadyCondition(model, runtimeReady)
+	if runtimeReady {
+		markRuntimeReady(model)
+	} else {
+		reason, message := handler.NotReadyReason()
+		markRuntimeNotReady(model, reason, message)
+	}
+	r.checkModelIdentityConflict(ctx, log, model)
 
 	phase, message := deriveModelPhase(governed, runtimeReady)
 	if phase != "Ready" {
 		model.Status.Endpoint = ""
 	}
-	r.updateStatus(ctx, model, phase, message, statusSnapshot)
-	return ctrl.Result{}, nil
+	if err := r.updateStatus(ctx, model, phase, message, statusSnapshot); err != nil {
+		return ctrl.Result{}, err
+	}
+	return requeueWhileBackendNotReady(runtimeReady), nil
 }
 
 // checkGovernanceAttached returns true if there is at least one active
 // MaaSSubscription AND at least one active MaaSAuthPolicy referencing this model.
 // No admin CR names, namespaces, or UIDs are propagated to status.
 func (r *MaaSModelRefReconciler) checkGovernanceAttached(ctx context.Context, model *maasv1alpha1.MaaSModelRef) bool {
-	sub := findAnySubscriptionForModel(ctx, r.Client, model.Namespace, model.Name)
+	sub := r.findAnySubscriptionForModel(ctx, model.Namespace, model.Name)
 	if sub == nil {
 		return false
 	}
-	ap := findAnyAuthPolicyForModel(ctx, r.Client, model.Namespace, model.Name)
+	ap := r.findAnyAuthPolicyForModel(ctx, model.Namespace, model.Name)
 	return ap != nil
+}
+
+func (r *MaaSModelRefReconciler) findAnySubscriptionForModel(ctx context.Context, modelNamespace, modelName string) *maasv1alpha1.MaaSSubscription {
+	subs, err := findAllSubscriptionsForModel(ctx, r.Client, modelNamespace, modelName)
+	if err != nil {
+		return nil
+	}
+	subs = filterSubscriptionsByTenantNamespace(ctx, r.Client, subs, r.DefaultTenantNamespace, r.TenantNamespaceDiscoveryEnabled)
+	if len(subs) == 0 {
+		return nil
+	}
+	return &subs[0]
+}
+
+func (r *MaaSModelRefReconciler) findAnyAuthPolicyForModel(ctx context.Context, modelNamespace, modelName string) *maasv1alpha1.MaaSAuthPolicy {
+	policies, err := findAllAuthPoliciesForModel(ctx, r.Client, modelNamespace, modelName)
+	if err != nil {
+		return nil
+	}
+	policies = filterAuthPoliciesByTenantNamespace(ctx, r.Client, policies, r.DefaultTenantNamespace, r.TenantNamespaceDiscoveryEnabled)
+	if len(policies) == 0 {
+		return nil
+	}
+	return &policies[0]
 }
 
 func (r *MaaSModelRefReconciler) setGovernanceCondition(model *maasv1alpha1.MaaSModelRef, governed bool) {
@@ -216,21 +327,28 @@ func (r *MaaSModelRefReconciler) setGovernanceCondition(model *maasv1alpha1.MaaS
 	apimeta.SetStatusCondition(&model.Status.Conditions, cond)
 }
 
-func (r *MaaSModelRefReconciler) setRuntimeReadyCondition(model *maasv1alpha1.MaaSModelRef, ready bool) {
-	cond := metav1.Condition{
+// markRuntimeReady records a healthy backend on RuntimeReady.
+func markRuntimeReady(model *maasv1alpha1.MaaSModelRef) {
+	setRuntimeReadyCondition(model, metav1.ConditionTrue, maasv1alpha1.ReasonRuntimeHealthy, "Backend is healthy")
+}
+
+// markRuntimeNotReady records why the backend is not ready on RuntimeReady; an empty
+// reason keeps the generic one.
+func markRuntimeNotReady(model *maasv1alpha1.MaaSModelRef, reason maasv1alpha1.ConditionReason, message string) {
+	if reason == "" {
+		reason, message = maasv1alpha1.ReasonRuntimeHealthFailure, "Backend is not ready"
+	}
+	setRuntimeReadyCondition(model, metav1.ConditionFalse, reason, message)
+}
+
+func setRuntimeReadyCondition(model *maasv1alpha1.MaaSModelRef, status metav1.ConditionStatus, reason maasv1alpha1.ConditionReason, message string) {
+	apimeta.SetStatusCondition(&model.Status.Conditions, metav1.Condition{
 		Type:               maasv1alpha1.ConditionRuntimeReady,
+		Status:             status,
+		Reason:             string(reason),
+		Message:            message,
 		ObservedGeneration: model.GetGeneration(),
-	}
-	if ready {
-		cond.Status = metav1.ConditionTrue
-		cond.Reason = string(maasv1alpha1.ReasonRuntimeHealthy)
-		cond.Message = "Backend is healthy"
-	} else {
-		cond.Status = metav1.ConditionFalse
-		cond.Reason = string(maasv1alpha1.ReasonRuntimeHealthFailure)
-		cond.Message = "Backend is not ready"
-	}
-	apimeta.SetStatusCondition(&model.Status.Conditions, cond)
+	})
 }
 
 func deriveModelPhase(governed, runtimeReady bool) (phase, message string) {
@@ -312,12 +430,12 @@ func (r *MaaSModelRefReconciler) deleteGeneratedPoliciesByLabel(ctx context.Cont
 	return nil
 }
 
-func (r *MaaSModelRefReconciler) updateStatus(ctx context.Context, model *maasv1alpha1.MaaSModelRef, phase, message string, statusSnapshot *maasv1alpha1.MaaSModelStatus) {
-	r.updateStatusWithReason(ctx, model, phase, message, "", statusSnapshot)
+func (r *MaaSModelRefReconciler) updateStatus(ctx context.Context, model *maasv1alpha1.MaaSModelRef, phase, message string, statusSnapshot *maasv1alpha1.MaaSModelStatus) error {
+	return r.updateStatusWithReason(ctx, model, phase, message, "", statusSnapshot)
 }
 
 // updateStatusWithReason sets Phase and Ready condition; when phase is "Failed", reason overrides the default "ReconcileFailed" (e.g. "Unsupported" for unimplemented kinds).
-func (r *MaaSModelRefReconciler) updateStatusWithReason(ctx context.Context, model *maasv1alpha1.MaaSModelRef, phase, message, reason string, statusSnapshot *maasv1alpha1.MaaSModelStatus) {
+func (r *MaaSModelRefReconciler) updateStatusWithReason(ctx context.Context, model *maasv1alpha1.MaaSModelRef, phase, message, reason string, statusSnapshot *maasv1alpha1.MaaSModelStatus) error {
 	model.Status.Phase = phase
 
 	status := metav1.ConditionTrue
@@ -344,14 +462,15 @@ func (r *MaaSModelRefReconciler) updateStatusWithReason(ctx context.Context, mod
 	})
 
 	if equality.Semantic.DeepEqual(*statusSnapshot, model.Status) {
-		return
+		return nil
 	}
 
 	if err := r.Status().Update(ctx, model); err != nil {
-		log := logr.FromContextOrDiscard(ctx)
+		log := oteljson.FromContext(ctx)
 		log.Error(err, "failed to update MaaSModelRef status", "name", model.Name)
-		// Intentionally do not return the error so we do not re-queue on status update conflict/failure.
+		return err
 	}
+	return nil
 }
 
 // llmisvcReadyChangedPredicate passes Create/Delete events and Update events
@@ -361,18 +480,18 @@ type llmisvcReadyChangedPredicate struct {
 }
 
 func (llmisvcReadyChangedPredicate) Update(e event.UpdateEvent) bool {
-	oldObj, ok := e.ObjectOld.(*kservev1alpha1.LLMInferenceService)
+	oldObj, ok := e.ObjectOld.(*kservev1alpha2.LLMInferenceService)
 	if !ok {
 		return true
 	}
-	newObj, ok := e.ObjectNew.(*kservev1alpha1.LLMInferenceService)
+	newObj, ok := e.ObjectNew.(*kservev1alpha2.LLMInferenceService)
 	if !ok {
 		return true
 	}
 	return llmisvcReadyStatus(oldObj) != llmisvcReadyStatus(newObj)
 }
 
-func llmisvcReadyStatus(obj *kservev1alpha1.LLMInferenceService) string {
+func llmisvcReadyStatus(obj *kservev1alpha2.LLMInferenceService) string {
 	for _, c := range obj.Status.Conditions {
 		if c.Type == apis.ConditionReady {
 			return string(c.Status)
@@ -381,14 +500,220 @@ func llmisvcReadyStatus(obj *kservev1alpha1.LLMInferenceService) string {
 	return ""
 }
 
-// SetupWithManager sets up the controller with the Manager.
+// crdExists checks whether a CRD is installed by a targeted Get using the CRD name
+// (format: <plural-lowercase-kind>.<group>, e.g. "authpolicies.kuadrant.io").
+// Uses the API reader directly — not the REST mapper (scheme-registered types cause
+// false positives) and not the cached client (cache not started at SetupWithManager time).
+func crdExists(ctx context.Context, reader client.Reader, crdName string) bool {
+	crd := &apiextensionsv1.CustomResourceDefinition{}
+	err := reader.Get(ctx, types.NamespacedName{Name: crdName}, crd)
+	if err == nil {
+		return true
+	}
+	if !apierrors.IsNotFound(err) {
+		ctrl.Log.Error(err, "failed to check for CRD", "crdName", crdName)
+	}
+	return false
+}
+
+// crdPartialMetadata returns a PartialObjectMetadata stub for the CRD GVK.
+// Using metadata-only informers avoids caching full CRD objects (50–200KB each
+// due to OpenAPI schemas), which is the single biggest memory contributor on
+// large clusters with 600+ CRDs.
+func crdPartialMetadata() *metav1.PartialObjectMetadata {
+	m := &metav1.PartialObjectMetadata{}
+	m.SetGroupVersionKind(apiextensionsv1.SchemeGroupVersion.WithKind("CustomResourceDefinition"))
+	return m
+}
+
+// registerWatchWhenCRDAppears dynamically registers a resource watch the first time
+// the target CRD becomes available. It watches CRD metadata (to avoid caching full
+// objects) and calls makeSource() exactly once via sync.Once when the named CRD is
+// detected — so multiple CRD update events never produce duplicate watchers.
+func registerWatchWhenCRDAppears(
+	c controller.Controller,
+	mgr ctrl.Manager,
+	crdName string,
+	makeSource func() source.Source,
+) error {
+	log := ctrl.Log.WithName("crd-watcher").WithValues("crdName", crdName)
+	log.Info("CRD not yet registered at startup; will register watch dynamically when it appears")
+	var once sync.Once
+	return c.Watch(source.Kind(
+		mgr.GetCache(),
+		crdPartialMetadata(),
+		handler.TypedEnqueueRequestsFromMapFunc[*metav1.PartialObjectMetadata](
+			func(ctx context.Context, crd *metav1.PartialObjectMetadata) []reconcile.Request {
+				if crd.Name != crdName {
+					return nil
+				}
+				once.Do(func() {
+					if err := c.Watch(makeSource()); err != nil {
+						log.Error(err, "failed to register watch after CRD appeared")
+					} else {
+						log.Info("CRD appeared; watch registered dynamically")
+					}
+				})
+				return nil
+			},
+		),
+	))
+}
+
+// registerWatchWhenCRDEstablished is registerWatchWhenCRDAppears for a watch with a
+// follow-up hook. Once the named CRD reports Established=True, it registers the watch and
+// then runs onEstablished, enqueuing the requests it returns on c. Unlike
+// registerWatchWhenCRDAppears, both steps are retried with backoff until they succeed.
+//
+// The CRD informer uses metadata-only objects to avoid caching full CRD specs.
+// The Established condition is checked via a live API read when the CRD name matches.
+func registerWatchWhenCRDEstablished(
+	c controller.Controller,
+	mgr ctrl.Manager,
+	crdName string,
+	makeSource func() source.Source,
+	onEstablished func(context.Context) ([]reconcile.Request, error),
+) error {
+	reader := mgr.GetAPIReader()
+	b := newCRDBootstrap(crdName, func() error { return c.Watch(makeSource()) }, onEstablished)
+	b.log.Info("CRD not yet registered at startup; will register watch when it is established")
+	return c.Watch(source.Kind(
+		mgr.GetCache(),
+		crdPartialMetadata(),
+		handler.TypedFuncs[*metav1.PartialObjectMetadata, reconcile.Request]{
+			CreateFunc: func(ctx context.Context, e event.TypedCreateEvent[*metav1.PartialObjectMetadata], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+				b.handleMetadata(ctx, e.Object.Name, reader, q)
+			},
+			UpdateFunc: func(ctx context.Context, e event.TypedUpdateEvent[*metav1.PartialObjectMetadata], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+				b.handleMetadata(ctx, e.ObjectNew.Name, reader, q)
+			},
+		},
+	))
+}
+
+// crdBootstrap runs the one-time setup for registerWatchWhenCRDEstablished.
+type crdBootstrap struct {
+	log           logr.Logger
+	crdName       string
+	register      func() error
+	onEstablished func(context.Context) ([]reconcile.Request, error)
+	initialDelay  time.Duration
+	maxDelay      time.Duration
+
+	started atomic.Bool
+	// done is closed when the watch is registered and the hook's requests are enqueued.
+	done chan struct{}
+}
+
+func newCRDBootstrap(crdName string, register func() error, onEstablished func(context.Context) ([]reconcile.Request, error)) *crdBootstrap {
+	return &crdBootstrap{
+		log:           ctrl.Log.WithName("crd-watcher").WithValues("crdName", crdName),
+		crdName:       crdName,
+		register:      register,
+		onEstablished: onEstablished,
+		initialDelay:  time.Second,
+		maxDelay:      time.Minute,
+		done:          make(chan struct{}),
+	}
+}
+
+// handleMetadata starts the bootstrap when a metadata-only CRD event matches.
+// It claims ownership via CompareAndSwap on the first matching event and polls
+// for the Established condition with exponential backoff on a background context
+// that outlives the event handler. The goroutine terminates when the process exits.
+func (b *crdBootstrap) handleMetadata(ctx context.Context, name string, reader client.Reader, q workqueue.TypedInterface[reconcile.Request]) {
+	if name != b.crdName || !b.started.CompareAndSwap(false, true) {
+		return
+	}
+	go b.waitForEstablishedAndRun(context.WithoutCancel(ctx), reader, q)
+}
+
+func (b *crdBootstrap) waitForEstablishedAndRun(ctx context.Context, reader client.Reader, q workqueue.TypedInterface[reconcile.Request]) {
+	defer close(b.done)
+	b.pollEstablished(ctx, reader)
+	if !b.retry(ctx, "register watch", b.register) {
+		return
+	}
+	b.log.Info("CRD established; watch registered dynamically")
+	b.retry(ctx, "run CRD established hook", func() error {
+		requests, err := b.onEstablished(ctx)
+		if err != nil {
+			return err
+		}
+		for _, req := range requests {
+			q.Add(req)
+		}
+		return nil
+	})
+}
+
+// pollEstablished polls indefinitely until the CRD reports Established=True.
+// API errors are logged at Error; "not yet established" is logged at V(1)
+// since it is the normal state during CRD install.
+func (b *crdBootstrap) pollEstablished(ctx context.Context, reader client.Reader) {
+	delay := b.initialDelay
+	for {
+		var crd apiextensionsv1.CustomResourceDefinition
+		if err := reader.Get(ctx, types.NamespacedName{Name: b.crdName}, &crd); err != nil {
+			b.log.Error(err, "failed to read CRD for Established check; retrying", "after", delay)
+		} else if crdEstablished(&crd) {
+			return
+		} else {
+			b.log.V(1).Info("CRD not yet established; retrying", "after", delay)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, b.maxDelay)
+	}
+}
+
+// retry calls fn until it succeeds, doubling the delay between attempts up to maxDelay.
+// It reports false if ctx ends first.
+func (b *crdBootstrap) retry(ctx context.Context, what string, fn func() error) bool {
+	delay := b.initialDelay
+	for {
+		err := fn()
+		if err == nil {
+			return true
+		}
+		b.log.Error(err, "failed to "+what+" after CRD was established; retrying", "after", delay)
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, b.maxDelay)
+	}
+}
+
+// crdEstablished reports whether the CRD has the Established=True condition.
+func crdEstablished(crd *apiextensionsv1.CustomResourceDefinition) bool {
+	for _, cond := range crd.Status.Conditions {
+		if cond.Type == apiextensionsv1.Established {
+			return cond.Status == apiextensionsv1.ConditionTrue
+		}
+	}
+	return false
+}
+
 func (r *MaaSModelRefReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	ctx := context.Background()
+
+	if r.Recorder == nil {
+		r.Recorder = mgr.GetEventRecorder("maas-modelref-controller")
+	}
+
 	if err := mgr.GetFieldIndexer().IndexField(ctx, &maasv1alpha1.MaaSModelRef{}, modelRefNameIndex, modelRefNameIndexer); err != nil {
 		return fmt.Errorf("failed to create field index %s: %w", modelRefNameIndex, err)
 	}
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &maasv1alpha1.MaaSModelRef{}, tenantAssociationIndex, tenantAssociationIndexer); err != nil {
+		return fmt.Errorf("failed to create field index %s: %w", tenantAssociationIndex, err)
+	}
 
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&maasv1alpha1.MaaSModelRef{}, builder.WithPredicates(predicate.Or(
 			predicate.GenerationChangedPredicate{},
 			predicate.Funcs{UpdateFunc: deletionTimestampSet},
@@ -397,13 +722,59 @@ func (r *MaaSModelRefReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// (fixes race condition where MaaSModelRef is created before HTTPRoute exists).
 		Watches(&gatewayapiv1.HTTPRoute{}, handler.EnqueueRequestsFromMapFunc(
 			r.mapHTTPRouteToMaaSModelRefs,
-		)).
-		// Watch LLMInferenceServices so we re-reconcile when the backing service's Ready status changes
-		// (automatically updates MaaSModelRef status from Pending -> Ready and vice versa).
-		Watches(&kservev1alpha1.LLMInferenceService{},
+		), builder.WithPredicates(httpRouteChangedForModelRef())).
+		// Watch sibling MaaSModelRefs so model-identity-conflict detection stays
+		// current: a newly created/deleted sibling, or one whose resolved alias
+		// or resolved tenant changed, can introduce or resolve a conflict for
+		// every other model in the namespace even though those models' own
+		// specs didn't change.
+		//
+		// Only siblings sharing the affected alias are enqueued (not the entire
+		// namespace) to avoid O(N²) fan-out in namespaces with many models.
+		Watches(&maasv1alpha1.MaaSModelRef{}, &handler.Funcs{
+			CreateFunc: func(ctx context.Context, e event.CreateEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+				if m, ok := e.Object.(*maasv1alpha1.MaaSModelRef); ok {
+					r.enqueueSiblingsWithAlias(ctx, m, q, "")
+				}
+			},
+			UpdateFunc: func(ctx context.Context, e event.UpdateEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+				oldM, ok1 := e.ObjectOld.(*maasv1alpha1.MaaSModelRef)
+				newM, ok2 := e.ObjectNew.(*maasv1alpha1.MaaSModelRef)
+				if ok1 && ok2 && siblingConflictFieldsChanged(oldM, newM) {
+					r.enqueueSiblingsWithAlias(ctx, newM, q, oldM.Status.ResolvedModelAlias)
+				}
+			},
+			DeleteFunc: func(ctx context.Context, e event.DeleteEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+				if m, ok := e.Object.(*maasv1alpha1.MaaSModelRef); ok {
+					r.enqueueSiblingsWithAlias(ctx, m, q, "")
+				}
+			},
+		})
+
+	const llmisvcCRD = "llminferenceservices.serving.kserve.io"
+	llmisvcExists := crdExists(ctx, mgr.GetAPIReader(), llmisvcCRD)
+
+	// Watch LLMInferenceServices — KServe CRD must be present for this watch to succeed.
+	// If not yet registered at startup, the watch is added dynamically when the CRD appears.
+	if llmisvcExists {
+		b = b.Watches(&kservev1alpha2.LLMInferenceService{},
 			handler.EnqueueRequestsFromMapFunc(r.mapLLMISvcToMaaSModelRefs),
 			builder.WithPredicates(predicate.Or(predicate.GenerationChangedPredicate{}, llmisvcReadyChangedPredicate{})),
-		).
+		)
+	} else {
+		ctrl.Log.Info("LLMInferenceService CRD not yet registered; watch will be added dynamically when KServe is ready")
+	}
+
+	// Watch inference ExternalModels: their reconciler can record status.httpRouteName
+	// after the route it names already exists and is accepted, and the HTTPRoute watch
+	// has nothing left to deliver by then.
+	const ippExternalModelCRD = "externalmodels.inference.opendatahub.io"
+	ippExternalModelExists := crdExists(ctx, mgr.GetAPIReader(), ippExternalModelCRD)
+	if ippExternalModelExists {
+		b = b.WatchesRawSource(r.ippExternalModelSource(mgr))
+	}
+
+	c, err := b.
 		// Watch MaaSSubscriptions so we re-reconcile when governance state changes
 		// (spec, status/phase, or deletion). No predicate filter — the reconciler's
 		// equality.Semantic.DeepEqual check gates unnecessary status writes.
@@ -414,7 +785,112 @@ func (r *MaaSModelRefReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&maasv1alpha1.MaaSAuthPolicy{}, handler.EnqueueRequestsFromMapFunc(
 			r.mapMaaSAuthPolicyToMaaSModelRefs,
 		)).
-		Complete(r)
+		// Watch AITenants so models without explicit spec.tenantRef are
+		// re-reconciled when a tenant is created, updated, or deleted —
+		// enabling auto-resolution of tenantRef from HTTPRoute gateway.
+		Watches(&maasv1alpha1.AITenant{}, handler.EnqueueRequestsFromMapFunc(
+			r.mapAITenantToMaaSModelRefs,
+		)).
+		Build(r)
+	if err != nil {
+		return err
+	}
+
+	if !llmisvcExists {
+		if err := registerWatchWhenCRDAppears(c, mgr, llmisvcCRD, func() source.Source {
+			// Use a typed watch, identical to the static path above. An unstructured
+			// watch would look equivalent but creates a separate informer: controller-
+			// runtime keys informers by object type, so an unstructured watch and the
+			// typed r.Get in Status() run independent LIST/WATCH loops with independent
+			// resource versions. A Ready transition event can then arrive while the
+			// typed informer still returns the pre-transition object, leaving the model
+			// stranded in a not-ready phase with no further requeue.
+			//
+			// source.Kind retries GetInformer until the REST mapper knows the GVK
+			// (the dynamic REST mapper reloads on a NoKindMatchError), so a typed
+			// late-CRD watch is safe — this pattern is already used for InferenceObjective
+			// in the subscription controller.
+			return source.Kind(mgr.GetCache(), client.Object(&kservev1alpha2.LLMInferenceService{}),
+				handler.EnqueueRequestsFromMapFunc(r.mapLLMISvcToMaaSModelRefs),
+				predicate.Or(predicate.GenerationChangedPredicate{}, llmisvcReadyChangedPredicate{}),
+			)
+		}); err != nil {
+			return fmt.Errorf("failed to register CRD watcher for LLMInferenceService: %w", err)
+		}
+	}
+	if !ippExternalModelExists {
+		if err := registerWatchWhenCRDAppears(c, mgr, ippExternalModelCRD, func() source.Source {
+			return r.ippExternalModelSource(mgr)
+		}); err != nil {
+			return fmt.Errorf("failed to register CRD watcher for inference ExternalModel: %w", err)
+		}
+	}
+	return nil
+}
+
+// httpRouteChangedForModelRef drops HTTPRoute status writes that MaaSModelRef reconcile
+// does not read: Kuadrant policy-affected conditions, and gateway rewrites of ResolvedRefs,
+// observedGeneration or lastTransitionTime. The reconcile reads the route name, labels
+// (llmisvc route lookup), spec.parentRefs and spec.hostnames, and for ExternalModel
+// the set of parents reporting Accepted=True and the reason and message of gateways
+// rejecting the route.
+func httpRouteChangedForModelRef() predicate.Predicate { //nolint:ireturn // builder.WithPredicates takes predicate.Predicate.
+	return predicate.Or(
+		predicate.GenerationChangedPredicate{},
+		predicate.LabelChangedPredicate{},
+		predicate.Funcs{UpdateFunc: uidChanged},
+		predicate.Funcs{UpdateFunc: routeAcceptedParentsChanged},
+		predicate.Funcs{UpdateFunc: routeRejectionsChanged},
+	)
+}
+
+func routeAcceptedParentsChanged(e event.UpdateEvent) bool {
+	oldRoute, okOld := e.ObjectOld.(*gatewayapiv1.HTTPRoute)
+	newRoute, okNew := e.ObjectNew.(*gatewayapiv1.HTTPRoute)
+	if !okOld || !okNew {
+		return true
+	}
+	return !acceptedRouteParents(oldRoute).Equal(acceptedRouteParents(newRoute))
+}
+
+func routeRejectionsChanged(e event.UpdateEvent) bool {
+	oldRoute, okOld := e.ObjectOld.(*gatewayapiv1.HTTPRoute)
+	newRoute, okNew := e.ObjectNew.(*gatewayapiv1.HTTPRoute)
+	if !okOld || !okNew {
+		return true
+	}
+	return !maps.Equal(routeRejections(oldRoute), routeRejections(newRoute))
+}
+
+// ippExternalModelChangedForModelRef drops inference ExternalModel status writes other
+// than status.httpRouteName and the ready per-gateway routes, the only ExternalModel status
+// MaaSModelRef reconcile reads.
+func ippExternalModelChangedForModelRef() predicate.Predicate { //nolint:ireturn // source.Kind takes predicate.Predicate.
+	return predicate.Or(
+		predicate.GenerationChangedPredicate{},
+		predicate.Funcs{UpdateFunc: ippExternalModelRoutesChanged},
+	)
+}
+
+func ippExternalModelRoutesChanged(e event.UpdateEvent) bool {
+	oldEM, okOld := e.ObjectOld.(*unstructured.Unstructured)
+	newEM, okNew := e.ObjectNew.(*unstructured.Unstructured)
+	if !okOld || !okNew {
+		return true
+	}
+	return ippExternalModelRouteName(oldEM) != ippExternalModelRouteName(newEM) ||
+		!maps.Equal(externalModelGatewayRoutes(oldEM), externalModelGatewayRoutes(newEM))
+}
+
+// ippExternalModelSource watches inference ExternalModels as unstructured: the type is
+// not in the scheme, and the CRD may be installed after startup.
+func (r *MaaSModelRefReconciler) ippExternalModelSource(mgr ctrl.Manager) source.Source { //nolint:ireturn // registerWatchWhenCRDAppears takes source.Source.
+	em := &unstructured.Unstructured{}
+	em.SetGroupVersionKind(inferenceExternalModelGVK)
+	return source.Kind[client.Object](mgr.GetCache(), em,
+		handler.EnqueueRequestsFromMapFunc(r.mapIPPExternalModelToMaaSModelRefs),
+		ippExternalModelChangedForModelRef(),
+	)
 }
 
 // mapHTTPRouteToMaaSModelRefs returns reconcile requests for all MaaSModelRefs in the HTTPRoute's namespace.
@@ -436,11 +912,52 @@ func (r *MaaSModelRefReconciler) mapHTTPRouteToMaaSModelRefs(ctx context.Context
 	return requests
 }
 
+// siblingConflictFieldsChanged reports whether an update to a MaaSModelRef can
+// change its model-identity-conflict verdict against its siblings. The verdict
+// depends on both the resolved alias and the resolved tenant: a tenant change
+// alone can flip a sibling's ModelIdentityUnique condition while the alias
+// stays the same, so siblings sharing the alias must be requeued either way.
+func siblingConflictFieldsChanged(oldM, newM *maasv1alpha1.MaaSModelRef) bool {
+	return oldM.Status.ResolvedModelAlias != newM.Status.ResolvedModelAlias ||
+		oldM.Status.ResolvedTenantRef != newM.Status.ResolvedTenantRef
+}
+
+// enqueueSiblingsWithAlias enqueues only the sibling MaaSModelRefs whose
+// ResolvedModelAlias matches the current alias of the changed object or, on an
+// update, the previous alias (so siblings that previously conflicted can clear
+// their condition). Empty aliases are skipped — they cannot produce collisions.
+func (r *MaaSModelRefReconciler) enqueueSiblingsWithAlias(ctx context.Context, changed *maasv1alpha1.MaaSModelRef, q workqueue.TypedRateLimitingInterface[reconcile.Request], oldAlias string) {
+	if changed == nil {
+		return
+	}
+	newAlias := changed.Status.ResolvedModelAlias
+	if newAlias == "" && oldAlias == "" {
+		return
+	}
+	var siblings maasv1alpha1.MaaSModelRefList
+	if err := r.List(ctx, &siblings, client.InNamespace(changed.Namespace)); err != nil {
+		oteljson.FromContext(ctx).Error(err, "failed to list sibling MaaSModelRefs", "namespace", changed.Namespace)
+		return
+	}
+	for _, m := range siblings.Items {
+		if m.Name == changed.Name {
+			continue
+		}
+		if (newAlias != "" && m.Status.ResolvedModelAlias == newAlias) ||
+			(oldAlias != "" && m.Status.ResolvedModelAlias == oldAlias) {
+			q.Add(reconcile.Request{NamespacedName: types.NamespacedName{Name: m.Name, Namespace: m.Namespace}})
+		}
+	}
+}
+
 // mapMaaSSubscriptionToMaaSModelRefs returns reconcile requests for all MaaSModelRefs
 // referenced by the given MaaSSubscription.
-func (r *MaaSModelRefReconciler) mapMaaSSubscriptionToMaaSModelRefs(_ context.Context, obj client.Object) []reconcile.Request {
+func (r *MaaSModelRefReconciler) mapMaaSSubscriptionToMaaSModelRefs(ctx context.Context, obj client.Object) []reconcile.Request {
 	sub, ok := obj.(*maasv1alpha1.MaaSSubscription)
 	if !ok {
+		return nil
+	}
+	if !isTenantNamespace(ctx, r.Client, sub.Namespace, r.DefaultTenantNamespace, r.TenantNamespaceDiscoveryEnabled) {
 		return nil
 	}
 	seen := make(map[types.NamespacedName]struct{})
@@ -458,9 +975,12 @@ func (r *MaaSModelRefReconciler) mapMaaSSubscriptionToMaaSModelRefs(_ context.Co
 
 // mapMaaSAuthPolicyToMaaSModelRefs returns reconcile requests for all MaaSModelRefs
 // referenced by the given MaaSAuthPolicy.
-func (r *MaaSModelRefReconciler) mapMaaSAuthPolicyToMaaSModelRefs(_ context.Context, obj client.Object) []reconcile.Request {
+func (r *MaaSModelRefReconciler) mapMaaSAuthPolicyToMaaSModelRefs(ctx context.Context, obj client.Object) []reconcile.Request {
 	policy, ok := obj.(*maasv1alpha1.MaaSAuthPolicy)
 	if !ok {
+		return nil
+	}
+	if !isTenantNamespace(ctx, r.Client, policy.Namespace, r.DefaultTenantNamespace, r.TenantNamespaceDiscoveryEnabled) {
 		return nil
 	}
 	seen := make(map[types.NamespacedName]struct{})
@@ -476,30 +996,209 @@ func (r *MaaSModelRefReconciler) mapMaaSAuthPolicyToMaaSModelRefs(_ context.Cont
 	return requests
 }
 
-// mapLLMISvcToMaaSModelRefs returns reconcile requests for all MaaSModels that
-// reference the given LLMInferenceService by name in the same namespace.
-func (r *MaaSModelRefReconciler) mapLLMISvcToMaaSModelRefs(ctx context.Context, obj client.Object) []reconcile.Request {
-	llmisvc, ok := obj.(*kservev1alpha1.LLMInferenceService)
+// mapAITenantToMaaSModelRefs returns reconcile requests for MaaSModelRefs that
+// may need re-reconciliation when an AITenant changes. This enables auto-resolution
+// of tenantRef from HTTPRoute gateway parentRefs.
+//
+// Uses the tenantAssociation field index to avoid listing every MaaSModelRef
+// in the cluster: queries for models associated with this tenant (cases 1+2)
+// and for unresolved models (case 3).
+func (r *MaaSModelRefReconciler) mapAITenantToMaaSModelRefs(ctx context.Context, obj client.Object) []reconcile.Request {
+	tenant, ok := obj.(*maasv1alpha1.AITenant)
 	if !ok {
 		return nil
 	}
+	log := oteljson.FromContext(ctx)
+
+	seen := make(map[types.NamespacedName]struct{})
+	var requests []reconcile.Request
+	appendModels := func(models *maasv1alpha1.MaaSModelRefList) {
+		for _, m := range models.Items {
+			key := types.NamespacedName{Name: m.Name, Namespace: m.Namespace}
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			requests = append(requests, reconcile.Request{NamespacedName: key})
+		}
+	}
+
+	// Cases 1+2: models explicitly referencing or auto-resolved to this tenant
+	var associated maasv1alpha1.MaaSModelRefList
+	if err := r.List(ctx, &associated, client.MatchingFields{tenantAssociationIndex: tenant.Name}); err != nil {
+		log.Error(err, "failed to list MaaSModelRefs by tenant association", "tenant", tenant.Name)
+		return nil
+	}
+	appendModels(&associated)
+
+	// Case 3: models not yet resolved — this new/updated tenant might be the match
+	var unresolved maasv1alpha1.MaaSModelRefList
+	if err := r.List(ctx, &unresolved, client.MatchingFields{tenantAssociationIndex: tenantAssociationUnresolved}); err != nil {
+		log.Error(err, "failed to list unresolved MaaSModelRefs for AITenant watch")
+		return nil
+	}
+	appendModels(&unresolved)
+
+	return requests
+}
+
+// mapLLMISvcToMaaSModelRefs returns reconcile requests for all MaaSModels that
+// reference the given LLMInferenceService by name in the same namespace.
+func (r *MaaSModelRefReconciler) mapLLMISvcToMaaSModelRefs(ctx context.Context, obj client.Object) []reconcile.Request {
+	return r.modelRefsReferencing(ctx, "LLMInferenceService", obj)
+}
+
+// mapIPPExternalModelToMaaSModelRefs returns reconcile requests for all MaaSModelRefs
+// that reference the given inference ExternalModel by name in the same namespace.
+func (r *MaaSModelRefReconciler) mapIPPExternalModelToMaaSModelRefs(ctx context.Context, obj client.Object) []reconcile.Request {
+	return r.modelRefsReferencing(ctx, "ExternalModel", obj)
+}
+
+// modelRefsReferencing returns reconcile requests for the MaaSModelRefs in obj's
+// namespace whose spec.modelRef names obj with the given kind.
+func (r *MaaSModelRefReconciler) modelRefsReferencing(ctx context.Context, kind string, obj client.Object) []reconcile.Request {
 	var models maasv1alpha1.MaaSModelRefList
-	if err := r.List(ctx, &models, client.MatchingFields{modelRefNameIndex: llmisvc.Name}); err != nil {
-		logr.FromContextOrDiscard(ctx).Error(err, "failed to list MaaSModels by modelRef.name index", "llmisvcName", llmisvc.Name)
+	if err := r.List(ctx, &models, client.MatchingFields{modelRefNameIndex: obj.GetName()}); err != nil {
+		oteljson.FromContext(ctx).Error(err, "failed to list MaaSModels by modelRef.name index", "kind", kind, "name", obj.GetName())
 		return nil
 	}
 	var requests []reconcile.Request
 	for _, m := range models.Items {
-		kind := m.Spec.ModelRef.Kind
-		if kind != "LLMInferenceService" {
+		if m.Spec.ModelRef.Kind != kind {
 			continue
 		}
 		// MaaSModelRef references models in the same namespace
-		if m.Namespace == llmisvc.Namespace {
+		if m.Namespace == obj.GetNamespace() {
 			requests = append(requests, reconcile.Request{
 				NamespacedName: types.NamespacedName{Name: m.Name, Namespace: m.Namespace},
 			})
 		}
 	}
 	return requests
+}
+
+// resolveGatewayRef resolves the gateway reference for a MaaSModelRef.
+// When spec.tenantRef is set, it looks up the named AITenant in the AITenant
+// infrastructure namespace and uses its Status.GatewayRef directly.
+// When spec.tenantRef is empty, it auto-resolves the tenant by performing a
+// reverse lookup: finding the AITenant whose Status.GatewayRef matches a
+// gateway parentRef on the HTTPRoute. This relies on the enforced 1:1
+// Gateway-to-Tenant mapping.
+func (r *MaaSModelRefReconciler) resolveGatewayRef(ctx context.Context, log logr.Logger, model *maasv1alpha1.MaaSModelRef, route *gatewayapiv1.HTTPRoute) (maasv1alpha1.TenantGatewayRef, error) {
+	if model.Spec.TenantRef != "" {
+		aitenant := &maasv1alpha1.AITenant{}
+		key := client.ObjectKey{
+			Name:      model.Spec.TenantRef,
+			Namespace: r.AITenantNamespace,
+		}
+		if err := r.Get(ctx, key, aitenant); err != nil {
+			if apierrors.IsNotFound(err) {
+				model.Status.ResolvedTenantRef = ""
+				return maasv1alpha1.TenantGatewayRef{}, fmt.Errorf("AITenant %q not found in namespace %s", model.Spec.TenantRef, r.AITenantNamespace)
+			}
+			return maasv1alpha1.TenantGatewayRef{}, fmt.Errorf("failed to get AITenant %q: %w", model.Spec.TenantRef, err)
+		}
+		ref := aitenant.Status.GatewayRef
+		if ref.Name == "" || ref.Namespace == "" {
+			model.Status.ResolvedTenantRef = ""
+			return maasv1alpha1.TenantGatewayRef{}, fmt.Errorf("AITenant %q has no gateway reference in status", model.Spec.TenantRef)
+		}
+		model.Status.ResolvedTenantRef = model.Spec.TenantRef
+		log.V(4).Info("Resolved gateway from AITenant", "aiTenant", model.Spec.TenantRef, "gateway", fmt.Sprintf("%s/%s", ref.Namespace, ref.Name))
+		return ref, nil
+	}
+
+	return r.resolveGatewayRefFromHTTPRoute(ctx, log, model, route)
+}
+
+// resolveGatewayRefFromHTTPRoute auto-resolves the tenant by finding the
+// AITenant whose Status.GatewayRef matches a gateway parentRef on the
+// HTTPRoute. Returns an error if multiple gateways match different tenants.
+func (r *MaaSModelRefReconciler) resolveGatewayRefFromHTTPRoute(ctx context.Context, log logr.Logger, model *maasv1alpha1.MaaSModelRef, route *gatewayapiv1.HTTPRoute) (maasv1alpha1.TenantGatewayRef, error) {
+	if len(route.Spec.ParentRefs) == 0 {
+		model.Status.ResolvedTenantRef = ""
+		return maasv1alpha1.TenantGatewayRef{}, fmt.Errorf("%w: HTTPRoute %s/%s has no gateway parentRefs", ErrTenantResolutionPending, route.Namespace, route.Name)
+	}
+
+	tenantList := &maasv1alpha1.AITenantList{}
+	if err := r.List(ctx, tenantList, client.InNamespace(r.AITenantNamespace)); err != nil {
+		return maasv1alpha1.TenantGatewayRef{}, fmt.Errorf("failed to list AITenants for auto-resolution: %w", err)
+	}
+
+	type gatewayKey struct{ name, namespace string }
+	tenantsByGateway := make(map[gatewayKey][]string, len(tenantList.Items))
+	for _, tenant := range tenantList.Items {
+		ref := tenant.Status.GatewayRef
+		if ref.Name != "" && ref.Namespace != "" {
+			k := gatewayKey{ref.Name, ref.Namespace}
+			tenantsByGateway[k] = append(tenantsByGateway[k], tenant.Name)
+		}
+	}
+
+	type match struct {
+		tenant string
+		ref    maasv1alpha1.TenantGatewayRef
+	}
+	var matches []match
+	seenTenants := make(map[string]struct{})
+
+	for _, parentRef := range route.Spec.ParentRefs {
+		if !parentRefTargetsGateway(parentRef) {
+			continue
+		}
+
+		gwName := string(parentRef.Name)
+		gwNamespace := route.Namespace
+		if parentRef.Namespace != nil {
+			gwNamespace = string(*parentRef.Namespace)
+		}
+
+		for _, tenantName := range tenantsByGateway[gatewayKey{gwName, gwNamespace}] {
+			if _, dup := seenTenants[tenantName]; dup {
+				continue
+			}
+			seenTenants[tenantName] = struct{}{}
+			matches = append(matches, match{
+				tenant: tenantName,
+				ref:    maasv1alpha1.TenantGatewayRef{Name: gwName, Namespace: gwNamespace},
+			})
+		}
+	}
+
+	if len(matches) == 1 {
+		m := matches[0]
+		model.Status.ResolvedTenantRef = m.tenant
+		log.Info("Auto-resolved tenant from HTTPRoute gateway",
+			"tenant", m.tenant, "gateway", fmt.Sprintf("%s/%s", m.ref.Namespace, m.ref.Name),
+			"model", fmt.Sprintf("%s/%s", model.Namespace, model.Name))
+		return m.ref, nil
+	}
+
+	if len(matches) > 1 {
+		model.Status.ResolvedTenantRef = ""
+		descs := make([]string, 0, len(matches))
+		for _, m := range matches {
+			descs = append(descs, fmt.Sprintf("%s/%s (tenant %s)", m.ref.Namespace, m.ref.Name, m.tenant))
+		}
+		return maasv1alpha1.TenantGatewayRef{}, fmt.Errorf("multiple gateways on HTTPRoute %s/%s match different AITenants: %v; "+
+			"set spec.tenantRef explicitly to select the desired tenant",
+			route.Namespace, route.Name, descs)
+	}
+
+	model.Status.ResolvedTenantRef = ""
+	gwDescs := make([]string, 0, len(route.Spec.ParentRefs))
+	for _, pr := range route.Spec.ParentRefs {
+		if !parentRefTargetsGateway(pr) {
+			continue
+		}
+
+		ns := route.Namespace
+		if pr.Namespace != nil {
+			ns = string(*pr.Namespace)
+		}
+		gwDescs = append(gwDescs, fmt.Sprintf("%s/%s", ns, pr.Name))
+	}
+	return maasv1alpha1.TenantGatewayRef{}, fmt.Errorf("no AITenant found for any gateway referenced by HTTPRoute %s/%s (gateways: %v); "+
+		"ensure an AITenant exists with a matching gateway, or set spec.tenantRef explicitly",
+		route.Namespace, route.Name, gwDescs)
 }

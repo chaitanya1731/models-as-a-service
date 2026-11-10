@@ -6,6 +6,10 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/logger"
 )
 
 const testGatewayName = "my-gateway"
@@ -49,14 +53,52 @@ func TestLoad_EnvironmentVariables(t *testing.T) {
 				}
 			},
 		},
+		{
+			name:    "LOG_FORMAT selects OTel JSON logging",
+			envVars: map[string]string{"LOG_FORMAT": "otel-json"},
+			check: func(t *testing.T, cfg *Config) {
+				t.Helper()
+				if cfg.LogFormat != logger.FormatOTelJSON {
+					t.Errorf("expected OTel JSON log format, got %q", cfg.LogFormat)
+				}
+			},
+		},
+		{
+			name:    "metrics secure defaults",
+			envVars: map[string]string{},
+			check: func(t *testing.T, cfg *Config) {
+				t.Helper()
+				if !cfg.MetricsSecure {
+					t.Error("expected MetricsSecure default true")
+				}
+				if cfg.MetricsPort != 9090 {
+					t.Errorf("expected MetricsPort 9090, got %d", cfg.MetricsPort)
+				}
+				if cfg.MetricsCertDir != "/tmp/k8s-metrics-server/metrics-certs" {
+					t.Errorf("unexpected MetricsCertDir %q", cfg.MetricsCertDir)
+				}
+			},
+		},
+		{
+			name:    "METRICS_SECURE=false disables secure metrics",
+			envVars: map[string]string{"METRICS_SECURE": "false"},
+			check: func(t *testing.T, cfg *Config) {
+				t.Helper()
+				if cfg.MetricsSecure {
+					t.Error("expected MetricsSecure false")
+				}
+			},
+		},
 	}
 
 	// All env vars that Load() reads, to be cleared before each subtest.
 	allEnvVars := []string{
-		"DEBUG_MODE", "GATEWAY_NAME", "SECURE", "INSTANCE_NAME",
+		"DEBUG_MODE", "LOG_FORMAT", "GATEWAY_NAME", "SECURE", "INSTANCE_NAME",
 		"NAMESPACE", "GATEWAY_NAMESPACE", "ADDRESS",
 		"PORT",
 		"TLS_CERT", "TLS_KEY", "TLS_SELF_SIGNED",
+		"METRICS_PORT", "METRICS_SECURE", "METRICS_CERT_DIR",
+		"API_KEY_DELETION_RETENTION_DAYS",
 	}
 
 	for _, tt := range tests {
@@ -115,6 +157,19 @@ func TestValidate(t *testing.T) {
 			expectError: "--tls-cert and --tls-key must both be provided together",
 		},
 		{
+			name: "invalid log format returns error",
+			cfg: Config{
+				DBConnectionURL:           "postgresql://localhost/test",
+				LogFormat:                 "unknown",
+				APIKeyMaxExpirationDays:   30,
+				AccessCheckTimeoutSeconds: 15,
+				MetricsPort:               9090,
+				MaaSSubscriptionNamespace: "models-as-a-service",
+				TenantName:                "test-tenant",
+			},
+			expectError: "unsupported log format",
+		},
+		{
 			name: "valid insecure config sets default address :8080",
 			cfg: Config{
 				DBConnectionURL:           "postgresql://localhost/test",
@@ -123,6 +178,7 @@ func TestValidate(t *testing.T) {
 				AccessCheckTimeoutSeconds: 15,
 				MetricsPort:               9090,
 				MaaSSubscriptionNamespace: "models-as-a-service",
+				TenantName:                "test-tenant",
 			},
 		},
 		{
@@ -134,6 +190,7 @@ func TestValidate(t *testing.T) {
 				AccessCheckTimeoutSeconds: 15,
 				MetricsPort:               9090,
 				MaaSSubscriptionNamespace: "models-as-a-service",
+				TenantName:                "test-tenant",
 			},
 		},
 		{
@@ -145,6 +202,7 @@ func TestValidate(t *testing.T) {
 				AccessCheckTimeoutSeconds: 15,
 				MetricsPort:               9090,
 				MaaSSubscriptionNamespace: "models-as-a-service",
+				TenantName:                "test-tenant",
 			},
 		},
 		{
@@ -155,6 +213,7 @@ func TestValidate(t *testing.T) {
 				AccessCheckTimeoutSeconds: 15,
 				MetricsPort:               9090,
 				MaaSSubscriptionNamespace: "models-as-a-service",
+				TenantName:                "test-tenant",
 			},
 		},
 		{
@@ -165,6 +224,7 @@ func TestValidate(t *testing.T) {
 				AccessCheckTimeoutSeconds: 15,
 				MetricsPort:               9090,
 				MaaSSubscriptionNamespace: "models-as-a-service",
+				TenantName:                "test-tenant",
 			},
 		},
 		{
@@ -175,6 +235,7 @@ func TestValidate(t *testing.T) {
 				AccessCheckTimeoutSeconds: 15,
 				MetricsPort:               9090,
 				MaaSSubscriptionNamespace: "models-as-a-service",
+				TenantName:                "test-tenant",
 			},
 		},
 		{
@@ -183,6 +244,7 @@ func TestValidate(t *testing.T) {
 				DBConnectionURL:           "postgresql://localhost/test",
 				APIKeyMaxExpirationDays:   0,
 				MaaSSubscriptionNamespace: "models-as-a-service",
+				TenantName:                "test-tenant",
 			},
 			expectError: "must be at least 1",
 		},
@@ -192,6 +254,7 @@ func TestValidate(t *testing.T) {
 				DBConnectionURL:           "postgresql://localhost/test",
 				APIKeyMaxExpirationDays:   -1,
 				MaaSSubscriptionNamespace: "models-as-a-service",
+				TenantName:                "test-tenant",
 			},
 			expectError: "must be at least 1",
 		},
@@ -204,6 +267,7 @@ func TestValidate(t *testing.T) {
 				SARCacheMaxSize:           8192,
 				MetricsPort:               0,
 				MaaSSubscriptionNamespace: "models-as-a-service",
+				TenantName:                "test-tenant",
 			},
 			expectError: "METRICS_PORT must be between 1 and 65535",
 		},
@@ -216,6 +280,7 @@ func TestValidate(t *testing.T) {
 				SARCacheMaxSize:           8192,
 				MetricsPort:               -1,
 				MaaSSubscriptionNamespace: "models-as-a-service",
+				TenantName:                "test-tenant",
 			},
 			expectError: "METRICS_PORT must be between 1 and 65535",
 		},
@@ -228,8 +293,53 @@ func TestValidate(t *testing.T) {
 				SARCacheMaxSize:           8192,
 				MetricsPort:               65536,
 				MaaSSubscriptionNamespace: "models-as-a-service",
+				TenantName:                "test-tenant",
 			},
 			expectError: "METRICS_PORT must be between 1 and 65535",
+		},
+		{
+			name: "MetricsSecure with empty MetricsCertDir returns error",
+			cfg: Config{
+				DBConnectionURL:           "postgresql://localhost/test",
+				APIKeyMaxExpirationDays:   30,
+				AccessCheckTimeoutSeconds: 15,
+				SARCacheMaxSize:           8192,
+				MetricsPort:               9090,
+				MetricsSecure:             true,
+				MetricsCertDir:            "",
+				MaaSSubscriptionNamespace: "models-as-a-service",
+				TenantName:                "test-tenant",
+			},
+			expectError: "METRICS_CERT_DIR must be non-empty when METRICS_SECURE is true",
+		},
+		{
+			name: "MetricsSecure with whitespace MetricsCertDir returns error",
+			cfg: Config{
+				DBConnectionURL:           "postgresql://localhost/test",
+				APIKeyMaxExpirationDays:   30,
+				AccessCheckTimeoutSeconds: 15,
+				SARCacheMaxSize:           8192,
+				MetricsPort:               9090,
+				MetricsSecure:             true,
+				MetricsCertDir:            "   ",
+				MaaSSubscriptionNamespace: "models-as-a-service",
+				TenantName:                "test-tenant",
+			},
+			expectError: "METRICS_CERT_DIR must be non-empty when METRICS_SECURE is true",
+		},
+		{
+			name: "MetricsSecure false allows empty MetricsCertDir",
+			cfg: Config{
+				DBConnectionURL:           "postgresql://localhost/test",
+				APIKeyMaxExpirationDays:   30,
+				AccessCheckTimeoutSeconds: 15,
+				SARCacheMaxSize:           8192,
+				MetricsPort:               9090,
+				MetricsSecure:             false,
+				MetricsCertDir:            "",
+				MaaSSubscriptionNamespace: "models-as-a-service",
+				TenantName:                "test-tenant",
+			},
 		},
 	}
 
@@ -270,15 +380,38 @@ func TestValidate(t *testing.T) {
 }
 
 func TestHandleDeprecatedFlags(t *testing.T) {
-	t.Run("deprecated port sets Address and clears Secure", func(t *testing.T) {
+	t.Run("deprecated port with Secure=true returns error", func(t *testing.T) {
 		cfg := &Config{
 			Secure:             true,
 			deprecatedHTTPPort: "9090",
 		}
-		cfg.handleDeprecatedFlags()
+		err := cfg.handleDeprecatedFlags()
 
-		if cfg.Secure {
-			t.Error("expected Secure to be false when deprecated port is used")
+		if err == nil {
+			t.Fatal("expected error when deprecated port is used with Secure=true")
+		}
+	})
+
+	t.Run("deprecated port with TLS configured returns error", func(t *testing.T) {
+		cfg := &Config{
+			deprecatedHTTPPort: "9090",
+			TLS:                TLSConfig{SelfSigned: true},
+		}
+		err := cfg.handleDeprecatedFlags()
+
+		if err == nil {
+			t.Fatal("expected error when deprecated port is used with TLS configuration")
+		}
+	})
+
+	t.Run("deprecated port without Secure or TLS sets Address", func(t *testing.T) {
+		cfg := &Config{
+			deprecatedHTTPPort: "9090",
+		}
+		err := cfg.handleDeprecatedFlags()
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
 		}
 		if cfg.Address != ":9090" {
 			t.Errorf("expected Address ':9090', got %q", cfg.Address)
@@ -290,10 +423,23 @@ func TestHandleDeprecatedFlags(t *testing.T) {
 			Address:            ":7777",
 			deprecatedHTTPPort: "9090",
 		}
-		cfg.handleDeprecatedFlags()
+		err := cfg.handleDeprecatedFlags()
 
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		if cfg.Address != ":7777" {
 			t.Errorf("expected Address ':7777' to be preserved, got %q", cfg.Address)
+		}
+	})
+
+	t.Run("deprecated port rejects malformed values", func(t *testing.T) {
+		for _, bad := range []string{":8080", "foo", "0", "65536", "-1"} {
+			cfg := &Config{deprecatedHTTPPort: bad}
+			err := cfg.handleDeprecatedFlags()
+			if err == nil {
+				t.Errorf("expected error for port %q, got nil", bad)
+			}
 		}
 	})
 
@@ -302,8 +448,11 @@ func TestHandleDeprecatedFlags(t *testing.T) {
 			Secure:  true,
 			Address: ":8443",
 		}
-		cfg.handleDeprecatedFlags()
+		err := cfg.handleDeprecatedFlags()
 
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
 		if !cfg.Secure {
 			t.Error("expected Secure to remain true")
 		}
@@ -311,4 +460,106 @@ func TestHandleDeprecatedFlags(t *testing.T) {
 			t.Errorf("expected Address ':8443', got %q", cfg.Address)
 		}
 	})
+}
+
+func TestValidateLokiReadEndpoint(t *testing.T) {
+	t.Parallel()
+	base := func() Config {
+		return Config{
+			DBConnectionURL:           "postgresql://localhost/test",
+			APIKeyMaxExpirationDays:   30,
+			AccessCheckTimeoutSeconds: 15,
+			MetricsPort:               9090,
+			MaaSSubscriptionNamespace: "models-as-a-service",
+			TenantName:                "test-tenant",
+		}
+	}
+
+	tests := []struct {
+		name        string
+		endpoint    string
+		expectError string
+	}{
+		{
+			name:        "empty endpoint is valid (feature disabled)",
+			endpoint:    "",
+			expectError: "",
+		},
+		{
+			name:        "valid https endpoint",
+			endpoint:    "https://loki-gateway.example.svc:8080/api/logs/v1/application",
+			expectError: "",
+		},
+		{
+			name:        "not a URL",
+			endpoint:    "not-a-url",
+			expectError: "LOKI_READ_ENDPOINT must be a valid http(s) URL",
+		},
+		{
+			name:        "unsupported scheme",
+			endpoint:    "ftp://loki.example",
+			expectError: "LOKI_READ_ENDPOINT must be a valid http(s) URL",
+		},
+		{
+			name:        "missing host",
+			endpoint:    "https://",
+			expectError: "LOKI_READ_ENDPOINT must be a valid http(s) URL",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := base()
+			cfg.LokiReadEndpoint = tc.endpoint
+
+			err := cfg.Validate()
+			if tc.expectError == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, tc.expectError)
+			}
+		})
+	}
+}
+
+func TestValidateAPIKeyDeletionRetention(t *testing.T) {
+	base := Config{
+		DBConnectionURL:           "postgresql://localhost/test",
+		APIKeyMaxExpirationDays:   30,
+		AccessCheckTimeoutSeconds: 15,
+		MetricsPort:               9090,
+		MaaSSubscriptionNamespace: "models-as-a-service",
+		TenantName:                "test-tenant",
+	}
+
+	defaultConfig := base
+	if err := defaultConfig.Validate(); err != nil {
+		t.Fatalf("default retention validation failed: %v", err)
+	}
+	if defaultConfig.APIKeyDeletionRetentionDays != defaultAPIKeyDeletionRetentionDays {
+		t.Fatalf("default retention = %d, want %d", defaultConfig.APIKeyDeletionRetentionDays, defaultAPIKeyDeletionRetentionDays)
+	}
+
+	customConfig := base
+	customConfig.APIKeyDeletionRetentionDays = 30
+	if err := customConfig.Validate(); err != nil {
+		t.Fatalf("custom retention validation failed: %v", err)
+	}
+	if customConfig.APIKeyDeletionRetentionDays != 30 {
+		t.Fatalf("custom retention = %d, want 30", customConfig.APIKeyDeletionRetentionDays)
+	}
+
+	invalidConfig := base
+	invalidConfig.APIKeyDeletionRetentionDays = -1
+	if err := invalidConfig.Validate(); err == nil || !strings.Contains(err.Error(), "API_KEY_DELETION_RETENTION_DAYS") {
+		t.Fatalf("negative retention validation error = %v", err)
+	}
+
+	tooLargeConfig := base
+	tooLargeConfig.APIKeyDeletionRetentionDays = maxAPIKeyDeletionRetentionDays + 1
+	if err := tooLargeConfig.Validate(); err == nil || !strings.Contains(err.Error(), "at most") {
+		t.Fatalf("too-large retention validation error = %v", err)
+	}
 }

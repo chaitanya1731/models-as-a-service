@@ -23,7 +23,7 @@ import (
 	"strings"
 
 	"github.com/go-logr/logr"
-	kservev1alpha1 "github.com/kserve/kserve/pkg/apis/serving/v1alpha1"
+	kservev1alpha2 "github.com/kserve/kserve/pkg/apis/serving/v1alpha2"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	gatewayapiv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -59,12 +59,22 @@ func (h *llmisvcHandler) validateLLMISvcHTTPRoute(ctx context.Context, log logr.
 	}
 	route := &routeList.Items[0]
 	routeName := route.Name
-	expectedGatewayName := h.r.gatewayName()
-	expectedGatewayNamespace := h.r.gatewayNamespace()
+
+	gatewayRef, err := h.r.resolveGatewayRef(ctx, log, model, route)
+	if err != nil {
+		return fmt.Errorf("resolve tenant gateway for model %s/%s: %w", model.Namespace, model.Name, err)
+	}
+	expectedGatewayName := gatewayRef.Name
+	expectedGatewayNamespace := gatewayRef.Namespace
+	log.V(4).Info("Using tenant gateway", "gateway", fmt.Sprintf("%s/%s", expectedGatewayNamespace, expectedGatewayName), "tenantRef", model.Spec.TenantRef)
+
 	gatewayFound := false
 	var gatewayName string
 	var gatewayNamespace string
 	for _, parentRef := range route.Spec.ParentRefs {
+		if !parentRefTargetsGateway(parentRef) {
+			continue
+		}
 		refName := string(parentRef.Name)
 		refNS := routeNS
 		if parentRef.Namespace != nil {
@@ -106,7 +116,7 @@ func (h *llmisvcHandler) validateLLMISvcHTTPRoute(ctx context.Context, log logr.
 
 func (h *llmisvcHandler) Status(ctx context.Context, log logr.Logger, model *maasv1alpha1.MaaSModelRef) (endpoint string, ready bool, err error) {
 	llmisvcNS := model.Namespace
-	llmisvc := &kservev1alpha1.LLMInferenceService{}
+	llmisvc := &kservev1alpha2.LLMInferenceService{}
 	key := client.ObjectKey{Name: model.Spec.ModelRef.Name, Namespace: llmisvcNS}
 	if err := h.r.Get(ctx, key, llmisvc); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -133,6 +143,11 @@ func (h *llmisvcHandler) Status(ctx context.Context, log logr.Logger, model *maa
 	return endpoint, true, nil
 }
 
+// NotReadyReason keeps the generic RuntimeReady reason and message.
+func (h *llmisvcHandler) NotReadyReason() (maasv1alpha1.ConditionReason, string) {
+	return "", ""
+}
+
 // GetModelEndpoint returns the model endpoint URL using gateway/HTTPRoute hostname and path.
 // Used when LLMInferenceService status does not expose an endpoint. ExternalModel and other kinds
 // implement their own logic and need not use these path assumptions.
@@ -141,8 +156,16 @@ func (h *llmisvcHandler) GetModelEndpoint(ctx context.Context, log logr.Logger, 
 		hostname := model.Status.HTTPRouteHostnames[0]
 		return fmt.Sprintf("https://%s/%s", hostname, model.Name), nil
 	}
-	gatewayName := h.r.gatewayName()
-	gatewayNS := h.r.gatewayNamespace()
+
+	// Use the gateway from the model's status (populated by validateLLMISvcHTTPRoute)
+	// which is tenant-aware. Fall back to default gateway if not set.
+	gatewayName := model.Status.HTTPRouteGatewayName
+	gatewayNS := model.Status.HTTPRouteGatewayNamespace
+	if gatewayName == "" {
+		gatewayName = h.r.gatewayName()
+		gatewayNS = h.r.gatewayNamespace()
+	}
+
 	gateway := &gatewayapiv1.Gateway{}
 	key := client.ObjectKey{Name: gatewayName, Namespace: gatewayNS}
 	if err := h.r.Get(ctx, key, gateway); err != nil {
@@ -166,56 +189,162 @@ func (h *llmisvcHandler) GetModelEndpoint(ctx context.Context, log logr.Logger, 
 	return "", fmt.Errorf("unable to determine endpoint: gateway %s/%s has no hostname or addresses", gatewayNS, gatewayName)
 }
 
+const (
+	addressNameGatewayExternal             = "gateway-external"
+	addressNameGatewayExternalModelRouting = "gateway-external-model-routing"
+)
+
 // getEndpointFromLLMISvc returns the endpoint URL from LLMInferenceService status as-reported.
-// When expectedHostnames is non-empty, only gateway-external addresses whose hostname matches
+// Prefers model-routing (BBR) addresses (gateway-external-model-routing) over path-based ones
+// (gateway-external), reflecting that BBR is the primary routing mode.
+// When expectedHostnames is non-empty, only addresses whose hostname matches
 // (case-insensitive per RFC 4343) are considered; this prevents selecting the wrong gateway
 // when multiple gateways exist.
 // When expectedHostnames is empty, preserves legacy behavior for single-gateway deployments.
 // Returns "" when no suitable address is found; the caller (Status) falls through to
 // GetModelEndpoint which derives the endpoint from Gateway/HTTPRoute metadata.
-func (h *llmisvcHandler) getEndpointFromLLMISvc(llmisvc *kservev1alpha1.LLMInferenceService, expectedHostnames []string) string {
+func (h *llmisvcHandler) getEndpointFromLLMISvc(llmisvc *kservev1alpha2.LLMInferenceService, expectedHostnames []string) string {
 	hostSet := make(map[string]struct{}, len(expectedHostnames))
 	for _, hn := range expectedHostnames {
 		hostSet[strings.ToLower(hn)] = struct{}{}
 	}
 	filtering := len(hostSet) > 0
 
-	var gatewayExternalURLs []string
-	for _, addr := range llmisvc.Status.Addresses {
-		if addr.Name != nil && *addr.Name == "gateway-external" && addr.URL != nil {
-			if filtering {
-				parsed := url.URL(*addr.URL)
-				host := strings.ToLower(parsed.Hostname())
-				if host == "" {
-					continue
-				}
-				if _, ok := hostSet[host]; !ok {
-					continue
-				}
-			}
-			gatewayExternalURLs = append(gatewayExternalURLs, addr.URL.String())
-		}
-	}
-	for _, u := range gatewayExternalURLs {
-		if strings.HasPrefix(u, "https://") {
+	// Prefer model-routing (BBR) addresses; fall back to path-based.
+	for _, targetName := range []string{addressNameGatewayExternalModelRouting, addressNameGatewayExternal} {
+		if u := h.selectAddress(llmisvc, targetName, hostSet, filtering); u != "" {
 			return u
 		}
 	}
-	if len(gatewayExternalURLs) > 0 {
-		return gatewayExternalURLs[0]
-	}
+
 	// When filtering is active, don't fall back to unfiltered addresses — they may
 	// belong to the wrong gateway.
 	if filtering {
 		return ""
 	}
-	if len(llmisvc.Status.Addresses) > 0 && llmisvc.Status.Addresses[0].URL != nil {
-		return llmisvc.Status.Addresses[0].URL.String()
+	// For unfiltered (legacy single-gateway) deployments, prefer base URLs (model-routing style)
+	// over path-based URLs so status.endpoint is consistent with the BBR gateway entry-point.
+	// Skip cluster-local routes so callers get the customer-facing endpoint from
+	// HTTPRoute/Gateway metadata via GetModelEndpoint.
+	var fallbackURL string
+	for _, addr := range llmisvc.Status.Addresses {
+		if addr.URL == nil {
+			continue
+		}
+		raw := addr.URL.String()
+		if isClusterLocalURL(raw) {
+			continue
+		}
+		// Prefer base URLs (path "" or "/") — these are model-routing endpoints.
+		if addr.URL.Path == "" || addr.URL.Path == "/" {
+			return upgradeToHTTPS(raw)
+		}
+		if fallbackURL == "" {
+			fallbackURL = upgradeToHTTPS(raw)
+		}
 	}
+	// Check Status.URL as a base-URL candidate.
 	if llmisvc.Status.URL != nil {
-		return llmisvc.Status.URL.String()
+		raw := llmisvc.Status.URL.String()
+		if !isClusterLocalURL(raw) {
+			if llmisvc.Status.URL.Path == "" || llmisvc.Status.URL.Path == "/" {
+				return upgradeToHTTPS(raw)
+			}
+			if fallbackURL == "" {
+				fallbackURL = upgradeToHTTPS(raw)
+			}
+		}
+	}
+	if fallbackURL != "" {
+		return fallbackURL
 	}
 	return ""
+}
+
+func (h *llmisvcHandler) selectAddress(llmisvc *kservev1alpha2.LLMInferenceService, targetName string, hostSet map[string]struct{}, filtering bool) string {
+	var urls []string
+	for _, addr := range llmisvc.Status.Addresses {
+		if addr.Name == nil || *addr.Name != targetName || addr.URL == nil {
+			continue
+		}
+		raw := addr.URL.String()
+		if isClusterLocalURL(raw) {
+			continue
+		}
+		if filtering {
+			parsed := url.URL(*addr.URL)
+			host := strings.ToLower(parsed.Hostname())
+			if host == "" {
+				continue
+			}
+			if _, ok := hostSet[host]; !ok {
+				continue
+			}
+		}
+		urls = append(urls, raw)
+	}
+	for _, u := range urls {
+		parsed, err := url.Parse(u)
+		if err == nil && strings.EqualFold(parsed.Scheme, "https") {
+			return u
+		}
+	}
+	if len(urls) > 0 {
+		return upgradeToHTTPS(urls[0])
+	}
+	return ""
+}
+
+func upgradeToHTTPS(rawURL string) string {
+	if len(rawURL) >= 7 && strings.EqualFold(rawURL[:7], "http://") {
+		return "https://" + rawURL[7:]
+	}
+	return rawURL
+}
+
+func isClusterLocalURL(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+	if host == "" {
+		return false
+	}
+	return strings.HasSuffix(host, ".svc") || strings.HasSuffix(host, ".svc.cluster.local")
+}
+
+// ResolveModelAlias returns the canonical BBR model ID for the referenced LLMInferenceService.
+//
+// It first checks LLMInferenceService.status.addresses[*].models[0].name, which KServe populates
+// as the authoritative canonical ID in the format publishers/{namespace}/models/{model-name}.
+// When that field is not yet populated, it falls back to constructing the alias from
+// spec.model.name (or metadata.name when spec.model.name is unset).
+//
+// Return semantics:
+//   - (alias, nil)  — alias resolved; caller should update status.resolvedModelAlias.
+//   - ("", nil)     — LLMISVC found but model name could not be determined; caller must
+//     preserve the existing alias rather than clearing it.
+//   - ("", err)     — transient API failure (e.g. API server unreachable); caller must
+//     preserve the existing alias rather than clearing it.
+func (h *llmisvcHandler) ResolveModelAlias(ctx context.Context, log logr.Logger, model *maasv1alpha1.MaaSModelRef) (string, error) {
+	llmisvc := &kservev1alpha2.LLMInferenceService{}
+	key := client.ObjectKey{Name: model.Spec.ModelRef.Name, Namespace: model.Namespace}
+	if err := h.r.Get(ctx, key, llmisvc); err != nil {
+		return "", err
+	}
+	for _, addr := range llmisvc.Status.Addresses {
+		if len(addr.Models) > 0 && addr.Models[0].Name != "" {
+			return addr.Models[0].Name, nil
+		}
+	}
+
+	// Fallback: construct the alias from spec.model.name (or metadata.name).
+	modelName := llmisvc.Name
+	if llmisvc.Spec.Model.Name != nil && *llmisvc.Spec.Model.Name != "" {
+		modelName = *llmisvc.Spec.Model.Name
+	}
+	return fmt.Sprintf("publishers/%s/models/%s", model.Namespace, modelName), nil
 }
 
 func (h *llmisvcHandler) CleanupOnDelete(ctx context.Context, log logr.Logger, model *maasv1alpha1.MaaSModelRef) error {

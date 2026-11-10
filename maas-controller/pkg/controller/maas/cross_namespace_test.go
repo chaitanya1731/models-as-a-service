@@ -18,6 +18,8 @@ package maas
 
 import (
 	"context"
+	"sort"
+	"strings"
 	"testing"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -33,18 +35,19 @@ import (
 	maasv1alpha1 "github.com/opendatahub-io/models-as-a-service/maas-controller/api/maas/v1alpha1"
 )
 
-// TestMaaSAuthPolicyReconciler_CrossNamespace verifies that MaaSAuthPolicy
-// can reference models in different namespaces and generates AuthPolicies
-// in the correct (model's) namespace.
+// TestMaaSAuthPolicyReconciler_CrossNamespace verifies gateway-only behavior:
+// referenced cross-namespace models are aggregated into the singleton gateway
+// AuthPolicy, and no legacy per-model AuthPolicies are created.
 func TestMaaSAuthPolicyReconciler_CrossNamespace(t *testing.T) {
 	const (
 		policyNamespace = "policy-ns"
 		modelNamespaceA = "model-ns-a"
 		modelNamespaceB = "model-ns-b"
 		modelName       = "test-model"
-		httpRouteName   = modelName
+		httpRouteName   = "maas-" + modelName
 		authPolicyName  = "maas-auth-" + modelName
 		maasPolicyName  = "cross-ns-policy"
+		gatewayNS       = "openshift-ingress"
 	)
 
 	// Model and HTTPRoute in namespace-a
@@ -84,64 +87,61 @@ func TestMaaSAuthPolicyReconciler_CrossNamespace(t *testing.T) {
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithRESTMapper(testRESTMapper()).
-		WithObjects(modelA, routeA, modelB, routeB, maasPolicy).
+		WithObjects(legacyNamespace(policyNamespace), modelA, routeA, modelB, routeB, maasPolicy).
 		WithStatusSubresource(&maasv1alpha1.MaaSAuthPolicy{}).
 		Build()
 
-	r := &MaaSAuthPolicyReconciler{Client: c, Scheme: scheme, MaaSAPINamespace: "maas-system"}
+	r := &MaaSAuthPolicyReconciler{
+		Client:           c,
+		Scheme:           scheme,
+		InfraNamespace:   "maas-system",
+		GatewayNamespace: gatewayNS,
+		GatewayName:      "maas-default-gateway",
+	}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: maasPolicyName, Namespace: policyNamespace}}
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
 		t.Fatalf("Reconcile: unexpected error: %v", err)
 	}
 
-	// Verify AuthPolicy created in modelNamespaceA
-	authPolicyA := &unstructured.Unstructured{}
-	authPolicyA.SetGroupVersionKind(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1", Kind: "AuthPolicy"})
-	if err := c.Get(context.Background(), types.NamespacedName{Name: authPolicyName, Namespace: modelNamespaceA}, authPolicyA); err != nil {
-		t.Errorf("AuthPolicy in namespace %q not found: %v", modelNamespaceA, err)
-	} else {
-		// Verify it targets the correct HTTPRoute
-		targetRefName, _, _ := unstructured.NestedString(authPolicyA.Object, "spec", "targetRef", "name")
-		if targetRefName != httpRouteName {
-			t.Errorf("AuthPolicy in %q has targetRef.name = %q, want %q", modelNamespaceA, targetRefName, httpRouteName)
-		}
+	// Verify gateway AuthPolicy contains both cross-namespace model identities.
+	// Gateway AuthPolicy name is now dynamic: {gatewayName}-maas-auth
+	expectedGWAuthPolicyName := "maas-gateway-auth"
+	gatewayAP := &unstructured.Unstructured{}
+	gatewayAP.SetGroupVersionKind(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1", Kind: "AuthPolicy"})
+	if err := c.Get(context.Background(), types.NamespacedName{Name: expectedGWAuthPolicyName, Namespace: gatewayNS}, gatewayAP); err != nil {
+		t.Fatalf("gateway AuthPolicy not found: %v", err)
+	}
+	rego, found, err := unstructured.NestedString(gatewayAP.Object, "spec", "defaults", "rules", "authorization", "require-group-membership", "opa", "rego")
+	if err != nil || !found {
+		t.Fatalf("gateway require-group-membership rego missing: found=%v err=%v", found, err)
+	}
+	if !strings.Contains(rego, "accessAllowed") {
+		t.Errorf("gateway rego should reference accessAllowed from subscription-info metadata, got: %s", rego)
 	}
 
-	// Verify AuthPolicy created in modelNamespaceB
-	authPolicyB := &unstructured.Unstructured{}
-	authPolicyB.SetGroupVersionKind(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1", Kind: "AuthPolicy"})
-	if err := c.Get(context.Background(), types.NamespacedName{Name: authPolicyName, Namespace: modelNamespaceB}, authPolicyB); err != nil {
-		t.Errorf("AuthPolicy in namespace %q not found: %v", modelNamespaceB, err)
-	} else {
-		targetRefName, _, _ := unstructured.NestedString(authPolicyB.Object, "spec", "targetRef", "name")
-		if targetRefName != httpRouteName {
-			t.Errorf("AuthPolicy in %q has targetRef.name = %q, want %q", modelNamespaceB, targetRefName, httpRouteName)
+	// Verify no legacy per-model AuthPolicy exists in model namespaces or policy namespace.
+	for _, ns := range []string{modelNamespaceA, modelNamespaceB, policyNamespace} {
+		ap := &unstructured.Unstructured{}
+		ap.SetGroupVersionKind(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1", Kind: "AuthPolicy"})
+		err := c.Get(context.Background(), types.NamespacedName{Name: authPolicyName, Namespace: ns}, ap)
+		if !apierrors.IsNotFound(err) {
+			t.Errorf("legacy per-model AuthPolicy should not exist in namespace %q, got: %v", ns, err)
 		}
-	}
-
-	// Verify NO AuthPolicy created in the policy namespace
-	wrongNsAuthPolicy := &unstructured.Unstructured{}
-	wrongNsAuthPolicy.SetGroupVersionKind(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1", Kind: "AuthPolicy"})
-	err := c.Get(context.Background(), types.NamespacedName{Name: authPolicyName, Namespace: policyNamespace}, wrongNsAuthPolicy)
-	if err == nil {
-		t.Errorf("AuthPolicy should NOT be created in policy namespace %q, but it exists", policyNamespace)
-	} else if !apierrors.IsNotFound(err) {
-		t.Errorf("unexpected error checking for AuthPolicy in policy namespace: %v", err)
 	}
 }
 
-// TestMaaSAuthPolicyReconciler_SelectiveModelManagement verifies that when a
-// MaaSAuthPolicy references only specific models, AuthPolicies are created only
-// for those models, and not for unreferenced models in other namespaces.
+// TestMaaSAuthPolicyReconciler_SelectiveModelManagement verifies that the gateway
+// policy only aggregates referenced models and still avoids per-model AuthPolicies.
 func TestMaaSAuthPolicyReconciler_SelectiveModelManagement(t *testing.T) {
 	const (
 		policyNamespace = "policy-ns"
 		modelNamespaceA = "model-ns-a"
 		modelNamespaceB = "model-ns-b"
 		modelName       = "test-model"
-		httpRouteName   = modelName
+		httpRouteName   = "maas-" + modelName
 		authPolicyName  = "maas-auth-" + modelName
 		maasPolicyName  = "selective-policy"
+		gatewayNS       = "openshift-ingress"
 	)
 
 	// Model and HTTPRoute in namespace-a (referenced by policy)
@@ -180,41 +180,57 @@ func TestMaaSAuthPolicyReconciler_SelectiveModelManagement(t *testing.T) {
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithRESTMapper(testRESTMapper()).
-		WithObjects(modelA, routeA, modelB, routeB, maasPolicy).
+		WithObjects(legacyNamespace(policyNamespace), modelA, routeA, modelB, routeB, maasPolicy).
 		WithStatusSubresource(&maasv1alpha1.MaaSAuthPolicy{}).
 		Build()
 
-	r := &MaaSAuthPolicyReconciler{Client: c, Scheme: scheme, MaaSAPINamespace: "maas-system"}
+	r := &MaaSAuthPolicyReconciler{
+		Client:           c,
+		Scheme:           scheme,
+		InfraNamespace:   "maas-system",
+		GatewayNamespace: gatewayNS,
+		GatewayName:      "maas-default-gateway",
+	}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: maasPolicyName, Namespace: policyNamespace}}
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
 		t.Fatalf("Reconcile: unexpected error: %v", err)
 	}
 
-	// Verify AuthPolicy created in modelNamespaceA (referenced model)
-	authPolicyA := &unstructured.Unstructured{}
-	authPolicyA.SetGroupVersionKind(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1", Kind: "AuthPolicy"})
-	if err := c.Get(context.Background(), types.NamespacedName{Name: authPolicyName, Namespace: modelNamespaceA}, authPolicyA); err != nil {
-		t.Errorf("AuthPolicy should exist in namespace %q (referenced model): %v", modelNamespaceA, err)
+	// Verify gateway rego is fixed-size (no model-specific data).
+	gatewayAP := &unstructured.Unstructured{}
+	gatewayAP.SetGroupVersionKind(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1", Kind: "AuthPolicy"})
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "maas-gateway-auth", Namespace: gatewayNS}, gatewayAP); err != nil {
+		t.Fatalf("gateway AuthPolicy not found: %v", err)
+	}
+	rego, found, err := unstructured.NestedString(gatewayAP.Object, "spec", "defaults", "rules", "authorization", "require-group-membership", "opa", "rego")
+	if err != nil || !found {
+		t.Fatalf("gateway require-group-membership rego missing: found=%v err=%v", found, err)
+	}
+	if !strings.Contains(rego, "accessAllowed") {
+		t.Errorf("gateway rego should reference accessAllowed, got: %s", rego)
 	}
 
-	// Verify NO AuthPolicy created in modelNamespaceB (unreferenced model)
-	authPolicyB := &unstructured.Unstructured{}
-	authPolicyB.SetGroupVersionKind(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1", Kind: "AuthPolicy"})
-	err := c.Get(context.Background(), types.NamespacedName{Name: authPolicyName, Namespace: modelNamespaceB}, authPolicyB)
-	if !apierrors.IsNotFound(err) {
-		t.Errorf("AuthPolicy should NOT exist in namespace %q (unreferenced model), but got: %v", modelNamespaceB, err)
+	// Verify no legacy per-model AuthPolicies are created.
+	for _, ns := range []string{modelNamespaceA, modelNamespaceB} {
+		ap := &unstructured.Unstructured{}
+		ap.SetGroupVersionKind(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1", Kind: "AuthPolicy"})
+		err := c.Get(context.Background(), types.NamespacedName{Name: authPolicyName, Namespace: ns}, ap)
+		if !apierrors.IsNotFound(err) {
+			t.Errorf("legacy per-model AuthPolicy should not exist in namespace %q, got: %v", ns, err)
+		}
 	}
 }
 
-// TestMaaSAuthPolicyReconciler_SameNameDifferentNamespaces verifies that
-// models with the same name in different namespaces are properly isolated.
+// TestMaaSAuthPolicyReconciler_SameNameDifferentNamespaces verifies that same-named
+// models in different namespaces remain isolated in the gateway aggregate map.
 func TestMaaSAuthPolicyReconciler_SameNameDifferentNamespaces(t *testing.T) {
 	const (
 		modelName      = "shared-model"
 		namespaceA     = "team-a"
 		namespaceB     = "team-b"
-		httpRouteName  = modelName
+		httpRouteName  = "maas-" + modelName
 		authPolicyName = "maas-auth-" + modelName
+		gatewayNS      = "openshift-ingress"
 	)
 
 	// Two models with same name in different namespaces
@@ -259,11 +275,17 @@ func TestMaaSAuthPolicyReconciler_SameNameDifferentNamespaces(t *testing.T) {
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithRESTMapper(testRESTMapper()).
-		WithObjects(modelA, routeA, modelB, routeB, policyA, policyB).
+		WithObjects(legacyNamespace(namespaceA), legacyNamespace(namespaceB), modelA, routeA, modelB, routeB, policyA, policyB).
 		WithStatusSubresource(&maasv1alpha1.MaaSAuthPolicy{}).
 		Build()
 
-	r := &MaaSAuthPolicyReconciler{Client: c, Scheme: scheme, MaaSAPINamespace: "maas-system"}
+	r := &MaaSAuthPolicyReconciler{
+		Client:           c,
+		Scheme:           scheme,
+		InfraNamespace:   "maas-system",
+		GatewayNamespace: gatewayNS,
+		GatewayName:      "maas-default-gateway",
+	}
 
 	// Reconcile both policies
 	reqA := ctrl.Request{NamespacedName: types.NamespacedName{Name: "policy-a", Namespace: namespaceA}}
@@ -276,23 +298,28 @@ func TestMaaSAuthPolicyReconciler_SameNameDifferentNamespaces(t *testing.T) {
 		t.Fatalf("Reconcile policy-b: unexpected error: %v", err)
 	}
 
-	// Verify AuthPolicy exists in namespace-a
-	authPolicyA := &unstructured.Unstructured{}
-	authPolicyA.SetGroupVersionKind(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1", Kind: "AuthPolicy"})
-	if err := c.Get(context.Background(), types.NamespacedName{Name: authPolicyName, Namespace: namespaceA}, authPolicyA); err != nil {
-		t.Errorf("AuthPolicy in namespace %q not found: %v", namespaceA, err)
+	// Verify no legacy per-model AuthPolicy exists in either model namespace.
+	for _, ns := range []string{namespaceA, namespaceB} {
+		ap := &unstructured.Unstructured{}
+		ap.SetGroupVersionKind(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1", Kind: "AuthPolicy"})
+		err := c.Get(context.Background(), types.NamespacedName{Name: authPolicyName, Namespace: ns}, ap)
+		if !apierrors.IsNotFound(err) {
+			t.Errorf("legacy per-model AuthPolicy should not exist in namespace %q, got: %v", ns, err)
+		}
 	}
 
-	// Verify AuthPolicy exists in namespace-b
-	authPolicyB := &unstructured.Unstructured{}
-	authPolicyB.SetGroupVersionKind(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1", Kind: "AuthPolicy"})
-	if err := c.Get(context.Background(), types.NamespacedName{Name: authPolicyName, Namespace: namespaceB}, authPolicyB); err != nil {
-		t.Errorf("AuthPolicy in namespace %q not found: %v", namespaceB, err)
+	// Rego is now fixed-size — access checks are delegated to subscription-info metadata.
+	gatewayAP := &unstructured.Unstructured{}
+	gatewayAP.SetGroupVersionKind(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1", Kind: "AuthPolicy"})
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "maas-gateway-auth", Namespace: gatewayNS}, gatewayAP); err != nil {
+		t.Fatalf("gateway AuthPolicy not found: %v", err)
 	}
-
-	// Verify they're separate resources (checking subjects would require parsing the spec)
-	if authPolicyA.GetNamespace() == authPolicyB.GetNamespace() {
-		t.Errorf("AuthPolicies should be in different namespaces, both in: %q", authPolicyA.GetNamespace())
+	rego, found, err := unstructured.NestedString(gatewayAP.Object, "spec", "defaults", "rules", "authorization", "require-group-membership", "opa", "rego")
+	if err != nil || !found {
+		t.Fatalf("gateway require-group-membership rego missing: found=%v err=%v", found, err)
+	}
+	if !strings.Contains(rego, "accessAllowed") {
+		t.Errorf("gateway rego should reference accessAllowed, got: %s", rego)
 	}
 }
 
@@ -305,7 +332,7 @@ func TestMaaSSubscriptionReconciler_CrossNamespace(t *testing.T) {
 		modelNamespaceA = "model-ns-a"
 		modelNamespaceB = "model-ns-b"
 		modelName       = "test-model"
-		httpRouteName   = modelName
+		httpRouteName   = "maas-" + modelName
 		trlpName        = "maas-trlp-" + modelName
 		subName         = "cross-ns-subscription"
 	)
@@ -372,7 +399,7 @@ func TestMaaSSubscriptionReconciler_CrossNamespace(t *testing.T) {
 		}).
 		Build()
 
-	r := &MaaSSubscriptionReconciler{Client: c, Scheme: scheme}
+	r := &MaaSSubscriptionReconciler{Client: c, APIReader: c, Scheme: scheme}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: subName, Namespace: subNamespace}}
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
 		t.Fatalf("Reconcile: unexpected error: %v", err)
@@ -417,7 +444,7 @@ func TestMaaSSubscriptionReconciler_DuplicateNameIsolation(t *testing.T) {
 	const (
 		modelName        = "llm"
 		modelNamespace   = "models"
-		httpRouteName    = modelName
+		httpRouteName    = "maas-" + modelName
 		trlpName         = "maas-trlp-" + modelName
 		subscriptionName = "gold" // SAME name in both namespaces
 		namespaceA       = "tenant-a"
@@ -435,7 +462,9 @@ func TestMaaSSubscriptionReconciler_DuplicateNameIsolation(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: httpRouteName, Namespace: modelNamespace},
 	}
 
-	// Subscription "gold" in tenant-a namespace (limit: 100)
+	// Subscription "gold" in tenant-a and tenant-b - SAME NAME, and the SAME rate
+	// so both land in the one grouped limit, exercising the case that actually
+	// matters: isolation now lives in the predicate/counters, not in the map key.
 	subA := &maasv1alpha1.MaaSSubscription{
 		ObjectMeta: metav1.ObjectMeta{Name: subscriptionName, Namespace: namespaceA},
 		Spec: maasv1alpha1.MaaSSubscriptionSpec{
@@ -452,7 +481,7 @@ func TestMaaSSubscriptionReconciler_DuplicateNameIsolation(t *testing.T) {
 		},
 	}
 
-	// Subscription "gold" in tenant-b namespace (limit: 10000) - SAME NAME!
+	// Subscription "gold" in tenant-b namespace - SAME NAME, SAME rate!
 	subB := &maasv1alpha1.MaaSSubscription{
 		ObjectMeta: metav1.ObjectMeta{Name: subscriptionName, Namespace: namespaceB},
 		Spec: maasv1alpha1.MaaSSubscriptionSpec{
@@ -463,7 +492,7 @@ func TestMaaSSubscriptionReconciler_DuplicateNameIsolation(t *testing.T) {
 				{
 					Name:            modelName,
 					Namespace:       modelNamespace,
-					TokenRateLimits: []maasv1alpha1.TokenRateLimit{{Limit: 10000, Window: "1m"}},
+					TokenRateLimits: []maasv1alpha1.TokenRateLimit{{Limit: 100, Window: "1m"}},
 				},
 			},
 		},
@@ -477,7 +506,7 @@ func TestMaaSSubscriptionReconciler_DuplicateNameIsolation(t *testing.T) {
 		WithIndex(&maasv1alpha1.MaaSSubscription{}, "spec.modelRef", subscriptionModelRefIndexer).
 		Build()
 
-	r := &MaaSSubscriptionReconciler{Client: c, Scheme: scheme}
+	r := &MaaSSubscriptionReconciler{Client: c, APIReader: c, Scheme: scheme}
 
 	// Reconcile both subscriptions
 	reqA := ctrl.Request{NamespacedName: types.NamespacedName{Name: subscriptionName, Namespace: namespaceA}}
@@ -502,82 +531,121 @@ func TestMaaSSubscriptionReconciler_DuplicateNameIsolation(t *testing.T) {
 		t.Fatalf("spec.limits not found: found=%v err=%v", found, err)
 	}
 
-	// CRITICAL: Verify both subscriptions have UNIQUE limit entries
-	// Format: "{namespace}-{name}-{model}-tokens"
-	keyA := namespaceA + "-" + subscriptionName + "-" + modelName + "-tokens"
-	keyB := namespaceB + "-" + subscriptionName + "-" + modelName + "-tokens"
-
-	if keyA == keyB {
-		t.Fatalf("SECURITY BUG: Limit keys are identical (%q), this would cause quota isolation bypass!", keyA)
+	// Both subscriptions share the same name AND rate, so they land in the same
+	// grouped limit (tokens-100-per-1m). Isolation must therefore come from the
+	// predicate's distinct short IDs and the counters, not from the map key or
+	// from having separate limit objects.
+	if len(limitsMap) != 1 {
+		t.Fatalf("expected exactly 1 grouped limit, got %d: %v", len(limitsMap), getMapKeys(limitsMap))
+	}
+	limit, ok := limitsMap["tokens-100-per-1m"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected limit %q not found, got keys: %v", "tokens-100-per-1m", getMapKeys(limitsMap))
 	}
 
-	limitA, hasA := limitsMap[keyA]
-	limitB, hasB := limitsMap[keyB]
-
-	if !hasA {
-		t.Errorf("Limit entry for tenant-a subscription not found, expected key %q, got keys: %v", keyA, getMapKeys(limitsMap))
+	whenSlice, _, _ := unstructured.NestedSlice(limit, "when")
+	if len(whenSlice) != 1 {
+		t.Fatalf("expected 1 when predicate, got %d", len(whenSlice))
 	}
-	if !hasB {
-		t.Errorf("Limit entry for tenant-b subscription not found, expected key %q, got keys: %v", keyB, getMapKeys(limitsMap))
+	predMap, ok := whenSlice[0].(map[string]any)
+	if !ok {
+		t.Fatal("whenSlice[0] is not map[string]any")
 	}
-
-	// Verify predicate includes namespace to prevent cross-tenant matching
-	// Format: auth.identity.selected_subscription_key == "{namespace}/{name}@{modelNamespace}/{modelName}"
-	if hasA {
-		limitAMap, ok := limitA.(map[string]any)
-		if !ok {
-			t.Fatal("limitA is not map[string]any")
-		}
-		whenSlice, _, _ := unstructured.NestedSlice(limitAMap, "when")
-		if len(whenSlice) > 0 {
-			predMap, ok := whenSlice[0].(map[string]any)
-			if !ok {
-				t.Fatal("whenSlice[0] is not map[string]any")
-			}
-			pred, ok := predMap["predicate"].(string)
-			if !ok {
-				t.Fatal("predicate is not string")
-			}
-			expectedPredA := `auth.identity.selected_subscription_key == "` + namespaceA + "/" + subscriptionName + "@" + modelNamespace + "/" + modelName + `" && !request.path.endsWith("/v1/models")`
-			if pred != expectedPredA {
-				t.Errorf("Tenant-a predicate = %q, want %q", pred, expectedPredA)
-			}
-			// CRITICAL: Predicate must NOT match tenant-b's subscription
-			if !containsString(pred, namespaceA) {
-				t.Errorf("SECURITY BUG: Tenant-a predicate doesn't include namespace: %s", pred)
-			}
-		}
+	pred, ok := predMap["predicate"].(string)
+	if !ok {
+		t.Fatal("predicate is not string")
 	}
 
-	if hasB {
-		limitBMap, ok := limitB.(map[string]any)
-		if !ok {
-			t.Fatal("limitB is not map[string]any")
-		}
-		whenSlice, _, _ := unstructured.NestedSlice(limitBMap, "when")
-		if len(whenSlice) > 0 {
-			predMap, ok := whenSlice[0].(map[string]any)
-			if !ok {
-				t.Fatal("whenSlice[0] is not map[string]any")
-			}
-			pred, ok := predMap["predicate"].(string)
-			if !ok {
-				t.Fatal("predicate is not string")
-			}
-			expectedPredB := `auth.identity.selected_subscription_key == "` + namespaceB + "/" + subscriptionName + "@" + modelNamespace + "/" + modelName + `" && !request.path.endsWith("/v1/models")`
-			if pred != expectedPredB {
-				t.Errorf("Tenant-b predicate = %q, want %q", pred, expectedPredB)
-			}
-			// CRITICAL: Predicate must NOT match tenant-a's subscription
-			if !containsString(pred, namespaceB) {
-				t.Errorf("SECURITY BUG: Tenant-b predicate doesn't include namespace: %s", pred)
-			}
+	idA := SubscriptionRateLimitID(ModelScopedSubscriptionKey(namespaceA, subscriptionName, modelNamespace, modelName))
+	idB := SubscriptionRateLimitID(ModelScopedSubscriptionKey(namespaceB, subscriptionName, modelNamespace, modelName))
+	if idA == idB {
+		t.Fatalf("SECURITY BUG: short IDs collide (%q), this would cause quota isolation bypass!", idA)
+	}
+	clauseA := `auth.identity.selected_subscription_id == "` + idA + `"`
+	clauseB := `auth.identity.selected_subscription_id == "` + idB + `"`
+	// buildGroupLimit sorts short IDs lexicographically before OR-ing.
+	ids := []string{idA, idB}
+	sort.Strings(ids)
+	expectedPred := `(auth.identity.selected_subscription_id == "` + ids[0] + `" || ` +
+		`auth.identity.selected_subscription_id == "` + ids[1] + `") && !request.path.endsWith("/v1/models")`
+	if pred != expectedPred {
+		t.Errorf("grouped predicate = %q, want %q", pred, expectedPred)
+	}
+	// CRITICAL: each clause must name its own short ID (namespace is hashed in),
+	// so a request for tenant-a's "gold" cannot be counted (or capped) as tenant-b's.
+	if !containsString(pred, clauseA) {
+		t.Errorf("SECURITY BUG: predicate is missing tenant-a's short-ID clause: %s", pred)
+	}
+	if !containsString(pred, clauseB) {
+		t.Errorf("SECURITY BUG: predicate is missing tenant-b's short-ID clause: %s", pred)
+	}
+
+	// CRITICAL: counters must key on selected_subscription_id as well as userid,
+	// or tenant-a and tenant-b would share one Limitador bucket despite the OR.
+	counters, _, _ := unstructured.NestedSlice(limit, "counters")
+	wantCounters := []string{"auth.identity.selected_subscription_id", "auth.identity.userid"}
+	if len(counters) != len(wantCounters) {
+		t.Fatalf("expected %d counters, got %d: %v", len(wantCounters), len(counters), counters)
+	}
+	for i, want := range wantCounters {
+		c, ok := counters[i].(map[string]any)
+		if !ok || c["expression"] != want {
+			t.Errorf("counters[%d] = %v, want expression %q", i, counters[i], want)
 		}
 	}
+}
 
-	// Verify both limit entries exist (no overwrite/collision)
-	if len(limitsMap) < 2 {
-		t.Errorf("Expected at least 2 limit entries (one per subscription), got %d: %v", len(limitsMap), getMapKeys(limitsMap))
+// TestMaaSAuthPolicyReconciler_DuplicateNameAnnotationIsolation verifies that
+// same-named MaaSAuthPolicies in different namespaces each contribute independently
+// to the gateway-level AuthPolicy rego when their respective namespace is reconciled.
+func TestMaaSAuthPolicyReconciler_DuplicateNameAnnotationIsolation(t *testing.T) {
+	const (
+		modelName      = "llm"
+		modelNamespace = "models"
+		policyName     = "access"
+		namespaceA     = "tenant-a"
+		gwNamespace    = "gateway-ns"
+	)
+
+	model := newMaaSModelRef(modelName, modelNamespace, "ExternalModel", modelName)
+	route := newExternalModelHTTPRoute(modelName, modelNamespace)
+	policyA := newMaaSAuthPolicy(policyName, namespaceA, "team-a",
+		maasv1alpha1.ModelRef{Name: modelName, Namespace: modelNamespace})
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithRESTMapper(testRESTMapper()).
+		WithObjects(legacyNamespace(namespaceA), model, route, policyA).
+		WithStatusSubresource(&maasv1alpha1.MaaSAuthPolicy{}).
+		Build()
+
+	r := &MaaSAuthPolicyReconciler{
+		Client:           c,
+		Scheme:           scheme,
+		InfraNamespace:   "opendatahub",
+		GatewayName:      "default-gateway",
+		GatewayNamespace: gwNamespace,
+	}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: policyName, Namespace: namespaceA}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("Reconcile MaaSAuthPolicy %s/%s: %v", namespaceA, policyName, err)
+	}
+
+	gw := &unstructured.Unstructured{}
+	gw.SetGroupVersionKind(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1", Kind: "AuthPolicy"})
+	// This uses the controller's default gateway (r.GatewayNamespace/r.GatewayName),
+	// so it gets the legacy name for backward compatibility
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "maas-gateway-auth", Namespace: gwNamespace}, gw); err != nil {
+		t.Fatalf("Get gateway AuthPolicy: %v", err)
+	}
+
+	// Rego is now fixed-size — access checks are delegated to subscription-info metadata.
+	rego, found, err := unstructured.NestedString(gw.Object, "spec", "defaults", "rules", "authorization", "require-group-membership", "opa", "rego")
+	if err != nil || !found {
+		t.Fatalf("gateway require-group-membership rego missing: found=%v err=%v", found, err)
+	}
+	if !strings.Contains(rego, "accessAllowed") {
+		t.Errorf("gateway rego should reference accessAllowed, got: %s", rego)
 	}
 }
 
@@ -610,7 +678,7 @@ func TestMaaSModelRefDeletion_CrossNamespaceIsolation(t *testing.T) {
 		modelName      = "shared-model"
 		namespaceA     = "team-a"
 		namespaceB     = "team-b"
-		httpRouteName  = modelName
+		httpRouteName  = "maas-" + modelName
 		authPolicyName = "maas-auth-" + modelName
 	)
 

@@ -1,6 +1,10 @@
 # MaaSAuthPolicy
 
-Defines who (groups/users) can access which models. Creates Kuadrant AuthPolicies that validate API keys via MaaS API callback and perform subscription selection. Must be created in the `models-as-a-service` namespace.
+Defines who (groups/users) can access which models. Creates Kuadrant AuthPolicies that validate API keys via MaaS API callback and perform subscription selection.
+
+**Namespace requirement:** Must be created in the tenant namespace:
+- Default tenant: `models-as-a-service`
+- Additional tenants: `ai-tenant-{tenantID}`
 
 ## MaaSAuthPolicySpec
 
@@ -14,7 +18,7 @@ Defines who (groups/users) can access which models. Creates Kuadrant AuthPolicie
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| groups | []GroupReference | No | List of Kubernetes group names |
+| groups | []GroupReference | No | Identity group names that may access the referenced models; matched exactly |
 | users | []string | No | List of Kubernetes user names |
 
 At least one of `groups` or `users` must be specified.

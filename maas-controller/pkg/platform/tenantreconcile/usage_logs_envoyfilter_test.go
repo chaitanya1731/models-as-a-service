@@ -1,0 +1,422 @@
+package tenantreconcile
+
+import (
+	"testing"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+
+	. "github.com/onsi/gomega"
+)
+
+func TestPatchUsageLogsClusterAddress(t *testing.T) {
+	g := NewWithT(t)
+
+	ef := &unstructured.Unstructured{
+		Object: map[string]any{
+			"spec": map[string]any{
+				"configPatches": []any{
+					map[string]any{
+						"patch": map[string]any{
+							"value": map[string]any{
+								"load_assignment": map[string]any{
+									"endpoints": []any{},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	err := PatchUsageLogsClusterAddress(ef, "usage-logs-collector.opendatahub.svc.cluster.local")
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).NotTo(ContainSubstring("%!w"))
+	g.Expect(err.Error()).To(ContainSubstring("endpoints not found or empty"))
+}
+
+// usageLogsClusterEF builds an EnvoyFilter shaped like the real manifest: a CLUSTER
+// patch with load_assignment.endpoints and, optionally, a TLS transport socket.
+func usageLogsClusterEF(withTLS bool) *unstructured.Unstructured {
+	clusterValue := map[string]any{
+		"name": "otel_als_cluster",
+		"load_assignment": map[string]any{
+			"endpoints": []any{
+				map[string]any{
+					"lb_endpoints": []any{
+						map[string]any{
+							"endpoint": map[string]any{
+								"address": map[string]any{
+									"socket_address": map[string]any{
+										"address":    "old-collector.opendatahub.svc.cluster.local",
+										"port_value": int64(4317),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	if withTLS {
+		clusterValue["transport_socket"] = map[string]any{
+			"name": "envoy.transport_sockets.tls",
+			"typed_config": map[string]any{
+				"@type":                   "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
+				"sni":                     "old-collector.opendatahub.svc.cluster.local",
+				"auto_sni_san_validation": true,
+				"common_tls_context": map[string]any{
+					"alpn_protocols": []any{"h2"},
+				},
+			},
+		}
+	}
+	return &unstructured.Unstructured{
+		Object: map[string]any{
+			"spec": map[string]any{
+				"configPatches": []any{
+					map[string]any{
+						"applyTo": "CLUSTER",
+						"patch":   map[string]any{"value": clusterValue},
+					},
+				},
+			},
+		},
+	}
+}
+
+// usageLogsClusterAddressOf reads the first endpoint address from a CLUSTER patch value.
+func usageLogsClusterAddressOf(g *WithT, patch map[string]any) string {
+	g.THelper()
+	value, _, err := unstructured.NestedMap(patch, "patch", "value")
+	g.Expect(err).NotTo(HaveOccurred())
+	endpoints, _, err := unstructured.NestedSlice(value, "load_assignment", "endpoints")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(endpoints).NotTo(BeEmpty())
+	ep0, ok := endpoints[0].(map[string]any)
+	g.Expect(ok).To(BeTrue())
+	lbEndpoints, _, err := unstructured.NestedSlice(ep0, "lb_endpoints")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(lbEndpoints).NotTo(BeEmpty())
+	lbe0, ok := lbEndpoints[0].(map[string]any)
+	g.Expect(ok).To(BeTrue())
+	addr, _, err := unstructured.NestedString(lbe0, "endpoint", "address", "socket_address", "address")
+	g.Expect(err).NotTo(HaveOccurred())
+	return addr
+}
+
+func TestPatchUsageLogsClusterAddressUpdatesSNI(t *testing.T) {
+	t.Run("updates address and SNI", func(t *testing.T) {
+		g := NewWithT(t)
+		ef := usageLogsClusterEF(true)
+		want := "data-science-usage-logs-collector-headless.opendatahub.svc.cluster.local"
+
+		g.Expect(PatchUsageLogsClusterAddress(ef, want)).To(Succeed())
+
+		configPatches, _, _ := unstructured.NestedSlice(ef.Object, "spec", "configPatches")
+		patch, _ := configPatches[0].(map[string]any)
+		g.Expect(usageLogsClusterAddressOf(g, patch)).To(Equal(want))
+		sni, _, _ := unstructured.NestedString(patch, "patch", "value", "transport_socket", "typed_config", "sni")
+		g.Expect(sni).To(Equal(want))
+
+		// gRPC negotiation and hostname validation must survive the patch untouched.
+		autoSNISANValidation, _, _ := unstructured.NestedBool(patch, "patch", "value", "transport_socket", "typed_config", "auto_sni_san_validation")
+		g.Expect(autoSNISANValidation).To(BeTrue())
+		alpnProtocols, _, _ := unstructured.NestedStringSlice(patch, "patch", "value", "transport_socket", "typed_config", "common_tls_context", "alpn_protocols")
+		g.Expect(alpnProtocols).To(ContainElement("h2"))
+	})
+
+	t.Run("does not add TLS when the cluster has none", func(t *testing.T) {
+		g := NewWithT(t)
+		ef := usageLogsClusterEF(false)
+		want := "usage-logs-collector.opendatahub.svc.cluster.local"
+
+		g.Expect(PatchUsageLogsClusterAddress(ef, want)).To(Succeed())
+
+		configPatches, _, _ := unstructured.NestedSlice(ef.Object, "spec", "configPatches")
+		patch, _ := configPatches[0].(map[string]any)
+		_, found, err := unstructured.NestedMap(patch, "patch", "value", "transport_socket")
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(found).To(BeFalse())
+	})
+}
+
+func TestDisableUsageLogsClusterTLS(t *testing.T) {
+	t.Run("removes the transport socket", func(t *testing.T) {
+		g := NewWithT(t)
+		ef := usageLogsClusterEF(true)
+
+		g.Expect(DisableUsageLogsClusterTLS(ef)).To(Succeed())
+
+		configPatches, _, _ := unstructured.NestedSlice(ef.Object, "spec", "configPatches")
+		patch, _ := configPatches[0].(map[string]any)
+		_, found, err := unstructured.NestedMap(patch, "patch", "value", "transport_socket")
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(found).To(BeFalse())
+
+		// The address is untouched.
+		g.Expect(usageLogsClusterAddressOf(g, patch)).To(Equal("old-collector.opendatahub.svc.cluster.local"))
+	})
+
+	t.Run("rejects a missing cluster patch", func(t *testing.T) {
+		g := NewWithT(t)
+		ef := &unstructured.Unstructured{Object: map[string]any{"spec": map[string]any{}}}
+
+		err := DisableUsageLogsClusterTLS(ef)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("configPatches not found or empty"))
+	})
+}
+
+// usageLogsEFWithAccessLog builds an EnvoyFilter shaped like the real manifest: a CLUSTER
+// patch with no access_log, followed by the NETWORK_FILTER patch that carries it.
+func usageLogsEFWithAccessLog(accessLog []any) *unstructured.Unstructured {
+	return &unstructured.Unstructured{
+		Object: map[string]any{
+			"spec": map[string]any{
+				"configPatches": []any{
+					map[string]any{
+						"applyTo": "CLUSTER",
+						"patch":   map[string]any{"value": map[string]any{"name": "otel_als_cluster"}},
+					},
+					map[string]any{
+						"applyTo": "NETWORK_FILTER",
+						"patch": map[string]any{
+							"value": map[string]any{
+								"typed_config": map[string]any{
+									"access_log": accessLog,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func usageLogsServiceNamespaceOf(g *WithT, ef *unstructured.Unstructured, accessLogIndex int) (string, bool) {
+	g.THelper()
+	configPatches, _, err := unstructured.NestedSlice(ef.Object, "spec", "configPatches")
+	g.Expect(err).NotTo(HaveOccurred())
+	patch, ok := configPatches[1].(map[string]any)
+	g.Expect(ok).To(BeTrue())
+	accessLog, _, err := unstructured.NestedSlice(patch, "patch", "value", "typed_config", "access_log")
+	g.Expect(err).NotTo(HaveOccurred())
+	entry, ok := accessLog[accessLogIndex].(map[string]any)
+	g.Expect(ok).To(BeTrue())
+	values, found, err := unstructured.NestedSlice(entry, "typed_config", "resource_attributes", "values")
+	g.Expect(err).NotTo(HaveOccurred())
+	if !found {
+		return "", false
+	}
+	for _, v := range values {
+		attr, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		if k, _, _ := unstructured.NestedString(attr, "key"); k != "service.namespace" {
+			continue
+		}
+		s, _, _ := unstructured.NestedString(attr, "value", "string_value")
+		return s, true
+	}
+	return "", false
+}
+
+func usageLogsResourceAttributeOf(g *WithT, ef *unstructured.Unstructured, key string) (string, bool) {
+	g.THelper()
+	configPatches, _, err := unstructured.NestedSlice(ef.Object, "spec", "configPatches")
+	g.Expect(err).NotTo(HaveOccurred())
+	for _, cp := range configPatches {
+		patch, ok := cp.(map[string]any)
+		if !ok {
+			continue
+		}
+		accessLog, _, err := unstructured.NestedSlice(patch, "patch", "value", "typed_config", "access_log")
+		g.Expect(err).NotTo(HaveOccurred())
+		for _, entry := range accessLog {
+			logEntry, ok := entry.(map[string]any)
+			if !ok {
+				continue
+			}
+			values, found, err := unstructured.NestedSlice(logEntry, "typed_config", "resource_attributes", "values")
+			g.Expect(err).NotTo(HaveOccurred())
+			if !found {
+				continue
+			}
+			for _, value := range values {
+				attr, ok := value.(map[string]any)
+				if !ok {
+					continue
+				}
+				if attrKey, _, _ := unstructured.NestedString(attr, "key"); attrKey == key {
+					attrValue, _, _ := unstructured.NestedString(attr, "value", "string_value")
+					return attrValue, true
+				}
+			}
+		}
+	}
+	return "", false
+}
+
+func otelAccessLogEntry(resourceAttributes []any) map[string]any {
+	entry := map[string]any{
+		"name":         "envoy.access_loggers.open_telemetry",
+		"typed_config": map[string]any{"@type": "type.googleapis.com/OpenTelemetryAccessLogConfig"},
+	}
+	if resourceAttributes != nil {
+		typedConfig, _ := entry["typed_config"].(map[string]any)
+		typedConfig["resource_attributes"] = map[string]any{"values": resourceAttributes}
+	}
+	return entry
+}
+
+func TestPatchUsageLogsServiceNamespace(t *testing.T) {
+	t.Run("appends service.namespace next to existing service.name", func(t *testing.T) {
+		g := NewWithT(t)
+
+		ef := usageLogsEFWithAccessLog([]any{
+			otelAccessLogEntry([]any{
+				map[string]any{"key": "service.name", "value": map[string]any{"string_value": "models-as-a-service"}},
+			}),
+		})
+
+		g.Expect(PatchUsageLogsServiceNamespace(ef, "ai-tenant-redteam")).To(Succeed())
+
+		ns, found := usageLogsServiceNamespaceOf(g, ef, 0)
+		g.Expect(found).To(BeTrue())
+		g.Expect(ns).To(Equal("ai-tenant-redteam"))
+
+		configPatches, _, _ := unstructured.NestedSlice(ef.Object, "spec", "configPatches")
+		patch, _ := configPatches[1].(map[string]any)
+		accessLog, _, _ := unstructured.NestedSlice(patch, "patch", "value", "typed_config", "access_log")
+		entry, _ := accessLog[0].(map[string]any)
+		values, _, _ := unstructured.NestedSlice(entry, "typed_config", "resource_attributes", "values")
+		g.Expect(values).To(HaveLen(2))
+		first, _ := values[0].(map[string]any)
+		name, _, _ := unstructured.NestedString(first, "value", "string_value")
+		g.Expect(name).To(Equal("models-as-a-service"))
+	})
+
+	t.Run("appends when resource attributes are absent", func(t *testing.T) {
+		g := NewWithT(t)
+
+		ef := usageLogsEFWithAccessLog([]any{otelAccessLogEntry(nil)})
+
+		g.Expect(PatchUsageLogsServiceNamespace(ef, "ai-tenant-redteam")).To(Succeed())
+
+		ns, found := usageLogsServiceNamespaceOf(g, ef, 0)
+		g.Expect(found).To(BeTrue())
+		g.Expect(ns).To(Equal("ai-tenant-redteam"))
+	})
+
+	t.Run("leaves non-OTel access loggers untouched", func(t *testing.T) {
+		g := NewWithT(t)
+
+		ef := usageLogsEFWithAccessLog([]any{
+			map[string]any{
+				"name":         "envoy.access_loggers.file",
+				"typed_config": map[string]any{"@type": "type.googleapis.com/FileAccessLog"},
+			},
+			otelAccessLogEntry([]any{
+				map[string]any{"key": "service.name", "value": map[string]any{"string_value": "models-as-a-service"}},
+			}),
+		})
+
+		g.Expect(PatchUsageLogsServiceNamespace(ef, "ai-tenant-redteam")).To(Succeed())
+
+		ns, found := usageLogsServiceNamespaceOf(g, ef, 1)
+		g.Expect(found).To(BeTrue())
+		g.Expect(ns).To(Equal("ai-tenant-redteam"))
+
+		// The file logger must not gain a resource_attributes field.
+		_, found = usageLogsServiceNamespaceOf(g, ef, 0)
+		g.Expect(found).To(BeFalse())
+	})
+
+	t.Run("rejects an empty namespace", func(t *testing.T) {
+		g := NewWithT(t)
+
+		ef := usageLogsEFWithAccessLog([]any{otelAccessLogEntry(nil)})
+
+		err := PatchUsageLogsServiceNamespace(ef, "")
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("must not be empty"))
+	})
+
+	t.Run("errors when no OTel access logger is present", func(t *testing.T) {
+		g := NewWithT(t)
+
+		ef := usageLogsEFWithAccessLog([]any{
+			map[string]any{"name": "envoy.access_loggers.file"},
+		})
+
+		err := PatchUsageLogsServiceNamespace(ef, "ai-tenant-redteam")
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("no envoy.access_loggers.open_telemetry access_log entry"))
+	})
+
+	t.Run("errors when configPatches is missing", func(t *testing.T) {
+		g := NewWithT(t)
+
+		ef := &unstructured.Unstructured{Object: map[string]any{"spec": map[string]any{}}}
+
+		err := PatchUsageLogsServiceNamespace(ef, "ai-tenant-redteam")
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("configPatches not found or empty"))
+	})
+
+	t.Run("errors when an access_log entry is not an object", func(t *testing.T) {
+		g := NewWithT(t)
+
+		ef := usageLogsEFWithAccessLog([]any{"not-an-object"})
+
+		err := PatchUsageLogsServiceNamespace(ef, "ai-tenant-redteam")
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("access_log[0] is not an object"))
+	})
+}
+
+func TestPatchUsageLogsProducerScope(t *testing.T) {
+	t.Run("appends authoritative tenant attribute", func(t *testing.T) {
+		g := NewWithT(t)
+		ef := usageLogsEFWithAccessLog([]any{otelAccessLogEntry(nil)})
+
+		g.Expect(PatchUsageLogsProducerScope(ef, "redteam")).To(Succeed())
+
+		tenantName, found := usageLogsResourceAttributeOf(g, ef, "tenant_name")
+		g.Expect(found).To(BeTrue())
+		g.Expect(tenantName).To(Equal("redteam"))
+	})
+
+	t.Run("rejects an empty tenant name", func(t *testing.T) {
+		g := NewWithT(t)
+		ef := usageLogsEFWithAccessLog([]any{otelAccessLogEntry(nil)})
+
+		g.Expect(PatchUsageLogsProducerScope(ef, "")).To(MatchError("tenant name must not be empty"))
+	})
+}
+
+func TestPatchUsageLogsEnvoyFilterWorkloadSelector(t *testing.T) {
+	g := NewWithT(t)
+
+	ef := &unstructured.Unstructured{
+		Object: map[string]any{
+			"spec": map[string]any{
+				"targetRefs": []any{
+					map[string]any{"name": "original-gateway"},
+				},
+			},
+		},
+	}
+
+	g.Expect(PatchUsageLogsEnvoyFilterWorkloadSelector(ef, "redteam-gateway")).To(Succeed())
+
+	wsLabels, found, _ := unstructured.NestedStringMap(ef.Object, "spec", "workloadSelector", "labels")
+	g.Expect(found).To(BeTrue())
+	g.Expect(wsLabels["gateway.networking.k8s.io/gateway-name"]).To(Equal("redteam-gateway"))
+
+	_, targetRefsFound, _ := unstructured.NestedSlice(ef.Object, "spec", "targetRefs")
+	g.Expect(targetRefsFound).To(BeFalse())
+}

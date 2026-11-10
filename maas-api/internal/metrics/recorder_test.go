@@ -15,17 +15,31 @@ import (
 
 type mockRecorder struct {
 	durations   []recordedDuration
+	requests    []recordedRequest
+	rejections  []string
 	inFlightInc []string
 	inFlightDec []string
 }
 
 type recordedDuration struct {
-	method, route, status string
-	duration              time.Duration
+	method, route, status, tenant string
+	duration                      time.Duration
 }
 
-func (m *mockRecorder) RecordRequestDuration(method, route, status string, d time.Duration) {
-	m.durations = append(m.durations, recordedDuration{method, route, status, d})
+type recordedRequest struct {
+	duration time.Duration
+}
+
+func (m *mockRecorder) RecordRequestDuration(method, route, status, tenant string, d time.Duration) {
+	m.durations = append(m.durations, recordedDuration{method, route, status, tenant, d})
+}
+
+func (m *mockRecorder) RecordRequest(d time.Duration) {
+	m.requests = append(m.requests, recordedRequest{d})
+}
+
+func (m *mockRecorder) RecordRejection(reason string) {
+	m.rejections = append(m.rejections, reason)
 }
 
 func (m *mockRecorder) IncrementInFlight(method string) {
@@ -36,10 +50,16 @@ func (m *mockRecorder) DecrementInFlight(method string) {
 	m.inFlightDec = append(m.inFlightDec, method)
 }
 
+func (m *mockRecorder) RecordKeyValidation(tenant, result string) {
+}
+
+func (m *mockRecorder) RecordTokenMint(tenant, result string) {
+}
+
 func setupTestRouter(rec metrics.MetricsRecorder) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	r.Use(metrics.NewMiddleware(rec))
+	r.Use(metrics.NewMiddleware(rec, "test-tenant"))
 	r.GET("/v1/models", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
 	r.POST("/v1/api-keys", func(c *gin.Context) { c.String(http.StatusCreated, "created") })
 	r.GET("/v1/api-keys/:id", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
@@ -96,4 +116,17 @@ func TestMiddlewareUnmatchedRoute(t *testing.T) {
 
 	assert.Len(t, mock.durations, 1)
 	assert.Equal(t, "unmatched", mock.durations[0].route)
+}
+
+func TestMiddlewareRecordsRequest(t *testing.T) {
+	mock := &mockRecorder{}
+	router := setupTestRouter(mock)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/v1/models", nil)
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Len(t, mock.requests, 1)
+	assert.Greater(t, mock.requests[0].duration, time.Duration(0))
 }

@@ -52,49 +52,104 @@ This guide helps you diagnose and resolve common issues with MaaS Platform deplo
       - [ ] Verify Gateway is in `Programmed` state: `kubectl get gateway -n openshift-ingress maas-default-gateway`
       - [ ] Check HTTPRoute configuration and status
 
-7. **Metrics not appearing in dashboards**: Prometheus is not scraping MaaS components.
-      - [ ] Verify User Workload Monitoring is enabled — see [Observability Prerequisites](../advanced-administration/observability.md#user-workload-monitoring)
-      - [ ] Verify Kuadrant observability is enabled — see [Observability Prerequisites](../advanced-administration/observability.md#kuadrant-observability)
-      - [ ] Check prometheus-user-workload pods are running:
+7. **High-concurrency inference returns intermittent `500` or `503` errors**: The RHCL/Kuadrant WASM authentication path may be timing out under burst load.
+      - [ ] Confirm the errors occur during concurrent request scenarios and not for low-volume requests
+      - [ ] Increase `AUTH_SERVICE_TIMEOUT` from the default `200ms` to `2s` through the RHCL operator Subscription configuration. See [High-concurrency authentication timeout](platform-setup.md#high-concurrency-authentication-timeout).
 
-      ```bash
-      kubectl get pods -n openshift-user-workload-monitoring
-      ```
-
-      - [ ] Verify ServiceMonitors/PodMonitors exist:
-
-      ```bash
-      kubectl get servicemonitor,podmonitor -A | grep -E "(maas|kuadrant|limitador)"
-      ```
-
-8. **Rate limiting metrics missing (authorized_calls, limited_calls)**: Kuadrant observability is not enabled.
-      - [ ] Enable observability on Kuadrant CR:
-
-      ```bash
-      kubectl patch kuadrant kuadrant -n kuadrant-system --type=merge \
-        -p '{"spec":{"observability":{"enable":true}}}'
-      ```
-
-      - [ ] Verify the PodMonitor was created:
-
-      ```bash
-      kubectl get podmonitor -n kuadrant-system
-      ```
-
-9. **RHOAI Dashboard Observability tab returns `503 Service Unavailable`**: The Dashboard cannot reach the Perses backend.
-
-      The error typically appears as `{"statusCode": 503, "code": "FST_REPLY_FROM_SERVICE_UNAVAILABLE", ...}`.
-      This is a Fastify/Dashboard-level error (not a gateway 503) indicating the monitoring stack
-      is not deployed or Perses is not running. The most common causes are missing operators (COO,
-      OpenTelemetry) or DSCI `monitoring.metrics` not being configured.
-
-      See [RHOAI Dashboard Observability Tab](../advanced-administration/observability.md#rhoai-dashboard-observability-tab) for the full prerequisites and verification checklist.
-
-10. **GenAI Studio tab not visible in Dashboard**: Requires `llamastackoperator` set to `Managed` in the DSC and the `genAiStudio` feature flag enabled on `OdhDashboardConfig`.
+8. **GenAI Studio tab not visible in Dashboard**: Requires `llamastackoperator` set to `Managed` in the DSC and the `genAiStudio` feature flag enabled on `OdhDashboardConfig`.
 
       See [OdhDashboardConfig Feature Flags](maas-setup.md#odhdashboardconfig-feature-flags) for setup.
 
-11. **TLS certificate errors (`curl: (60) SSL certificate problem`)**: Your cluster uses self-signed or internal CA certificates that are not in your system trust store. See [TLS Certificate Validation](#tls-certificate-validation) below.
+9. **GatewayClass stuck in `Accepted: Unknown` ("Waiting for controller")**: A conflicting OSSM subscription prevents the `openshift-ingress` operator from managing Gateway API on OCP versions where the ingress operator uses OLM for OSSM management (4.19, 4.20, 4.21 before 4.21.22). On OCP 4.21.22+, 4.22+, the ingress operator uses the Sail Library directly and manual OSSM subscriptions do not cause this conflict.
+
+      On affected versions, the `openshift-ingress` ClusterOperator manages OSSM 3 via OLM and
+      pins it to a version compatible with the cluster. Two scenarios cause this failure:
+
+      - An **OSSM v2.x** subscription (`servicemeshoperator`) blocks OSSM v3 installation —
+        v2 and v3 cannot coexist, and the ingress operator reports `GatewayAPIOSSMConflict`.
+      - A **manually installed OSSM v3** subscription (`servicemeshoperator3`, e.g. from the
+        stable channel via OperatorHub) pins a version the ingress operator cannot manage.
+
+      - [ ] Check for a conflicting OSSM subscription (v2 or v3):
+
+      ```bash
+      kubectl get subscription -A -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name' | grep -i servicemesh
+      ```
+
+      - [ ] Delete the conflicting subscription and its CSV (replace `<namespace>` and `<operator-name>` with the values from the previous step, e.g. `openshift-operators` and `servicemeshoperator3` or `servicemeshoperator`):
+
+      ```bash
+      kubectl delete subscription <operator-name> -n <namespace>
+      kubectl delete csv -n <namespace> -l operators.coreos.com/<operator-name>.<namespace>
+      ```
+
+      - [ ] Wait for the `openshift-ingress` operator to reinstall OSSM at the pinned version:
+
+      ```bash
+      kubectl wait --for=condition=Available clusteroperator/ingress --timeout=300s
+      ```
+
+      - [ ] Do **not** approve the OSSM upgrade InstallPlan that may appear in `openshift-operators` — approving it re-breaks the gateway
+
+      - [ ] Verify the GatewayClass is now accepted (`Accepted` must be `True`):
+
+      ```bash
+      kubectl get gatewayclass openshift-default -o jsonpath='{.metadata.name}{"\t"}{range .status.conditions[?(@.type=="Accepted")]}{.status}{"\t"}{.message}{end}{"\n"}'
+      ```
+
+      See [Install Gateway API Controller](platform-setup.md#install-gateway-api-controller) for the full warning and context.
+
+10. **TLS certificate errors (`curl: (60) SSL certificate problem`)**: Your cluster uses self-signed or internal CA certificates that are not in your system trust store. See [TLS Certificate Validation](#tls-certificate-validation) below.
+
+11. **Cannot create MaaSSubscription or MaaSAuthPolicy (`no endpoints available for service "maas-controller-webhook-service"`)**: The maas-controller pods are not running or not ready.
+
+      MaaS uses admission webhooks to validate resource creation. When the controller is unavailable (pod crash, upgrade, or scaled to 0), the webhook endpoint becomes unreachable and creates are rejected.
+
+      - [ ] Check controller pod status:
+
+      ```bash
+      kubectl get pods -n models-as-a-service -l control-plane=maas-controller
+      ```
+
+      - [ ] Check webhook service endpoints:
+
+      ```bash
+      kubectl get endpoints maas-controller-webhook-service -n models-as-a-service
+      ```
+
+      - [ ] Check controller logs for errors:
+
+      ```bash
+      kubectl logs -n models-as-a-service deployment/maas-controller
+      ```
+
+      Creates succeed once controller pods are healthy. Model inference requests are unaffected during controller downtime (data plane continues operating normally).
+
+12. **Cannot create `AITenant` (`must be created in the configured AITenant infrastructure namespace`)**: The object is being created outside the namespace configured by `--aitenant-namespace` (default `ai-tenants`).
+
+      - [ ] Check which namespace the controller is configured to accept:
+
+      ```bash
+      kubectl get deployment maas-controller -n opendatahub -o jsonpath='{.spec.template.spec.containers[0].args}'
+      ```
+
+      - [ ] Create the `AITenant` in that namespace instead of the target tenant namespace:
+
+      ```bash
+      kubectl get namespace ai-tenants
+      ```
+
+      - [ ] If the error is `no endpoints available for service "maas-controller-webhook-service"`, follow the same webhook health checks as issue 11 above.
+
+13. <a id="16-management-endpoints-return-auth_failure-on-rhcl-v140"></a>**Management endpoints return `AUTH_FAILURE` on RHCL v1.4.0**: All management endpoints (`/v1/models`, `/v1/subscriptions`, `/v1/api-keys`) return `AUTH_FAILURE` while inference endpoints work. RHCL v1.4.0 contains a Wasm shim bug that prevents auth calls from reaching Authorino. Upstream Kuadrant (ODH) is not affected.
+
+      - [ ] Confirm you are on RHCL v1.4.0:
+
+      ```bash
+      kubectl get subscription -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,VERSION:.status.currentCSV' | grep -i rhcl
+      ```
+
+      - [ ] Upgrade RHCL to v1.4.1 or later
 
 ## Conflicting AuthPolicy Detection
 
@@ -211,5 +266,5 @@ For detailed TLS configuration options, see [TLS Configuration](../configuration
 ## Additional Resources
 
 - [Validation Guide](validation.md) — Manual validation steps
-- [Observability Guide](../advanced-administration/observability.md) — Metrics, monitoring, and dashboards
+- [Observability Guide](../observability/index.md) — Metrics, monitoring, and dashboards
 - [scripts/README.md](https://github.com/opendatahub-io/models-as-a-service/blob/main/scripts/README.md) — Deployment scripts documentation

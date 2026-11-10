@@ -87,12 +87,27 @@ Enables Authorino to make HTTPS calls to `maas-api` for API key validation and m
 # Configure SSL environment variables for outbound HTTPS
 # Note: The Authorino CR doesn't support envVars, so we patch the deployment directly
 kubectl -n kuadrant-system set env deployment/authorino \
-  SSL_CERT_FILE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt \
-  REQUESTS_CA_BUNDLE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt
+  SSL_CERT_FILE=/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt \
+  REQUESTS_CA_BUNDLE=/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
 ```
 
 !!! note
-    OpenShift's service-ca-operator automatically populates the ConfigMap with the cluster CA certificate.
+    OpenShift projects the `openshift-service-ca.crt` ConfigMap, which service-ca-operator
+    populates with the service CA bundle, into every pod's service account volume at
+    `/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt`. This is the bundle that
+    signs the `maas-api` serving certificate, and it requires no extra volume mount on the
+    Authorino deployment — which matters because authorino-operator manages that deployment
+    and reverts volumes added to it.
+
+    Verify the file is actually present in the pod rather than relying on the absence of
+    errors. Authorino is written in Go, and Go's `crypto/x509` ignores an unreadable
+    `SSL_CERT_FILE` and falls back to the system trust store, so a path that does not exist
+    produces no certificate errors in the logs while never trusting the service CA:
+
+    ```bash
+    kubectl -n kuadrant-system exec deploy/authorino -- \
+      ls -l /var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
+    ```
 
 ### Gateway → maas-api TLS (DestinationRule)
 
@@ -106,6 +121,40 @@ Client → Gateway (TLS termination) → [DestinationRule] → maas-api:8443 (TL
 
 !!! info "Future consideration"
     Once Gateway API v1.4+ with BackendTLSPolicy is supported by the Istio Gateway provider, the DestinationRule can be replaced with a standard Gateway API resource.
+
+## ExternalModel TLS Origination
+
+By default, the ExternalModel reconciler enables TLS origination for external provider endpoints. The Istio sidecar performs the TLS handshake with the provider, and a DestinationRule with `tls.mode: SIMPLE` is created.
+
+To disable TLS origination for an ExternalModel (e.g., for internal non-TLS endpoints), set the `maas.opendatahub.io/tls` annotation to `"false"`:
+
+!!! warning "Cleartext credential traffic"
+    Disabling TLS while `credentialRef` is set means the provider API key is sent in cleartext between the gateway and the endpoint. Only disable TLS on a trusted, isolated network where credential exposure is not a concern.
+
+```yaml
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: ExternalModel
+metadata:
+  name: internal-vllm
+  namespace: llm
+  annotations:
+    maas.opendatahub.io/tls: "false"
+    maas.opendatahub.io/port: "8000"
+spec:
+  provider: openai
+  endpoint: vllm.internal.example.com
+  targetModel: my-model
+  credentialRef:
+    name: vllm-api-key
+```
+
+When TLS is disabled:
+
+- The ServiceEntry protocol changes from HTTPS to HTTP
+- No DestinationRule is created; any existing controller-managed DestinationRule is deleted. DestinationRules annotated with `opendatahub.io/managed: "false"` are preserved.
+- The default port remains 443 unless overridden with `maas.opendatahub.io/port` (valid range: 1–65535)
+
+For full annotation details, see the [ExternalModel CRD Reference](../reference/crds/external-model.md#annotations).
 
 ## Custom maas-api TLS Configuration
 
@@ -131,7 +180,7 @@ Pre-configured overlays are available for common scenarios:
 | Overlay | Description |
 |---------|-------------|
 | `deployment/base/maas-api/overlays/tls` | Base TLS overlay for maas-api (deployment patch, service annotation, DestinationRule) |
-| `maas-api/deploy/overlays/odh` | Tenant reconciler overlay (TLS, gateway policies, shared-patches) |
+| `maas-api/deploy/overlays/odh` | Tenant reconciler overlay (TLS, gateway policies) |
 
 The `tls` base overlay includes:
 
@@ -143,7 +192,8 @@ The `tls` base overlay includes:
 
 maas-api is deployed by the Tenant reconciler in `maas-controller`. The `deploy.sh` script
 installs prerequisites (policy engine, PostgreSQL, Authorino TLS) and then deploys
-`maas-controller`, which creates the `default-tenant` CR and reconciles maas-api via SSA.
+`maas-controller`, which creates `AITenant/models-as-a-service`; that AITenant creates or
+adopts `MaasTenantConfig/default-tenant`, and maas-api is reconciled via SSA.
 
 To verify that the overlay builds correctly:
 
@@ -154,4 +204,3 @@ kustomize build deployment/base/maas-api/overlays/tls
 ## Verifying TLS Configuration
 
 For TLS verification commands, see [Validation Guide - TLS Verification](../install/validation.md#tls-verification).
-

@@ -10,6 +10,7 @@ This guide covers what tests exist in the MaaS project, how to run them, and how
 | **Unit tests** | `maas-controller/pkg/` | Go | `make test` |
 | **E2E tests** | `test/e2e/tests/` | Python (pytest) | `run-tests-quick.sh`, `smoke.sh` |
 | **CI smoke / E2E** | `test/e2e/scripts/prow_run_smoke_test.sh` | Bash + pytest | Konflux integration |
+| **Integration tests** | `test/integration/postgres.sh` | Bash | See [Integration Tests (PostgreSQL)](#integration-tests-postgresql) |
 | **Integration tests** | [opendatahub-tests](https://github.com/opendatahub-io/opendatahub-tests) | Python (pytest) | ODH CI / Nightly |
 
 ### Repository Structure (Testing)
@@ -34,25 +35,59 @@ test/e2e/
 └── requirements.txt             # Python dependencies
 ```
 
-### E2E Test Modules
+### E2E Test Modules and Groups
 
-| Module | What it covers |
-|--------|---------------|
-| `test_smoke.py` | Health checks, catalog shape, basic inference |
-| `test_api_keys.py` | API key CRUD, admin authorization, validation |
-| `test_subscription.py` | Subscription enforcement, rate limiting, auth flows |
-| `test_subscription_list_endpoints.py` | Subscription listing endpoints |
-| `test_models_endpoint.py` | `/v1/models` subscription-aware filtering |
-| `test_namespace_scoping.py` | Namespace isolation behavior |
-| `test_external_oidc.py` | External OIDC token flows (skipped unless `EXTERNAL_OIDC=true`) |
+Tests are organized into **xdist groups** for parallel execution. All tests in a group run on the same pytest-xdist worker, and a worker takes the next queued group when it finishes one. See [Parallel E2E](#parallel-e2e-pytest-xdist) for details on how groups work.
+
+### Smoke subset (`@pytest.mark.smoke`)
+
+`/group-test` sets **`E2E_SMOKE_ONLY=true`** (via `.tekton/maas-group-test.yaml` podTemplate env), so PR passes 1–2 only collect tests marked `smoke`. That subset prioritizes basic API/gateway coverage, a light cross-slice of tenant/security/network checks, and the AGC external-model happy paths (default-tenant implicit attachment + user-namespace `gatewayRefs` serving). Heavier multi-tenant lifecycle, shared-model/conflict/lifecycle external-model suites, and serial mutators stay off the smoke path. `prow_run_smoke_test.sh` defaults to the **full suite** when the env var is unset, so nightly and other callers still cover tests marked neither `smoke` nor `nightly`.
+
+- Local smoke subset: `./test/e2e/scripts/run_e2e_tests.sh --smoke-only` (or `E2E_SMOKE_ONLY=true`)
+- Add new PR-critical coverage by marking individual tests/classes/modules with `@pytest.mark.smoke` (prefer read-only or shared-fixture paths over new AuthPolicy/AITenant churn)
+
+| Group | Module | What it covers |
+|-------|--------|---------------|
+| `readonly` | `test_smoke.py` | Health checks, catalog shape, basic inference |
+| `readonly` | `test_config_tenant.py` | Read-only Config CR validation |
+| `readonly` | `test_tenant.py` | Read-only MaasTenantConfig validation |
+| `readonly` | `test_tenant_discovery.py` | Read-only /v1/tenants endpoint checks |
+| `readonly` | `test_networkpolicy.py` | NetworkPolicy + connectivity checks |
+| `readonly` | `test_gateway_filter_chain.py` | Gateway filter order (ipp-pre -> auth -> ipp -> endpoint picker); its InferencePool traffic test is `serial` |
+| `api_keys` | `test_api_keys.py` | API key CRUD, admin authorization, validation |
+| `api_keys` | `test_subscription.py` | Subscription enforcement, rate limiting, auth flows |
+| `api_keys` | `test_subscription_list_endpoints.py` | Subscription listing endpoints |
+| `api_keys` | `test_x_api_key_auth.py` | X-API-Key header authentication (IPP ExternalModel) |
+| `models` | `test_models_endpoint.py` | `/v1/models` subscription-aware filtering |
+| `models` | `test_gateway_scoped_authpolicy.py` | Gateway AuthPolicy structure, lifecycle, enforcement gaps |
+| `models` | `test_model_identity_conflict.py` | MaaSModelRef model-identity collision detection |
+| `models` | `test_multi_tenant_integration.py` | Full lifecycle, two-tenant coexistence (placed here to even out pass 1) |
+| `security` | `test_negative_security.py` | Header spoofing, expired keys, cross-model access |
+| `security` | `test_namespace_scoping.py` | Namespace isolation behavior |
+| `mt_lifecycle` | `test_aitenant_lifecycle.py` | AITenant create/migrate/delete |
+| `mt_lifecycle` | `test_multi_tenant_maas_api.py` | Per-tenant Deployment, Service, HTTPRoute; dual-listener AuthConfig/wasm checks are `@pytest.mark.serial` |
+| `mt_lifecycle` | `test_tenant_namespace_discovery.py` | Namespace-label discovery, webhook validation |
+| `mt_lifecycle` | `test_crd_watch_resilience.py` | Dynamic CRD watch registration (restarts controller) |
+| `tenant_isolation` | `test_tenant_auth_isolation.py` | Cross-tenant key rejection, OIDC scoping |
+| `tenant_isolation` | `test_tenant_rate_limit_isolation.py` | Per-tenant rate limit independence |
+| `tenant_isolation` | `test_tenant_subscription_isolation.py` | Per-tenant subscription scoping |
+| `tenant_isolation` | `test_tenant_discovery_isolation.py` | Per-tenant /v1/tenants isolation |
+| `tenant_inference` | `test_tenant_model_inference.py` | Cross-gateway auth isolation and per-Gateway AuthPolicy EnvoyFilter selectors |
+| `tenant_ipp` | `test_per_tenant_ipp_isolation.py` | Per-tenant IPP stacks, routing isolation |
+| `tenant_auto_resolve` | `test_tenant_auto_resolve.py` | MaaSModelRef tenant auto-resolution from the gateway parentRef |
+| `tenant_ipp` | `test_tenant_external_model_attachment.py` | Multi-tenant AGC/Praxis external models: user-ns models on tenant gateways, lifecycle cleanup, `NotAllowedByListeners` |
+| `tenant_ipp` | `test_tenant_external_model_shared.py` | Multi-tenant AGC/Praxis external models: shared model on two gateways, auth/quota isolation |
+| `tenant_ipp` | `test_tenant_external_model_conflicts.py` | Multi-tenant AGC/Praxis external models: modelName conflicts, same-named objects (overlay collision regression) |
+| `tenant_ipp` | `test_tenant_external_model_compat.py` | Multi-tenant AGC/Praxis external models: omitted-gatewayRefs compatibility; legacy IPP coexistence (`serial`, gated on `TENANT_EXTERNAL_MODEL_LEGACY_IPP_E2E`) |
+| `tenant_ipp` | `test_tenant_external_model_crossns.py` | ReferenceGrant-gated cross-namespace providers (P1; gated on `TENANT_EXTERNAL_MODEL_CROSSNS_E2E`) |
+| `tenant_ipp` | `test_tenant_external_model_default_tenant.py` | AGC/Praxis: models without `gatewayRefs` outside tenant namespaces served through the default tenant's Gateway (3.5 compatibility), `gatewayRefs` transition, deletion cleanup |
+| `inference_priority` | `test_inference_priority.py` | Subscription `inferencePriority`: InferenceObjective lifecycle, `flowControlStatuses`, gateway flow-control headers (`serial`; skips without the `inferenceobjectives.llm-d.ai` CRD) |
+| `external` | `test_external_oidc.py` | External OIDC token flows (skipped unless `EXTERNAL_OIDC=true`) |
+| `external` | `test_external_models.py` | ExternalModel/ExternalProvider, egress, body routing |
+
+The `test_tenant_external_model_*` modules share the `tenant_ipp` group for now: the legacy IPP controllers do not yet skip ExternalModels with gatewayRefs (upstream image pin pending), so without the guard they adopt this suite's models and flap `status.httpRouteName` when the groups run concurrently. Split them back into their own `tenant_external_model` group once the guard ships.
 
 ## Running Tests
-
-!!! tip "Development images"
-    By default, `deploy.sh` uses `:odh-stable` images from the `odh` overlay. To deploy with `:latest` images (built from `main`), pass `--dev`:
-    ```bash
-    ./scripts/deploy.sh --dev
-    ```
 
 ### Unit Tests (Go)
 
@@ -74,10 +109,34 @@ test/e2e/
 
 Both generate a `coverage.html` report in their respective directories.
 
+### Integration Tests (PostgreSQL)
+
+Integration tests for `maas-api` verify JSONB storage, GIN index queries, and NULL handling against a real PostgreSQL database.
+
+**Integration tests skip protection:**
+
+Note: `TestPostgres` is compiled with the other unit tests. To avoid the postgresql integration tests running during unit testing with `make test` the following must be true for the postgresql tests to be included in `make test`.
+
+- Build tag check (requires `-tags=integration`)
+- `testing.Short()` check (skipped in short mode)
+- Environment variable check (skips if `TEST_DATABASE_URL` not set)
+
+`TEST_READ_DATABASE_URL` is optional. When it is not set, read-pool integration tests use
+`TEST_DATABASE_URL` for both independent pools, which validates routing and fallback with
+the real PostgreSQL driver. Set it to a real read-replica URL to exercise the deployed
+database topology.
+
+```bash
+./test/integration/postgresql.sh
+if [ $? -eq 0 ]; then 
+  echo "Integration tests passed" 
+fi
+```
+
 ### E2E Tests (Python)
 
 !!! note "Prerequisites"
-    OpenShift cluster with MaaS deployed, `oc` logged in as cluster-admin, Python 3.9+.
+    OpenShift cluster with MaaS deployed, `oc` logged in as cluster-admin, Python 3.10+ (3.11 recommended; pytest 9).
 
 === "Quick (local dev)"
 
@@ -116,9 +175,11 @@ Both generate a `coverage.html` report in their respective directories.
     export GATEWAY_HOST="maas.apps.your-cluster.example.com"
     export E2E_SKIP_TLS_VERIFY=true
 
-    pytest tests/ -v                                    # all tests
-    pytest tests/test_subscription.py -v                # one module
-    pytest tests/test_api_keys.py::TestAPIKeyCreation -v  # one class
+    # Mixed-marker modules need separate passes (or use run_e2e_tests.sh for the full suite).
+    pytest tests/ -m "not serial" -v
+    pytest tests/ -m serial -v
+    pytest tests/test_subscription.py -m "not serial" -v
+    pytest tests/test_api_keys.py::TestAPIKeyCRUD -m "not serial" -v
     ```
 
 ### Key Environment Variables
@@ -133,9 +194,81 @@ The E2E framework auto-discovers most values from the cluster. These are the mos
 | `ADMIN_OC_TOKEN` | Admin token; admin tests skip if unset |
 | `E2E_SKIP_TLS_VERIFY` | Set `true` to skip TLS verification |
 | `MODEL_NAME` | Override model ID (defaults to first from catalog) |
+| `E2E_MODEL_PATH` | Override the model route path used by inference tests (for example, `/llm/facebook-opt-125m-simulated`; omit `/v1`) |
 | `EXTERNAL_OIDC` | Set `true` to enable external OIDC tests |
+| `E2E_PARALLEL_WORKERS` | pytest-xdist worker count for pass 1 (default `5`). Set to `1` for single-worker pass 1 without xdist; pass 2 stays serial. |
+| `LLMISVC_CONTROLLER_CPU_REQUEST` / `LLMISVC_CONTROLLER_CPU_LIMIT` | CPU that `deploy-platform.sh` gives `llmisvc-controller-manager` on the test cluster (defaults `1` / `2`; shipped is 100m). Set the limit empty to keep the shipped resources. |
 
 See `test/e2e/tests/conftest.py` and individual test module docstrings for the full set of supported variables.
+
+The governed chat/completions smoke regressions are covered by
+`tests/test_smoke.py::test_chat_completions_gateway_alive` (non-streaming body
+content) and `tests/test_smoke.py::test_chat_completions_streaming_sse`
+(`text/event-stream`, JSON `data:` chunks, `data: [DONE]`). Both use the
+governed `facebook-opt-125m-simulated` LLMInferenceService and MaaSModelRef
+deployed by `scripts/deploy-models.sh`, plus the `simulator-subscription` API key
+created by the `api_key_headers` fixture. `MODEL_NAME` selects the route/catalog
+model, while `E2E_MODEL_NAME` sets the ID sent in the inference request body
+(default `facebook/opt-125m`). The full CI runner sets `GATEWAY_HOST` and
+`MODEL_NAME`; for a local run, set `GATEWAY_HOST` to the gateway hostname and
+`MODEL_NAME` to the catalog model ID. Set `E2E_MODEL_PATH` when the catalog URL
+does not identify the model route. SSE parsing is centralized in
+`test_helper.assert_openai_sse_chat_stream`.
+
+### Parallel E2E (pytest-xdist)
+
+`run_e2e_tests.sh` and `run-tests-quick.sh` run **two marker-filtered passes** by default (default `E2E_PARALLEL_WORKERS=5`). Use `--serial-only` to run pass 2 only (`-m serial`); that mode does not execute non-serial tests. Direct `pytest` invocations must use the same split when a module mixes `@serial` and worker-tenant tests.
+
+1. **Pass 1**: `-m "not serial"` — with `--dist=loadgroup -n 5` when workers > 1, or single-worker execution when `E2E_PARALLEL_WORKERS=1`
+2. **Pass 2 (serial)**: `-m serial` — tests that mutate shared cluster state (subscription delete/restore, controller/Kuadrant scaling)
+
+Set `E2E_PARALLEL_WORKERS=1` to disable xdist on pass 1 while keeping the serial/non-serial split (useful for debugging on shared clusters). Pass `./run_e2e_tests.sh --serial-only` only when intentionally limiting the run to serial mutators.
+
+#### xdist Groups
+
+Every test file must have a module-level `xdist_group` marker:
+
+```python
+import pytest
+
+pytestmark = pytest.mark.xdist_group("api_keys")
+```
+
+All tests in a file run on the same xdist worker, grouped with other files sharing the same group name. Tests **without** an `xdist_group` marker are scattered round-robin across workers, which can cause resource conflicts.
+
+#### Group Assignment Rules
+
+When adding a new test file, assign it to a group using these criteria (in priority order):
+
+1. **Mutation scope**: Tests that create, modify, or delete the same CRs (MaaSAuthPolicy, MaaSSubscription, MaaSModelRef, etc.) must be in the same group. This prevents two workers from concurrently mutating the same resource.
+
+2. **Functional domain**: Group tests by what they exercise. API key tests go with `api_keys`, gateway AuthPolicy tests go with `models`, multi-tenant lifecycle tests go with `mt_lifecycle`, etc.
+
+3. **Read-only tests go in `readonly`**: Tests that only read cluster state (no creates, no deletes, no patches) belong in the `readonly` group. This group finishes fast and never conflicts with other groups.
+
+4. **Self-managing tenant tests go in `mt_lifecycle` or a `tenant_*` group**: Tests that create their own AITenant CRs belong in one of these groups. `mt_lifecycle` for lifecycle operations (create/delete/migrate), `tenant_isolation` for cross-tenant isolation assertions using the `shared_test_tenants` fixture. A long isolation module that builds its own tenant pair gets its own group (`tenant_inference`, `tenant_ipp`), so its runtime doesn't add to `tenant_isolation`'s.
+
+5. **Externally-gated tests go in `external`**: Tests that require external infrastructure (Keycloak OIDC, external endpoints) and use `pytest.mark.skipif` to self-gate belong in the `external` group.
+
+6. **Prefer existing groups over new ones**: Adding more groups increases cluster resource pressure. Only create a new group if the test's mutation scope genuinely conflicts with all existing groups. The exception is wall clock: with `--dist=loadgroup` pass 1 cannot finish before its longest group, so split a group whose runtime alone sets the pass length, as long as the parts share no tenants or CRs and make no negative assertions (quiet logs, counters) on components the others touch. Pass 1 has more groups than workers: xdist starts the groups with the most tests first and hands the rest to whichever worker drains first, so a long group with few tests starts late.
+
+#### Serial Marker
+
+Tests that mutate **global** cluster state must be marked `@pytest.mark.serial`:
+
+```python
+@pytest.mark.serial
+def test_delete_shared_subscription_then_restore(self):
+    ...
+```
+
+Serial tests run in Pass 2 on a single worker. Use `@serial` when the test:
+
+- Deletes or modifies a shared fixture (e.g., `simulator-subscription`, `simulator-access`)
+- Scales or restarts a cluster operator (maas-controller, Kuadrant)
+- Modifies a CRD or cluster-scoped resource that other groups depend on
+
+Do **not** use `@serial` for tests that only create/delete their own uniquely-named resources — those are safe to run in parallel within their group.
 
 ## CI Pipeline
 
@@ -158,7 +291,27 @@ graph TB
 | **GitHub Actions** | `maas-controller/api/**` or `deployment/**` changes | `make verify-codegen`, kustomize manifest validation |
 | **Konflux** | Any non-docs PR or push to `main` | Builds multi-arch images, then runs full E2E on an ephemeral OpenShift cluster |
 
-Konflux provisions a fresh cluster, deploys ODH + MaaS with the PR's built images, and runs `test/e2e/scripts/prow_run_smoke_test.sh`. Nightly builds use the same script against the latest `main` images — there is no separate nightly test suite.
+Konflux provisions a fresh cluster, deploys ODH + MaaS with the PR's built images, and runs `test/e2e/scripts/prow_run_smoke_test.sh`. `/group-test` opts into the smoke-marked subset (`E2E_SMOKE_ONLY=true`; see [Smoke subset](#smoke-subset-pytestmarksmoke)). Nightly builds use the same script without that flag (full passes 1–2); extended `@pytest.mark.nightly` coverage still requires `MAAS_PYTEST_INCLUDE_NIGHTLY=true` / OIDC jobs.
+
+### Deploy phase timings and fail-fast
+
+`/group-test` is sequential: cluster provision → **deploy + validate** → pytest. `prow_run_smoke_test.sh` writes UTC start/end stamps for `deploy_platform`, `deploy_models`, `validate`, `pytest_pass1`, and `pytest_pass2` to **`phase-timings.txt`**.
+
+| Where | Path |
+|-------|------|
+| Local | `$PROJECT_ROOT/test/e2e/reports/phase-timings.txt` (or `$ARTIFACT_DIR` / `$ARTIFACTS` / `$LOG_DIR` if set) |
+| Konflux / Prow | `artifacts/<job>/<step>/phase-timings.txt` (OpenShift CI copies `ARTIFACT_DIR`) |
+
+Each line looks like `2026-08-19T20:01:02Z deploy_platform start`. A start without a matching end means that phase failed or the job was killed.
+
+Readiness gates **fail the job before pytest** so a bad DSC, AuthPolicy, or ODH install does not burn another ~40 minutes of pytest:
+
+- DataScienceCluster wait in `prow_run_smoke_test.sh` exits 1 and dumps DSC conditions.
+- After models are applied, AuthPolicy `Enforced=True` is required (`wait_for_auth_policies_enforced` returns 1 on timeout). `SKIP_AUTH_CHECK` still defaults to true **before** models exist (RHOAIENG-48760 chicken-egg).
+- `.github/hack/install-odh.sh` exits 1 if the operator webhook, DSCInitialization, or DataScienceCluster never become Ready.
+- `validate-deployment.sh` retries after polling gateway/pods, not after a fixed 30s sleep.
+
+`SKIP_DEPLOYMENT=true` still skips platform and model install; timings are then recorded only for validate and pytest.
 
 !!! tip "Docs-only changes"
     PRs that only touch `docs/**` or `*.md` files skip Konflux builds and E2E entirely (controlled via CEL expressions in `.tekton/` pipeline definitions).
@@ -206,27 +359,25 @@ func TestMyReconciler_Succeeds(t *testing.T) {
 
 ### Adding an E2E Test
 
-1. **Pick the right module** — add your test to an existing `test_*.py` file if it fits the scope (see the [E2E test modules table](#e2e-test-modules)). Create a new module only if your feature doesn't fit any existing one.
+1. **Pick the right module** — add your test to an existing `test_*.py` file if it fits the scope (see the [E2E test modules table](#e2e-test-modules-and-groups)). Create a new module only if your feature doesn't fit any existing one.
 
-2. **Use shared fixtures** — `conftest.py` provides session-scoped fixtures like `maas_api_base_url`, `headers`, `token`, `admin_headers`, `api_key`, etc. Import `TLS_VERIFY` from `conftest` for HTTP calls.
+2. **Assign an xdist group** — every test file must have a module-level `xdist_group` marker. Follow the [group assignment rules](#group-assignment-rules) to pick the right group. If adding to an existing file, it already has a group.
 
-3. **Add test resources if needed** — if your feature requires new MaaS CRs (models, subscriptions, auth policies), add a kustomize overlay under `test/e2e/fixtures/` and include it in the base `kustomization.yaml`.
+    ```python
+    import pytest
 
-4. **Register new modules in CI** — `prow_run_smoke_test.sh` runs an **explicit file list**. If you create a new test module, add it to the pytest invocation in `run_e2e_tests()`:
-
-    ```bash
-    # In test/e2e/scripts/prow_run_smoke_test.sh
-    pytest \
-        "$test_dir/tests/test_api_keys.py" \
-        "$test_dir/tests/test_namespace_scoping.py" \
-        ...
-        "$test_dir/tests/test_my_new_feature.py"  # ← add here
+    pytestmark = pytest.mark.xdist_group("api_keys")
     ```
 
-    !!! warning
-        `smoke.sh` auto-discovers all files under `tests/`, but `prow_run_smoke_test.sh` does **not**. Your new module will not run in Konflux CI or nightly builds unless you add it to that explicit list.
+3. **Mark serial tests** — if your test mutates shared cluster state (deletes shared fixtures, scales operators), add `@pytest.mark.serial`. See [Serial Marker](#serial-marker) for criteria.
 
-5. **Use skip markers for optional features** — if your test depends on optional infrastructure (e.g., external OIDC), gate it with `pytest.mark.skipif` so the same module runs cleanly in all environments.
+4. **Use shared fixtures** — `conftest.py` provides session-scoped fixtures like `maas_api_base_url`, `headers`, `token`, `admin_headers`, `api_key`, etc. Import `TLS_VERIFY` from `conftest` for HTTP calls.
+
+5. **Add test resources if needed** — if your feature requires new MaaS CRs (models, subscriptions, auth policies), add a kustomize overlay under `test/e2e/fixtures/` and include it in the base `kustomization.yaml`.
+
+6. **Use pytest discovery for CI** — `run_e2e_tests.sh` collects every `test_*.py` module under `test/e2e/tests/`. New modules do not need a separate CI registration step. Give the module an appropriate `xdist_group` marker and mark cluster-wide mutations as `serial`. Mark PR-critical low-churn coverage with `@pytest.mark.smoke` so `/group-test` picks it up (`E2E_SMOKE_ONLY=true`).
+
+7. **Use skip markers for optional features** — if your test depends on optional infrastructure (e.g., external OIDC, IPP ExternalModel CRD), gate it with `pytest.mark.skipif` so the same module runs cleanly in all environments.
 
 ## Integration Testing with ODH Operator
 
@@ -257,12 +408,27 @@ If your change affects how MaaS integrates with the ODH operator or other ODH co
 | End-to-end model serving through the full ODH stack | `opendatahub-tests` repo |
 | Bug fix with regression test | In-repo (unit or E2E depending on scope) |
 
+## Test Ownership Across the AI Gateway Stack (AIGO / AIGC / MaaS)
+
+AI Gateway now spans three repos: [ai-gateway-operator](https://github.com/opendatahub-io/ai-gateway-operator) (AIGO), [ai-gateway-controller](https://github.com/opendatahub-io/ai-gateway-controller) (AIGC), and this repo (MaaS). Where a test belongs depends on what it needs to observe, not which repo you happen to be changing:
+
+| Repo | Owns | What it tests | Test suite |
+|------|------|----------------|------------|
+| **AIGO** | Component setup & dependency management | `AIGateway` CR reconciles to `Ready`; sibling controller Deployments (`maas-controller`, `ai-gateway-controller`, `batch-gateway-operator`) become `Available`; aggregate status (`ModelsAsAServiceReady`, etc.) rolls up correctly. Never the request path. | `test/e2e/*_test.go` (Go — deploy prereqs, create CR, assert status) |
+| **AIGC** | Deploying the Praxis-backed stack + AIGC's own control-plane logic | Its own reconciliation logic (`pkg/tenant`, `pkg/render`, `pkg/controller` for ExternalModel/ExternalProvider) via real fixtures. For MaaS-level/request-path behavior, AIGC does **not** write new test content — it fetches and re-runs **this repo's own pytest suite** against its Praxis-backed deployment, pinned via `test/maas-e2e.lock`, proving the same behavior holds under Praxis as under IPP. | `test/kind-env`, `test/openshift-env` (real fixtures) + a runtime checkout of `test/e2e/tests/` from this repo in `test/maas-e2e/`, fetched at the commit pinned in `test/maas-e2e.lock` |
+| **MaaS** (this repo) | The single source of truth for MaaS-level resource/request behavior | Subscription enforcement, auth policy, rate limiting, API-key lifecycle, and anything visible at the MaaS API/Gateway boundary — including OpenAI resource-API routing and identity-header propagation. Written once here, run twice: in-repo against IPP, and via AIGC's runtime checkout in `test/maas-e2e/` against Praxis. | `test/e2e/tests/*.py` (pytest) |
+
+**The upstream-first rule:** if MaaS-level behavior has a coverage gap that's exposed while working in AIGC or AIGO, add the test to **this repo's** `test/e2e/tests/` first (skip-gated with `pytest.mark.skipif` if the behavior is genuinely Praxis-only, mirroring the existing `EXTERNAL_OIDC` skip pattern — see [Group Assignment Rules](#group-assignment-rules)), then have the downstream repo bump its pin to pick it up. Don't accept a parallel Go/mock test in AIGO, and don't let a bespoke copy accumulate in AIGC. [`ai-gateway-controller#37`](https://github.com/opendatahub-io/ai-gateway-controller/pull/37) is a worked example of this lifecycle: a gap was fixed upstream in MaaS ([#1508](https://github.com/opendatahub-io/models-as-a-service/pull/1508)); once it landed, AIGC removed its own side-workarounds and re-pinned `test/maas-e2e.lock`.
+
 ## Checklist: Adding a New Test
 
 - [ ] **Unit test**: Add `*_test.go` alongside your source in `maas-api/` or `maas-controller/`; run `make test`
 - [ ] **E2E test**: Add to an existing `test_*.py` or create a new module in `test/e2e/tests/`
+- [ ] **xdist group**: Ensure the test file has a `pytestmark = pytest.mark.xdist_group("group_name")` marker (see [group assignment rules](#group-assignment-rules))
+- [ ] **Smoke marker**: Add `@pytest.mark.smoke` only for low-churn PR coverage that should run under `E2E_SMOKE_ONLY` (avoid AuthPolicy/AITenant create/delete storms)
+- [ ] **Serial marker**: Add `@pytest.mark.serial` if the test mutates shared fixtures or scales operators
 - [ ] **Test fixtures**: If new CRs are needed, add a kustomize overlay in `test/e2e/fixtures/`
-- [ ] **CI registration**: Add new E2E modules to the explicit list in `prow_run_smoke_test.sh`
+- [ ] **Pytest discovery**: Confirm the new module follows the `test_*.py` naming convention and is collected with `pytest tests/ --collect-only -q`
 - [ ] **Skip markers**: Use `pytest.mark.skipif` for tests requiring optional infrastructure
 - [ ] **Local validation**: Run `make test` and/or `./test/e2e/run-tests-quick.sh` before pushing
 - [ ] **Integration tests**: If your change affects ODH operator integration, update tests in [opendatahub-tests](https://github.com/opendatahub-io/opendatahub-tests)

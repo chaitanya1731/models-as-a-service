@@ -57,11 +57,15 @@ nav:
     - Migration:
       - Tier to Subscription: migration/tier-to-subscription.md
       - Upgrade to 3.4: migration/upgrade-to-3.4.md
+      - Upgrade to 3.5: migration/upgrade-to-3.5.md
+      - Upgrade to 3.6: migration/upgrade-to-3.6.md
   - Concepts:
     - Architecture: concepts/architecture.md
+    - Multi-Tenancy: concepts/multi-tenancy.md
     - Personas: concepts/personas.md
     - Access and Quota Overview: concepts/subscription-overview.md
     - Model Reference: concepts/model-reference.md
+    - Authentication Modes: concepts/auth-modes.md
     - API Key Authentication: concepts/api-key-authentication.md
     - Model Access Control: concepts/model-access-control.md
   - Install:
@@ -74,12 +78,16 @@ nav:
       - Model Setup: install/model-setup.md
       - External Model Setup (Tech Preview): install/external-model-setup.md
       - Validation: install/validation.md
+      - Multi-Tenant Setup: install/multi-tenant-setup.md
+      - Multi-Tenant Validation: install/multi-tenant-validation.md
       - Troubleshooting: install/troubleshooting.md
   - Administration Guide:
     - Configuration & Management:
       - Quota and Access Configuration: configuration-and-management/quota-and-access-configuration.md
       - API Key Administration: configuration-and-management/api-key-administration.md
+      - Infrastructure Namespace Separation: configuration-and-management/infra-namespace-migration.md
       - Namespace User Permissions (RBAC): configuration-and-management/namespace-rbac.md
+      - Tenant RBAC: configuration-and-management/tenant-rbac.md
       - Troubleshooting ExternalModel RBAC: configuration-and-management/troubleshooting-external-model-rbac.md
       - TLS Configuration: configuration-and-management/tls-configuration.md
       - Gateway Patterns: configuration-and-management/gateway-patterns.md
@@ -87,10 +95,18 @@ nav:
       - Model Setup: configuration-and-management/model-setup.md
       - Model Listing Flow: configuration-and-management/model-listing-flow.md
     - Advanced Administration:
-      - Observability Dashboard: advanced-administration/observability.md
       - Subscription Cardinality: advanced-administration/subscription-cardinality.md
+      - Telemetry Defaults and Cardinality: advanced-administration/telemetry-defaults-and-cardinality.md
       - Limitador Persistence: advanced-administration/limitador-persistence.md
       - Authorino Caching: configuration-and-management/authorino-caching.md
+      - External OIDC: advanced-administration/external-oidc.md
+      - Controller Performance Tuning: advanced-administration/controller-performance-tuning.md
+  - Observability:
+    - Overview: observability/index.md
+    - Setup: observability/setup.md
+    - OTel JSON stdout: observability/otel-json-stdout.md
+    - Metrics & Dashboards: observability/metrics-and-dashboards.md
+    - Operations: observability/operations.md
   - User Guide:
     - API Key Management: user-guide/api-key-management.md
     - Model Discovery: user-guide/model-discovery.md
@@ -110,7 +126,8 @@ nav:
       - ExternalModel: reference/crds/external-model.md
       - MaaSAuthPolicy: reference/crds/maas-auth-policy.md
       - MaaSSubscription: reference/crds/maas-subscription.md
-      - Tenant: reference/crds/tenant.md
+      - AITenant: reference/crds/ai-tenant.md
+      - MaasTenantConfig: reference/crds/tenant.md  # Legacy filename, documents MaasTenantConfig CRD
 
 extra:
   version:

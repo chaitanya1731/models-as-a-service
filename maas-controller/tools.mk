@@ -6,12 +6,26 @@ $(LOCALBIN):
 
 ## Tools
 GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
+OPERATOR_CHAOS ?= $(LOCALBIN)/operator-chaos
 
-GOLANGCI_LINT_VERSION ?= v2.6.2
+GOLANGCI_LINT_VERSION ?= v2.12.2
+OPERATOR_CHAOS_VERSION ?= ec5cd239b770735cab3028d3594385950b51e327
 # Target the versioned binary so version bumps trigger reinstall
 $(GOLANGCI_LINT)-$(GOLANGCI_LINT_VERSION): $(LOCALBIN)
 	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
 $(GOLANGCI_LINT): $(GOLANGCI_LINT)-$(GOLANGCI_LINT_VERSION)
+
+$(OPERATOR_CHAOS)-$(OPERATOR_CHAOS_VERSION): $(LOCALBIN)
+	$(call go-install-tool,$(OPERATOR_CHAOS),github.com/opendatahub-io/operator-chaos/cmd/operator-chaos,$(OPERATOR_CHAOS_VERSION))
+$(OPERATOR_CHAOS): $(OPERATOR_CHAOS)-$(OPERATOR_CHAOS_VERSION)
+
+# envtest follows the controller-runtime and k8s.io/api versions in go.mod, honouring replace.
+SETUP_ENVTEST ?= $(LOCALBIN)/setup-envtest
+ENVTEST_VERSION ?= $(shell go list -m -f "{{ if .Replace }}{{ .Replace.Version }}{{ else }}{{ .Version }}{{ end }}" sigs.k8s.io/controller-runtime | awk -F'[v.]' '{printf "release-%d.%d", $$2, $$3}')
+ENVTEST_K8S_VERSION ?= $(shell go list -m -f "{{ if .Replace }}{{ .Replace.Version }}{{ else }}{{ .Version }}{{ end }}" k8s.io/api | awk -F'[v.]' '{printf "1.%d", $$3}')
+$(SETUP_ENVTEST)-$(ENVTEST_VERSION): $(LOCALBIN)
+	$(call go-install-tool,$(SETUP_ENVTEST),sigs.k8s.io/controller-runtime/tools/setup-envtest,$(ENVTEST_VERSION))
+$(SETUP_ENVTEST): $(SETUP_ENVTEST)-$(ENVTEST_VERSION)
 
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary (ideally with version)

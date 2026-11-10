@@ -1,0 +1,288 @@
+package gateway
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+
+	"github.com/opendatahub-io/models-as-a-service/maas-discovery/internal/types"
+)
+
+const (
+	protocolHTTPS = "HTTPS"
+	protocolTLS   = "TLS"
+	protocolHTTP  = "HTTP"
+	schemeHTTPS   = "https"
+	schemeHTTP    = "http"
+)
+
+// RouteHostInfo stores externally reachable Route endpoint metadata for a
+// Gateway Service backend.
+type RouteHostInfo struct {
+	Host   string
+	Scheme string
+	Port   int64
+}
+
+// ExtractMetadata extracts connection metadata from a Gateway's unstructured object map.
+// On success it returns a fully populated GatewayMetadata. If the gateway is missing
+// status, listeners, or an external hostname, it returns an error. Callers should
+// degrade gracefully by keeping name/namespace and omitting externalUrl.
+func ExtractMetadata(gateway map[string]any, name, namespace string, routeHosts ...map[string]RouteHostInfo) (*types.GatewayMetadata, error) {
+	spec, ok := gateway["spec"].(map[string]any)
+	if !ok {
+		return nil, errors.New("gateway spec not found")
+	}
+
+	status, ok := gateway["status"].(map[string]any)
+	if !ok {
+		return nil, errors.New("gateway status not found")
+	}
+
+	specListenersRaw, ok := spec["listeners"].([]any)
+	if !ok || len(specListenersRaw) == 0 {
+		return nil, errors.New("gateway has no listeners in spec")
+	}
+
+	statusListenersRaw, ok := status["listeners"].([]any)
+	if !ok || len(statusListenersRaw) == 0 {
+		return nil, errors.New("gateway has no listeners in status")
+	}
+
+	statusListenersByName := make(map[string]map[string]any)
+	for _, l := range statusListenersRaw {
+		if statusListener, ok := l.(map[string]any); ok {
+			if n, ok := statusListener["name"].(string); ok {
+				statusListenersByName[n] = statusListener
+			}
+		}
+	}
+
+	port, protocol, hostname, found := selectBestListener(specListenersRaw, statusListenersByName)
+	if !found {
+		return nil, errors.New("no ready listeners found on gateway")
+	}
+
+	externalHost := hostname
+	if externalHost == "" {
+		if addresses, ok := status["addresses"].([]any); ok && len(addresses) > 0 {
+			if addr, ok := addresses[0].(map[string]any); ok {
+				if value, ok := addr["value"].(string); ok {
+					externalHost = value
+				}
+			}
+		}
+	}
+
+	if externalHost == "" {
+		return nil, errors.New("could not determine external hostname from gateway")
+	}
+
+	if strings.HasSuffix(externalHost, ".svc.cluster.local") {
+		svcName, _, _ := strings.Cut(externalHost, ".")
+		effectiveScheme, effectivePort := listenerSchemeAndPort(protocol, port)
+		for _, rh := range routeHosts {
+			if routeInfo, ok := rh[svcName]; ok {
+				externalHost = routeInfo.Host
+				if routeInfo.Scheme != "" {
+					effectiveScheme = routeInfo.Scheme
+				}
+				if routeInfo.Port != 0 {
+					effectivePort = routeInfo.Port
+				}
+				scheme := effectiveScheme
+				externalURL := fmt.Sprintf("%s://%s", scheme, externalHost)
+				if (scheme == schemeHTTPS && effectivePort != 443) || (scheme == schemeHTTP && effectivePort != 80) {
+					externalURL = fmt.Sprintf("%s:%d", externalURL, effectivePort)
+				}
+
+				return &types.GatewayMetadata{
+					Name:        name,
+					Namespace:   namespace,
+					Protocol:    scheme,
+					ExternalURL: externalURL,
+					Port:        effectivePort,
+				}, nil
+			}
+		}
+		return nil, fmt.Errorf("gateway %s/%s has internal service name %s instead of external hostname",
+			namespace, name, externalHost)
+	}
+
+	scheme, effectivePort := listenerSchemeAndPort(protocol, port)
+
+	externalURL := fmt.Sprintf("%s://%s", scheme, externalHost)
+	if (scheme == schemeHTTPS && effectivePort != 443) || (scheme == schemeHTTP && effectivePort != 80) {
+		externalURL = fmt.Sprintf("%s:%d", externalURL, effectivePort)
+	}
+
+	return &types.GatewayMetadata{
+		Name:        name,
+		Namespace:   namespace,
+		Protocol:    scheme,
+		ExternalURL: externalURL,
+		Port:        effectivePort,
+	}, nil
+}
+
+// BuildRouteHostMap builds a map from Kubernetes Service name to admitted external
+// Route endpoint metadata. Returns an empty map if no routes are provided.
+func BuildRouteHostMap(routes []unstructured.Unstructured) map[string]RouteHostInfo {
+	m := make(map[string]RouteHostInfo, len(routes))
+	for i := range routes {
+		if !routeAdmitted(routes[i].Object) {
+			continue
+		}
+
+		spec, ok := routes[i].Object["spec"].(map[string]any)
+		if !ok {
+			continue
+		}
+		host, _ := spec["host"].(string)
+		if host == "" {
+			continue
+		}
+		to, ok := spec["to"].(map[string]any)
+		if !ok {
+			continue
+		}
+		svcName, _ := to["name"].(string)
+		if svcName == "" {
+			continue
+		}
+
+		scheme := schemeHTTP
+		port := int64(80)
+		if routeUsesTLS(spec) {
+			scheme = schemeHTTPS
+			port = 443
+		}
+
+		existing, found := m[svcName]
+		if found && existing.Scheme == schemeHTTPS {
+			continue
+		}
+
+		m[svcName] = RouteHostInfo{Host: host, Scheme: scheme, Port: port}
+	}
+	return m
+}
+
+func listenerSchemeAndPort(listenerProtocol string, listenerPort int64) (string, int64) {
+	scheme := schemeHTTPS
+	if listenerProtocol == protocolHTTP {
+		scheme = schemeHTTP
+	}
+	return scheme, listenerPort
+}
+
+func routeUsesTLS(routeSpec map[string]any) bool {
+	_, ok := routeSpec["tls"].(map[string]any)
+	return ok
+}
+
+func routeAdmitted(route map[string]any) bool {
+	status, ok := route["status"].(map[string]any)
+	if !ok {
+		return false
+	}
+	ingresses, ok := status["ingress"].([]any)
+	if !ok {
+		return false
+	}
+
+	for _, ingress := range ingresses {
+		ingressMap, ok := ingress.(map[string]any)
+		if !ok {
+			continue
+		}
+		conditions, ok := ingressMap["conditions"].([]any)
+		if !ok {
+			continue
+		}
+		for _, cond := range conditions {
+			condMap, ok := cond.(map[string]any)
+			if !ok {
+				continue
+			}
+			typeVal, _ := condMap["type"].(string)
+			statusVal, _ := condMap["status"].(string)
+			if typeVal == "Admitted" && statusVal == "True" {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// selectBestListener picks the best ready listener from a Gateway spec.
+// Prefers HTTPS/TLS over HTTP to avoid redirect-induced POST→GET conversion.
+// Returns found=false when no listener with attachedRoutes > 0 exists.
+func selectBestListener(specListeners []any, statusByName map[string]map[string]any) (int64, string, string, bool) {
+	var foundHTTP bool
+	var httpPort int64
+	var httpHostname string
+
+	for _, l := range specListeners {
+		specListener, ok := l.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		listenerName, _ := specListener["name"].(string)
+		statusListener, hasStatus := statusByName[listenerName]
+		if !hasStatus {
+			continue
+		}
+
+		attachedRoutes := toInt64(statusListener["attachedRoutes"])
+		if attachedRoutes == 0 {
+			continue
+		}
+
+		listenerProtocol := protocolHTTPS
+		if protocolVal, ok := specListener["protocol"].(string); ok {
+			listenerProtocol = protocolVal
+		}
+		listenerPort := int64(443)
+		if p := toInt64(specListener["port"]); p != 0 {
+			listenerPort = p
+		}
+		listenerHostname, _ := specListener["hostname"].(string)
+
+		if listenerProtocol == protocolHTTPS || listenerProtocol == protocolTLS {
+			return listenerPort, listenerProtocol, listenerHostname, true
+		}
+
+		if listenerProtocol == protocolHTTP && !foundHTTP {
+			foundHTTP = true
+			httpPort = listenerPort
+			httpHostname = listenerHostname
+		}
+	}
+
+	if foundHTTP {
+		return httpPort, protocolHTTP, httpHostname, true
+	}
+	return 0, "", "", false
+}
+
+// toInt64 converts an interface value to int64, handling both int64 and float64
+// (JSON unmarshal to interface{} uses float64, while the unstructured converter uses int64).
+func toInt64(v any) int64 {
+	switch n := v.(type) {
+	case int64:
+		return n
+	case float64:
+		return int64(n)
+	case int32:
+		return int64(n)
+	case int:
+		return int64(n)
+	default:
+		return 0
+	}
+}

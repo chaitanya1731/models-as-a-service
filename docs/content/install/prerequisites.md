@@ -13,9 +13,26 @@ Red Hat OpenShift AI (RHOAI). MaaS is installed by enabling it in the DataScienc
 | v0.0.2       | 4.19.9+ | v1.3+ / v1.2+             | v1.2+       |
 | v0.1.0+      | 4.19.9+ | v1.4.2+ / v1.3            | v1.2+       |
 
+!!! warning "RHCL v1.4.0 — silent auth bypass"
+    RHCL v1.4.0 contains a Wasm shim bug that silently bypasses gateway authentication.
+    Management endpoints return `AUTH_FAILURE`; inference endpoints work but are
+    unauthenticated. Upgrade to **RHCL v1.4.1+**. See
+    [Troubleshooting #16](troubleshooting.md#16-management-endpoints-return-auth_failure-on-rhcl-v140)
+    for diagnosis.
+
+!!! warning "RHOAI 3.6 — use RHCL v1.5"
+    For RHOAI 3.6, use **RHCL v1.5.0+** (OLM channel `stable-1.5`). On RHCL 1.4.x,
+    including the 1.4.3 that the default `stable` channel installs, a provider error
+    response without token usage can hang for a caller with two or more
+    MaaSSubscriptions while a TokenRateLimitPolicy is active
+    ([Kuadrant/wasm-shim#425](https://github.com/Kuadrant/wasm-shim/issues/425)).
+    The 1.4 backport is not merged, and `stable-1.4` (1.4.4) is not a confirmed fix.
+    When upgrading, switch the RHCL Subscription channel to `stable-1.5`.
+
 !!! note "Other Kubernetes flavors"
     Other Kubernetes flavors (e.g., upstream Kubernetes, other distributions) are currently being validated.
 
+For the mapping between RHOAI product versions and MaaS releases, see [RHOAI to MaaS Release Mapping](../release-notes/index.md#rhoai-to-maas-release-mapping).
 
 
 ## Required Tools
@@ -42,22 +59,93 @@ component enabled (KServe) and properly configured for deploying models with
 
 A specific requirement for MaaS v0.1.0+ is to set up RHOAI Model Serving with Red Hat Connectivity Link (RHCL) v1.3 or later.
 
-## Optional: Observability Prerequisites
+## Observability Prerequisites (Recommended)
 
-If you plan to use MaaS dashboards, showback, or usage metrics, additional platform configuration is required:
+If you plan to use MaaS dashboards, showback, or usage metrics, the ODH monitoring stack needs to be enabled in the [Platform Operator](../install/platform-setup.md#install-platform-operator).
 
-- **User Workload Monitoring** — Required for Prometheus to scrape metrics from MaaS components
-- **Kuadrant Observability** — Required for rate-limiting and usage metrics (e.g., `authorized_calls`, `limited_calls`)
+To enable the ODH monitoring stack, you need to configure DSCI `monitoring.metrics`. For example:
 
-See [Observability Prerequisites](../advanced-administration/observability.md#prerequisites) for detailed configuration steps.
+```shell
+kubectl apply -f - <<EOF
+apiVersion: dscinitialization.opendatahub.io/v2
+kind: DSCInitialization
+metadata:
+    name: default-dsci
+spec:
+    applicationsNamespace: opendatahub
+    monitoring:
+        managementState: Managed
+        namespace: opendatahub
+        metrics:
+            storage:
+                size: 90Gi
+    trustedCABundle:
+        managementState: Managed
+EOF
+```
 
-### RHOAI Dashboard Observability Tab
+Note that enabling the ODH monitoring stack also requires to install the Cluster Observability Operator and OpenTelemetry Operator.
 
-To enable the **Observability** tab in the RHOAI Dashboard (Perses-based dashboards), you need the
-Cluster Observability Operator, OpenTelemetry Operator, DSCI monitoring configuration, and a
-Dashboard feature flag. See [RHOAI Dashboard Observability Tab](../advanced-administration/observability.md#rhoai-dashboard-observability-tab) for the full setup and verification steps.
+See [Managing observability (RHOAI 3.4)](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/html/managing_openshift_ai/managing-observability_managing-rhoai).
 
-### GenAI Studio
+### Loki for Access logs
+
+To enable storing access logs from the MaaS gateway for logs-based showback or auditing, you need to configure a LokiStack. First, install the Loki Operator, and then configure a LokiStack named `usage` in the monitoring namespace configured in DSCI `spec.monitoring.namespace`, for example:
+
+```yaml
+apiVersion: loki.grafana.com/v1
+kind: LokiStack
+metadata:
+  name: usage
+  namespace: opendatahub
+spec:
+  limits:
+    global:
+      otlp:
+        streamLabels:
+          resourceAttributes:
+            - name: service.name
+            - name: subscription
+            - name: model
+            - name: response_type
+            - name: kubernetes_namespace_name
+  managementState: Managed
+  size: 1x.demo
+  storage:
+    schemas:
+      - effectiveDate: '2024-10-01'
+        version: v13
+    secret:
+      credentialMode: static
+      name: <storage-secret-name>
+      type: s3
+  tenants:
+    mode: openshift-logging
+```
+
+!!! note "AI Grid deployments"
+    For AI Grid deployments using the MaaS API Loki read proxy, add
+    `organization_id` and `user_id` to the existing
+    `spec.limits.global.otlp.streamLabels.resourceAttributes` list in the
+    `LokiStack` spec:
+
+    ```yaml
+    streamLabels:
+      resourceAttributes:
+        # Keep the existing resource attributes and add these entries.
+        - name: organization_id
+        - name: user_id
+    ```
+
+    The collector must also export both fields as OTLP resource attributes.
+    If it uses the `groupbyattrs` processor, include both fields in
+    `groupbyattrs.keys`. The proxy requires indexed stream labels for its
+    organization and user filters to match logs. These changes affect newly
+    ingested logs; existing logs retain their original label configuration.
+    See [Logs-based usage dashboards](../observability/setup.md#logs-based-usage-dashboards)
+    for identity capture settings.
+
+## GenAI Studio
 
 To enable **GenAI Studio** in the RHOAI Dashboard, you need the LlamaStack Operator enabled in your
 DSC and a Dashboard feature flag. See [OdhDashboardConfig Feature Flags](maas-setup.md#odhdashboardconfig-feature-flags) for setup.

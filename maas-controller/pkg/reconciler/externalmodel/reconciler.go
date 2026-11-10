@@ -9,6 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -17,10 +18,13 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	maasv1alpha1 "github.com/opendatahub-io/models-as-a-service/maas-controller/api/maas/v1alpha1"
+	"github.com/opendatahub-io/models-as-a-service/maas-controller/pkg/modelnaming"
+	"github.com/opendatahub-io/models-as-a-service/maas-controller/pkg/oteljson"
 	"github.com/opendatahub-io/models-as-a-service/maas-controller/pkg/platform/tenantreconcile"
 )
 
@@ -30,6 +34,26 @@ const (
 
 	// annotationTLS controls TLS origination (default "true").
 	annotationTLS = "maas.opendatahub.io/tls"
+)
+
+var inferenceExternalModelGVK = schema.GroupVersionKind{
+	Group:   "inference.opendatahub.io",
+	Version: "v1alpha1",
+	Kind:    "ExternalModel",
+}
+
+var inferenceExternalProviderGVK = schema.GroupVersionKind{
+	Group:   "inference.opendatahub.io",
+	Version: "v1alpha1",
+	Kind:    "ExternalProvider",
+}
+
+// IPP's legacy migration labels the inference ExternalModel and
+// ExternalProvider it creates for a legacy ExternalModel of the same name.
+const (
+	labelManagedBy              = "app.kubernetes.io/managed-by"
+	labelMigratedFrom           = "inference.opendatahub.io/migrated-from"
+	managedByIPPLegacyMigration = "ipp-legacy-migration"
 )
 
 // Reconciler watches ExternalModel CRs and creates the Istio resources
@@ -98,13 +122,17 @@ func getTLSInfo(extModel *maasv1alpha1.ExternalModel) (tls bool, port int32, err
 //+kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=get;list;watch;create;update
 //+kubebuilder:rbac:groups=maas.opendatahub.io,resources=externalmodels,verbs=get;list;watch
 //+kubebuilder:rbac:groups=maas.opendatahub.io,resources=externalmodels/finalizers,verbs=update
+//+kubebuilder:rbac:groups=maas.opendatahub.io,resources=externalmodels/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;delete
 //+kubebuilder:rbac:groups=networking.istio.io,resources=serviceentries,verbs=get;list;watch;create;update
 //+kubebuilder:rbac:groups=networking.istio.io,resources=destinationrules,verbs=get;list;watch;create;update;delete
+// Changing ownerReferences needs delete permission on the object (OwnerReferencesPermissionEnforcement).
+//+kubebuilder:rbac:groups=inference.opendatahub.io,resources=externalmodels;externalproviders,verbs=get;update;delete
 
 // Reconcile handles create/update/delete of ExternalModel CRs.
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log.FromContext(ctx).Info("Reconciling ExternalModel", "namespace", req.Namespace, "name", req.Name)
+	ctx = oteljson.IntoContext(ctx)
+	oteljson.FromContext(ctx).Info("Reconciling ExternalModel", "namespace", req.Namespace, "name", req.Name)
 
 	extModel := &maasv1alpha1.ExternalModel{}
 	if err := r.Get(ctx, req.NamespacedName, extModel); err != nil {
@@ -119,12 +147,38 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
+	inferenceEM, err := r.getInferenceExternalModel(ctx, extModel)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Release before the superseded check: an inference ExternalModel without a
+	// route name yet would still be garbage-collected with its legacy owner.
+	if inferenceEM != nil {
+		if err := r.releaseMigratedResources(ctx, extModel, inferenceEM); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	// If an inference.opendatahub.io ExternalModel exists for this model,
+	// the IPP controller owns networking. Tear down legacy maas-* children.
+	if superseded, err := isSupersededByInference(extModel, inferenceEM); err != nil {
+		return ctrl.Result{}, err
+	} else if superseded {
+		oteljson.FromContext(ctx).Info("inference ExternalModel exists, tearing down legacy networking",
+			"name", req.Name, "namespace", req.Namespace)
+		if _, err := r.teardownLegacyChildren(ctx, extModel); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, r.markMigrated(ctx, extModel)
+	}
+
 	tls, port, err := getTLSInfo(extModel)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("invalid ExternalModel annotations: %w", err)
 	}
 
-	logger := r.Log.WithValues("externalmodel", req.NamespacedName)
+	logger := oteljson.FromContext(ctx).WithValues("externalmodel", req.NamespacedName)
 	logger.Info("Reconciling ExternalModel",
 		"provider", extModel.Spec.Provider,
 		"endpoint", extModel.Spec.Endpoint,
@@ -133,12 +187,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	ns := extModel.Namespace
 	name := extModel.Name
+	resourceName := modelnaming.ExternalModelResourceName(name)
 	gwName := r.gatewayName()
 	gwNamespace := r.gatewayNamespace()
 	labels := commonLabels(name)
 
 	// 1. ExternalName Service (backend for HTTPRoute)
-	svc := buildService(extModel.Spec.Endpoint, name, ns, port, labels)
+	svc := buildService(extModel.Spec.Endpoint, resourceName, ns, port, labels)
 	if err := controllerutil.SetControllerReference(extModel, svc, r.Scheme); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to set owner on Service: %w", err)
 	}
@@ -147,7 +202,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	// 2. ServiceEntry (registers external host in mesh)
-	se := buildServiceEntry(extModel.Spec.Endpoint, name, ns, port, tls, labels)
+	se := buildServiceEntry(extModel.Spec.Endpoint, resourceName, ns, port, tls, labels)
 	if err := r.setUnstructuredOwner(extModel, se); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to set owner on ServiceEntry: %w", err)
 	}
@@ -157,7 +212,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	// 3. DestinationRule (only if TLS; delete stale DR when TLS is disabled)
 	if tls {
-		dr := buildDestinationRule(extModel.Spec.Endpoint, name, ns, labels)
+		dr := buildDestinationRule(extModel.Spec.Endpoint, resourceName, ns, labels)
 		if err := r.setUnstructuredOwner(extModel, dr); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to set owner on DestinationRule: %w", err)
 		}
@@ -165,7 +220,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			return ctrl.Result{}, fmt.Errorf("failed to create DestinationRule: %w", err)
 		}
 	} else {
-		if err := r.deleteIfExists(ctx, logger, "DestinationRule", name, ns, schema.GroupVersionKind{
+		if err := r.deleteIfExists(ctx, logger, "DestinationRule", resourceName, ns, schema.GroupVersionKind{
 			Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule",
 		}); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to delete stale DestinationRule: %w", err)
@@ -173,7 +228,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	// 4. HTTPRoute (routes requests to external provider via gateway)
-	hr := buildHTTPRoute(extModel.Spec.Endpoint, name, extModel.Spec.TargetModel, ns, port, gwName, gwNamespace, labels)
+	hr := buildHTTPRoute(extModel.Spec.Endpoint, resourceName, resourceName, name, extModel.Spec.TargetModel, ns, port, gwName, gwNamespace, labels)
 	if err := controllerutil.SetControllerReference(extModel, hr, r.Scheme); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to set owner on HTTPRoute: %w", err)
 	}
@@ -311,10 +366,189 @@ func (r *Reconciler) applyHTTPRoute(ctx context.Context, log logr.Logger, desire
 	return r.Update(ctx, existing)
 }
 
+// getInferenceExternalModel returns the inference.opendatahub.io ExternalModel with
+// the same name/namespace, or nil if there is none.
+//
+// When the inference CRD is not installed (IsNoMatchError), it also returns nil and
+// the legacy reconciler proceeds normally, so pure 3.4 clusters are unaffected.
+func (r *Reconciler) getInferenceExternalModel(ctx context.Context, extModel *maasv1alpha1.ExternalModel) (*unstructured.Unstructured, error) {
+	key := client.ObjectKeyFromObject(extModel)
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(inferenceExternalModelGVK)
+	if err := r.Get(ctx, key, obj); err != nil {
+		if apierrors.IsNotFound(err) || apimeta.IsNoMatchError(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to check inference ExternalModel %s/%s: %w", key.Namespace, key.Name, err)
+	}
+	return obj, nil
+}
+
+// isSupersededByInference reports whether an inference.opendatahub.io ExternalModel
+// exists for the same name/namespace AND has published its HTTPRoute
+// (status.httpRouteName is set), meaning the IPP controller now owns networking.
+//
+// Teardown is gated on that readiness signal, not on mere existence: if we removed
+// the legacy maas-* route the moment the inference CR appeared — before its route is
+// programmed — there would be a window with no route for the model, causing a
+// routing/auth gap during the migration cutover. The MaaSModelRef handler waits for
+// the same signal (see providers_external.go), so this keeps the two in lockstep.
+func isSupersededByInference(extModel *maasv1alpha1.ExternalModel, inferenceEM *unstructured.Unstructured) (bool, error) {
+	if inferenceEM == nil {
+		return false, nil
+	}
+	routeName, _, err := unstructured.NestedString(inferenceEM.Object, "status", "httpRouteName")
+	if err != nil {
+		return false, fmt.Errorf("failed to read status.httpRouteName on inference ExternalModel %s/%s: %w", inferenceEM.GetNamespace(), inferenceEM.GetName(), err)
+	}
+	// Once migrated, the legacy model stays superseded while its inference
+	// ExternalModel exists. That model may lose its route name, for example
+	// when it fails, and the legacy networking must not come back.
+	return routeName != "" || extModel.Status.Phase == "Migrated", nil
+}
+
+// releaseMigratedResources removes this legacy ExternalModel's owner reference
+// from the inference ExternalModel and ExternalProvider that IPP's legacy
+// migration created for it. The legacy API is deprecated, so deleting a
+// Migrated legacy object looks like routine cleanup, but the garbage collector
+// would delete the live model and provider with it.
+func (r *Reconciler) releaseMigratedResources(ctx context.Context, extModel *maasv1alpha1.ExternalModel, inferenceEM *unstructured.Unstructured) error {
+	if err := r.releaseFromLegacyOwner(ctx, extModel, inferenceEM); err != nil {
+		return err
+	}
+	provider := &unstructured.Unstructured{}
+	provider.SetGroupVersionKind(inferenceExternalProviderGVK)
+	if err := r.Get(ctx, client.ObjectKeyFromObject(extModel), provider); err != nil {
+		if apierrors.IsNotFound(err) || apimeta.IsNoMatchError(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to get inference ExternalProvider %s/%s: %w", extModel.Namespace, extModel.Name, err)
+	}
+	return r.releaseFromLegacyOwner(ctx, extModel, provider)
+}
+
+// releaseFromLegacyOwner removes extModel's owner reference from obj if IPP's
+// legacy migration created obj for it.
+func (r *Reconciler) releaseFromLegacyOwner(ctx context.Context, extModel *maasv1alpha1.ExternalModel, obj *unstructured.Unstructured) error {
+	labels := obj.GetLabels()
+	if labels[labelManagedBy] != managedByIPPLegacyMigration || labels[labelMigratedFrom] != extModel.Name {
+		return nil
+	}
+	refs := obj.GetOwnerReferences()
+	kept := make([]metav1.OwnerReference, 0, len(refs))
+	for _, ref := range refs {
+		if ref.UID != extModel.UID {
+			kept = append(kept, ref)
+		}
+	}
+	if len(kept) == len(refs) {
+		return nil
+	}
+	// Update, as granted on these resources, checks the resourceVersion read above.
+	obj.SetOwnerReferences(kept)
+	if err := r.Update(ctx, obj); err != nil {
+		return fmt.Errorf("failed to release inference %s %s/%s from its legacy owner: %w", obj.GetKind(), extModel.Namespace, extModel.Name, err)
+	}
+	oteljson.FromContext(ctx).Info("released migrated inference resource from its legacy owner",
+		"kind", obj.GetKind(), "name", extModel.Name, "namespace", extModel.Namespace)
+	return nil
+}
+
+// teardownLegacyChildren deletes the maas-* networking resources (Service,
+// ServiceEntry, DestinationRule, HTTPRoute) that were created by this reconciler
+// for the given ExternalModel, then returns a no-requeue result.
+func (r *Reconciler) teardownLegacyChildren(ctx context.Context, extModel *maasv1alpha1.ExternalModel) (ctrl.Result, error) {
+	logger := oteljson.FromContext(ctx)
+	resourceName := modelnaming.ExternalModelResourceName(extModel.Name)
+	ns := extModel.Namespace
+
+	if err := r.deleteIfExists(ctx, logger, "HTTPRoute", resourceName, ns, schema.GroupVersionKind{
+		Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute",
+	}); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to delete legacy HTTPRoute: %w", err)
+	}
+	if err := r.deleteIfExists(ctx, logger, "DestinationRule", resourceName, ns, schema.GroupVersionKind{
+		Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule",
+	}); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to delete legacy DestinationRule: %w", err)
+	}
+	if err := r.deleteIfExists(ctx, logger, "ServiceEntry", resourceName, ns, schema.GroupVersionKind{
+		Group: "networking.istio.io", Version: "v1", Kind: "ServiceEntry",
+	}); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to delete legacy ServiceEntry: %w", err)
+	}
+
+	svc := &corev1.Service{}
+	svcKey := types.NamespacedName{Name: resourceName, Namespace: ns}
+	if err := r.Get(ctx, svcKey, svc); err == nil {
+		if isManaged(svc) {
+			logger.Info("Deleting legacy Service", "name", resourceName)
+			if err := r.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
+				return ctrl.Result{}, fmt.Errorf("failed to delete legacy Service: %w", err)
+			}
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return ctrl.Result{}, fmt.Errorf("failed to get legacy Service: %w", err)
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// markMigrated records that the inference API now owns networking for this
+// legacy ExternalModel. The legacy object no longer owns the migrated inference
+// resources (see releaseMigratedResources), so the status gives users a durable
+// migration signal and the legacy object can be deleted on its own.
+func (r *Reconciler) markMigrated(ctx context.Context, extModel *maasv1alpha1.ExternalModel) error {
+	desiredMessage := fmt.Sprintf("Model migrated to inference.opendatahub.io ExternalModel: %s", extModel.Name)
+	if extModel.Status.Phase == "Migrated" && extModel.Status.Message == desiredMessage {
+		return nil
+	}
+
+	extModel.Status.Phase = "Migrated"
+	extModel.Status.Message = desiredMessage
+	if err := r.Status().Update(ctx, extModel); err != nil {
+		return fmt.Errorf("failed to mark legacy ExternalModel %s/%s as migrated: %w", extModel.Namespace, extModel.Name, err)
+	}
+	return nil
+}
+
 // SetupWithManager registers the reconciler to watch ExternalModel CRs.
+//
+// It additionally watches inference.opendatahub.io ExternalModels so that when the
+// legacy-migration controller creates the canonical CR, the matching legacy
+// ExternalModel is re-reconciled promptly and its maas-* networking is torn down —
+// rather than waiting for the periodic resync (which can be hours). Each inference
+// event is mapped to the same name/namespace; Reconcile then no-ops if no legacy
+// ExternalModel exists there, so native inference-only models are never affected.
+//
+// The watch is only wired when the inference CRD is installed. On pure 3.4 clusters
+// the CRD is absent and establishing an informer for it would fail cache sync, so we
+// skip it; there is no inference CR to react to on those clusters anyway.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&maasv1alpha1.ExternalModel{}).
-		Named("external-model-reconciler").
-		Complete(r)
+		Named("external-model-reconciler")
+
+	if _, err := mgr.GetRESTMapper().RESTMapping(
+		inferenceExternalModelGVK.GroupKind(), inferenceExternalModelGVK.Version,
+	); err == nil {
+		inferenceEM := &unstructured.Unstructured{}
+		inferenceEM.SetGroupVersionKind(inferenceExternalModelGVK)
+		b = b.Watches(inferenceEM, handler.EnqueueRequestsFromMapFunc(
+			func(_ context.Context, obj client.Object) []reconcile.Request {
+				return []reconcile.Request{{
+					NamespacedName: types.NamespacedName{
+						Name:      obj.GetName(),
+						Namespace: obj.GetNamespace(),
+					},
+				}}
+			},
+		))
+	} else {
+		mgr.GetLogger().Info("inference.opendatahub.io ExternalModel CRD not installed; "+
+			"skipping supersede watch (legacy ExternalModel reconciler runs unchanged)",
+			"gvk", inferenceExternalModelGVK.String())
+	}
+
+	return b.Complete(r)
 }

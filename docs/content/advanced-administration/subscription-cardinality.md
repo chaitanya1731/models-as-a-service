@@ -6,15 +6,46 @@ This guide explains the cardinality dimensions in MaaS, when they become a probl
 
 ## How Cardinality Arises
 
-Every MaaSSubscription generates a Kuadrant **TokenRateLimitPolicy** (TRLP) per model reference. Limitador maintains a separate counter for each unique combination of labels on that policy. The TelemetryPolicy adds further labels (`user`, `subscription`, `model`, `organization_id`, and optionally `group`) to usage metrics.
+The controller generates one Kuadrant **TokenRateLimitPolicy** (TRLP) per model, shared by every MaaSSubscription that references it. The TRLP has one limit per distinct set of `tokenRateLimits` on that model, so subscriptions with identical rates share a limit. Each limit counts per subscription and per user (counters `selected_subscription_id` and `userid` for subscriptions created after the short-ID rollout, or `selected_subscription_key` and `userid` for pre-upgrade subscriptions), so sharing a limit never means sharing a budget. Limitador maintains a separate counter for each unique combination of those values. The TelemetryPolicy adds further labels (`user`, `subscription`, `model`, `organization_id`, and optionally `group`) to usage metrics.
 
-The total number of counters Limitador tracks is roughly:
+A rate set that still has both generations is split into two limits so the counter expressions can differ. That extra limit is copied into every gateway ActionSet, so clusters with many leftover pre-upgrade subscriptions keep more of the wasm-config size until those CRs are replaced. See [Upgrade to 3.6](../migration/upgrade-to-3.6.md#trade-off-size-savings-only-accrue-on-new-subscriptions).
+
+Limits and counters scale differently:
 
 ```
-counters ≈ subscriptions × models × unique_users × rate_limit_windows
+limits per model = distinct rate sets among the subscriptions on that model
+counters         ≈ subscriptions × models × unique_users × rate_limit_windows
 ```
+
+Model references with `unlimited: true` add no counters. All unlimited subscriptions on a model share one limit without rates, so Limitador only records their usage metrics.
 
 For Prometheus, the cardinality of `authorized_hits`, `authorized_calls`, and `limited_calls` grows with the number of distinct `user` and `subscription` label values.
+
+## Gateway Config Size
+
+Kuadrant renders every TRLP limit into one wasm config object per gateway, `kuadrant-{gateway-name}` in the gateway namespace (an `EnvoyFilter` on Kuadrant 1.5 and later, a `WasmPlugin` on 1.4.x). Each limit becomes two actions, a request-time check and a response-time token report, in every route-match ActionSet, so the object grows roughly with:
+
+```
+size ≈ limits × route_matches × listeners × hostnames × 2 actions
+```
+
+At the default LLMInferenceService shape (**19 route matches**), one limit costs about 27 KB per listener. Before RHOAIENG-95277 every subscription and model pair got its own limit, and the object grew until it hit the etcd object size limit (1.5 MiB by default). Now a subscription at an existing rate adds one clause to that limit's predicate: about 80 bytes in the TRLP and about 3 KB per listener in the gateway config. A subscription at a new rate still adds a whole limit.
+
+When body-based routing is the only path clients use, you can cut each model's match count from **19 to 9** with the KServe LLMInferenceService annotation `serving.kserve.io/model-based-routing-only: "true"`. That drops the unused per-model path matches (`/{namespace}/{name}/...` and `/publishers/...`) and keeps header-based model routing. See [Reduce LLMInferenceService route matches](#reduce-llminferenceservice-route-matches).
+
+To keep the object small, reuse a small set of standard rates across subscriptions instead of giving each subscription its own numbers. Spell them the same way too: `100/1m` and `100/60s` are different rate sets.
+
+```bash
+# Gateway wasm config size in bytes, as compact JSON. Kuadrant 1.5+ writes an EnvoyFilter:
+kubectl get envoyfilter kuadrant-maas-default-gateway -n openshift-ingress -o json | jq -c . | wc -c
+
+# Kuadrant 1.4.x writes a WasmPlugin with the same name instead:
+kubectl get wasmplugin kuadrant-maas-default-gateway -n openshift-ingress -o json | jq -c . | wc -c
+
+# Limits per model TRLP
+kubectl get tokenratelimitpolicy -A -o json | \
+  jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name): \(.spec.limits | length) limits"'
+```
 
 ## Users vs Groups
 
@@ -60,7 +91,7 @@ spec:
 
 ## Telemetry Label Cardinality
 
-The Tenant CR controls which labels the TelemetryPolicy adds to Limitador usage metrics. Each enabled label multiplies cardinality.
+The MaasTenantConfig CR controls which labels the TelemetryPolicy adds to Limitador usage metrics. Each enabled label multiplies cardinality.
 
 | Field | Default | Cardinality impact | Recommendation |
 |-------|---------|-------------------|----------------|
@@ -72,14 +103,14 @@ The Tenant CR controls which labels the TelemetryPolicy adds to Limitador usage 
 To check or change these settings:
 
 ```bash
-kubectl get tenant default-tenant -n models-as-a-service \
+kubectl get maastenantconfig default-tenant -n models-as-a-service \
   -o jsonpath='{.spec.telemetry.metrics}' | jq .
 ```
 
 To disable a high-cardinality label:
 
 ```bash
-kubectl patch tenant default-tenant -n models-as-a-service --type=merge \
+kubectl patch maastenantconfig default-tenant -n models-as-a-service --type=merge \
   -p '{"spec":{"telemetry":{"metrics":{"captureGroup": false}}}}'
 ```
 
@@ -101,9 +132,9 @@ High cardinality in `authorized_hits`, `authorized_calls`, and `limited_calls` m
 
 - **Prometheus memory and storage** — each unique label combination creates a new time series.
 - **Query performance** — queries like `sum by (user) (rate(authorized_hits[5m]))` become slow when thousands of user values exist.
-- **Dashboard responsiveness** — Grafana panels using high-cardinality metrics may time out.
+- **Dashboard responsiveness** — Perses panels using high-cardinality metrics may time out.
 
-Gateway latency metrics (`istio_request_duration_milliseconds_bucket`) are labeled by **subscription only** (not by user) specifically to keep cardinality bounded. See [Observability Dashboard](observability.md#per-subscription-latency-tracking).
+Gateway latency metrics (`istio_request_duration_milliseconds_bucket`) are labeled by **subscription only** (not by user) specifically to keep cardinality bounded. See [Metrics & Dashboards](../observability/metrics-and-dashboards.md#per-subscription-latency-tracking).
 
 ## Monitoring Cardinality
 
@@ -136,7 +167,7 @@ count({__name__=~"authorized_hits|authorized_calls|limited_calls"})
 kubectl get maassubscription -n models-as-a-service -o json | \
   jq -r '.items[] | "\(.metadata.name): groups=\(.spec.owner.groups // [] | length), users=\(.spec.owner.users // [] | length), models=\(.spec.modelRefs | length)"'
 
-# Count total TokenRateLimitPolicies (one per subscription × model)
+# Count total TokenRateLimitPolicies (one per model)
 kubectl get tokenratelimitpolicy -A --no-headers | wc -l
 ```
 
@@ -186,6 +217,63 @@ kubectl get tokenratelimitpolicy -A -o json | \
 
 **Fix:** Use dedicated HTTPRoutes per model to ensure independent rate limiting.
 
+## Reduce LLMInferenceService route matches
+
+Kuadrant's gateway config size scales with **HTTPRoute matches**, not with how many `backendRef`s share a rule. A default LLMInferenceService HTTPRoute still has about **19 matches** even after Exact paths share a single backend. Ten of those matches are per-model path URLs that body-based OpenAI clients never use once IPP (or Praxis) injects the model-routing header.
+
+KServe LLMInferenceService supports an opt-in annotation that drops those path matches ([kserve/kserve#6306](https://github.com/kserve/kserve/pull/6306)):
+
+```text
+serving.kserve.io/model-based-routing-only: "true"
+```
+
+Effect on the managed HTTPRoute: about **19 → 9 matches** per model (header-based model routing kept; `/{ns}/{name}/...` and `/publishers/...` path trees removed).
+
+### Where to set it
+
+| Location | Behavior |
+|----------|----------|
+| **Gateway** annotation on every parent of the route | Applies to services that do not override it. All parents must agree. |
+| **LLMInferenceService** `spec.annotations` | Explicit `"true"` or `"false"` wins for that service (overrides Gateway). |
+
+Model-based routing must already be active for the service (`serving.kserve.io/model-based-routing-enabled: "true"` from the workload preset). Without that, the controller does not strip paths (so the route never becomes empty). Values are parsed as booleans (`strconv.ParseBool`).
+
+```bash
+kubectl annotate gateway maas-default-gateway -n openshift-ingress \
+  serving.kserve.io/model-based-routing-only=true --overwrite
+```
+
+```bash
+kubectl patch llminferenceservice my-model -n llm --type merge -p '{
+  "spec": {
+    "annotations": {
+      "serving.kserve.io/model-based-routing-only": "true"
+    }
+  }
+}'
+```
+
+### Verify
+
+```bash
+# Matches on the managed route (expect ~9 when the annotation applied)
+kubectl get httproute -n llm -o json | \
+  jq -r '.items[] | "\(.metadata.name): rules=\(.spec.rules|length) matches=\([.spec.rules[].matches[]?] | length)"'
+
+# Informational condition on the LLMInferenceService
+kubectl get llminferenceservice my-model -n llm -o jsonpath='{range .status.conditions[?(@.type=="PerModelPathsDropped")]}{.status} {.reason} {.message}{"\n"}{end}'
+```
+
+`PerModelPathsDropped=True` means per-model paths were removed. `False` reasons include `DisabledOnService`, `NotSetOnAllGateways`, `ModelBasedRoutingNotEnabled`, and `UnrecognizedValue`.
+
+### Trade-offs
+
+- Per-model path URLs stop working for that service (clients must use body-based routing with IPP/Praxis).
+- `status.url` falls back to the Gateway root rather than a path URL.
+- Off by default — existing path-based integrations keep working until you opt in.
+
+Prefer this when the tenant already standardizes on [body-based inference](../user-guide/inference.md#endpoint-overview). Combine it with [reusing a small set of rates](#gateway-config-size) for the largest EnvoyFilter / WasmPlugin savings.
+
 ## Best Practices
 
 1. **Use groups, not individual users** — assign human users to Kubernetes groups and reference groups in `owner.groups`. Reserve `owner.users` for service accounts.
@@ -193,10 +281,13 @@ kubectl get tokenratelimitpolicy -A -o json | \
 3. **Monitor counter growth** — periodically check the number of TokenRateLimitPolicies and Prometheus time series for MaaS metrics.
 4. **Use Redis for Limitador** in production — persistent storage prevents counter resets on pod restarts and provides better visibility into counter counts. See [Limitador Persistence](limitador-persistence.md).
 5. **Use dedicated routes per model** — avoids TRLP conflicts and simplifies cardinality accounting.
+6. **Reuse a small set of rates** - every distinct rate set on a model adds a limit to the gateway wasm config, while another subscription at an existing rate adds only a predicate clause. See [Gateway Config Size](#gateway-config-size).
+7. **Prefer model-based-routing-only when using body-based routing** — drops unused LLMInferenceService path matches (~19 → ~9) so Kuadrant pays less per limit. See [Reduce LLMInferenceService route matches](#reduce-llminferenceservice-route-matches).
 
 ## Related Documentation
 
 - [Quota and Access Configuration](../configuration-and-management/quota-and-access-configuration.md) — step-by-step subscription setup including the `users` field warning
-- [Observability Dashboard](observability.md) — metrics collection, TelemetryPolicy labels, and dashboard configuration
+- [Inference](../user-guide/inference.md) — body-based vs path-based client endpoints
+- [Observability](../observability/index.md) — metrics collection, TelemetryPolicy labels, and dashboard configuration
 - [Limitador Persistence](limitador-persistence.md) — configuring Redis for persistent rate-limit counters
 - [MaaSSubscription CRD Reference](../reference/crds/maas-subscription.md) — full CRD field reference

@@ -1,108 +1,139 @@
 #!/bin/bash
 
 # =============================================================================
-# MaaS Platform End-to-End Testing Script
+# MaaS Platform End-to-End Testing — Thin Orchestrator
 # =============================================================================
 #
-# This script automates the complete deployment and validation of the MaaS 
-# platform on OpenShift with multi-user testing capabilities.
+# Orchestrates the CI pipeline: prereqs → deploy → models → tokens → validate → tests.
+# Each phase is implemented in a standalone script; this file only sequences them.
 #
-# WHAT IT DOES:
-#   1. Install cert-manager and LeaderWorkerSet (LWS) operators (required for KServe)
-#   2. Deploy MaaS platform via kustomize (RHCL, gateway, MaaS API, maas-controller)
-#   3. Install OpenDataHub (ODH) operator with DataScienceCluster (KServe)
-#   4. Deploy MaaS system (free + premium + e2e test fixtures: LLMIS + MaaSModelRef + MaaSAuthPolicy + MaaSSubscription)
-#   5. Setup test tokens (admin + regular user) for comprehensive testing
-#   6. Run E2E tests (API keys + subscription + models + tenant + ...)
-#   7. Run deployment validation + token metadata verification
-# 
+# Scripts called:
+#   deploy-platform.sh    Install cert-manager, ODH, deploy MaaS via deploy.sh
+#   deploy-models.sh      Deploy e2e fixtures (LLMIS, MaaSModelRef, AuthPolicy, Subscription)
+#   setup-test-tokens.sh  Create test users (admin + regular) and extract auth tokens
+#   run_e2e_tests.sh      pytest execution: two-pass xdist (parallel + serial)
+#
 # USAGE:
 #   ./test/e2e/scripts/prow_run_smoke_test.sh
 #
 # CI/CD PIPELINE USAGE:
-#   # Test with pipeline-built images
 #   OPERATOR_CATALOG=quay.io/opendatahub/opendatahub-operator-catalog:pr-123 \
 #   MAAS_API_IMAGE=quay.io/opendatahub/maas-api:pr-456 \
-#   MAAS_CONTROLLER_IMAGE=quay.io/opendatahub/maas-controller:pr-42 \
 #   ./test/e2e/scripts/prow_run_smoke_test.sh
 #
 # ENVIRONMENT VARIABLES:
-#   OPERATOR_CATALOG - ODH catalog image (optional). Unset = community-operators ODH 3.3.
-#                      Set for custom builds, e.g. quay.io/opendatahub/opendatahub-operator-catalog:latest
+#   OPERATOR_CATALOG - ODH catalog image (optional)
 #   OPERATOR_IMAGE   - Custom ODH operator image for CSV patch (optional)
 #   SKIP_DEPLOYMENT - Skip platform and model deployment (default: false)
-#                     Use for running tests against an existing cluster
 #   SKIP_VALIDATION - Skip deployment validation (default: false)
-#   MAAS_API_IMAGE - Custom MaaS API image (default: uses operator default)
-#                    Example: quay.io/opendatahub/maas-api:pr-232
-#   MAAS_CONTROLLER_IMAGE - Custom MaaS controller image (default: quay.io/opendatahub/maas-controller:latest)
-#                           Example: quay.io/opendatahub/maas-controller:pr-430
+#   MAAS_API_IMAGE - Custom MaaS API image (optional)
+#   MAAS_CONTROLLER_IMAGE - Custom MaaS controller image (optional)
+#   AI_GATEWAY_OPERATOR_IMAGE - Custom ai-gateway-operator image (optional)
+#   AI_GATEWAY_CONTROLLER_IMAGE - AIGC manager image; unset defaults to
+#                                quay.io/opendatahub/odh-ai-gateway-controller:latest (main after AIGC #91).
+#                                Set to empty to skip companion install.
+#   AIGC_GIT_URL / AIGC_GIT_REF - Optional overrides for deploy-aigc-companion.sh (defaults live in that script)
+#   DEPLOY_MODE - MaaS ownership mode (default: kustomize for presubmits)
+#   POLICY_ENGINE - Rate-limiting policy engine (default: rhcl)
+#   RHCL_STARTING_CSV - Optional RHCL operator startingCSV pin
+#   RHCL_NAMESPACE - RHCL/Kuadrant workload namespace (default: kuadrant-system)
+#   OLM_BUNDLE_UNPACK_RETRY - Retry failed OLM bundle unpacks during deploy (default: true)
 #   INSECURE_HTTP  - Deploy without TLS and use HTTP for tests (default: false)
-#                    Affects deploy.sh (via --disable-tls-backend) and test env
-#   EXTERNAL_OIDC - Enable external OIDC e2e coverage with an externally provisioned IdP (default: false)
-#   OIDC_ISSUER_URL - Required when EXTERNAL_OIDC=true; issuer URL used by deploy.sh
-#   OIDC_TOKEN_URL - Required when EXTERNAL_OIDC=true; token endpoint used by pytest
-#   OIDC_CLIENT_ID - Required when EXTERNAL_OIDC=true; client ID used to request tokens
-#   OIDC_USERNAME - Required when EXTERNAL_OIDC=true; test user for OIDC token requests
-#   OIDC_PASSWORD - Required when EXTERNAL_OIDC=true; password for the OIDC test user
-#   DEPLOYMENT_NAMESPACE - Namespace of MaaS API and controller (default: opendatahub)
-#   MAAS_SUBSCRIPTION_NAMESPACE - Namespace of MaaS CRs and Tenant CR (default: models-as-a-service)
-#   GATEWAY_NAMESPACE - Namespace for payload-processing deployment checks (default: openshift-ingress)
-#   MODEL_NAMESPACE - Namespace of models and MaaSModelRefs (default: llm)
+#   EXTERNAL_OIDC - Enable external OIDC e2e coverage (default: false)
+#   OIDC_ISSUER_URL, OIDC_TOKEN_URL, OIDC_CLIENT_ID, OIDC_USERNAME, OIDC_PASSWORD
+#   OIDC_AUDIENCE, OIDC_ACCESS_TOKEN_PURPOSE_CLAIM, OIDC_ACCESS_TOKEN_PURPOSE - Optional strict
+#                   OIDC contract applied to the default AITenant by deploy.sh
+#   E2E_RUN_ONLY_OIDC_TESTS - Skip passes 1–2 and run only the OIDC tests (requires EXTERNAL_OIDC=true)
+#   OIDC_READINESS_STRICT - Exit if OIDC gateway readiness fails (default: true)
+#   DEPLOYMENT_NAMESPACE - Namespace of maas-controller (default: opendatahub)
+#   MAAS_SUBSCRIPTION_NAMESPACE - Namespace of MaaS CRs (default: models-as-a-service)
+#   ENABLE_TENANT_NAMESPACE_DISCOVERY - Patch maas-controller before pytest (default: true)
+#   AITENANT_NAMESPACE - Namespace for AITenant CRs (default: ai-tenants)
+#   GATEWAY_NAMESPACE - Gateway namespace (default: openshift-ingress)
+#   MODEL_NAMESPACE - Namespace of models (default: llm)
+#   E2E_PARALLEL_WORKERS - pytest-xdist worker count (default: 5)
+#   E2E_SMOKE_ONLY - Restrict pytest to @pytest.mark.smoke (default: false).
+#                    /group-test sets true via Tekton podTemplate env.
+#   E2E_INCLUDE_NEW_FROM_DIFF - With E2E_SMOKE_ONLY, also run tests added since
+#                    E2E_DIFF_BASE (dynamic pr_new marker). /group-test sets true.
+#   E2E_DIFF_BASE / PULL_BASE_SHA / BASE_SHA - PR base for the new-test diff.
+#   E2E_DIFF_UPSTREAM_URL / E2E_DIFF_TARGET_BRANCH - Upstream repo + base branch
+#                    when the checkout's origin is a fork (/group-test sets these).
+#   E2E_MAXFAIL - failures before a pass stops (default: 0 here, i.e. never;
+#                 run_e2e_tests.sh defaults to 5 when invoked directly)
+#   TENANT_EXTERNAL_MODEL_CROSSNS_E2E - Opt in to P1 cross-namespace external
+#                         provider E2E (needs AGC cross-namespace provider
+#                         support packaged, default: false)
+#   TENANT_EXTERNAL_MODEL_LEGACY_IPP_E2E - Opt in to the legacy IPP coexistence
+#                         E2E (scenario 5; needs the IPP image pin with the
+#                         legacy-controller exclusion guard, default: false)
 #
-# TIMEOUT CONFIGURATION (all in seconds, sourced from deployment-helpers.sh):
-#   Customize for CI/CD environments or slow clusters:
-#   CUSTOM_RESOURCE_TIMEOUT=600   DataScienceCluster wait
-#   LLMIS_TIMEOUT=300            LLMInferenceService ready
-#   MAASMODELREF_TIMEOUT=300     MaaSModelRef ready
-#   AUTHPOLICY_TIMEOUT=180       AuthPolicy enforced
-#   AUTHORINO_TIMEOUT=120        Authorino ready
-#   ROLLOUT_TIMEOUT=120          Deployment rollout
-#   See deployment-helpers.sh for complete list
+# TIMEOUT CONFIGURATION (all in seconds, from deployment-helpers.sh):
+#   CUSTOM_RESOURCE_TIMEOUT, LLMIS_TIMEOUT, MAASMODELREF_TIMEOUT,
+#   AUTHPOLICY_TIMEOUT, AUTHORINO_TIMEOUT, ROLLOUT_TIMEOUT
 # =============================================================================
 
 set -euo pipefail
 
-# Find project root before sourcing helpers (helpers need to be sourced from correct path)
+# ── Bootstrap ────────────────────────────────────────────────────────────
 _find_project_root_bootstrap() {
-  local start_dir="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-  local dir="$start_dir"
-  while [[ "$dir" != "/" && ! -e "$dir/.git" ]]; do
-    dir="$(dirname "$dir")"
-  done
+  local dir="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+  while [[ "$dir" != "/" && ! -e "$dir/.git" ]]; do dir="$(dirname "$dir")"; done
   [[ -e "$dir/.git" ]] && printf '%s\n' "$dir" || return 1
 }
-
-# Configuration
 PROJECT_ROOT="$(_find_project_root_bootstrap)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Source helper functions (includes find_project_root and other utilities)
 source "$PROJECT_ROOT/scripts/deployment-helpers.sh"
+source "$PROJECT_ROOT/test/e2e/scripts/auth_utils.sh"
 
-# Options (can be set as environment variables)
-SKIP_DEPLOYMENT=${SKIP_DEPLOYMENT:-false}  # Skip platform and model deployment (for existing clusters)
+# ── Configuration (env var defaults) ─────────────────────────────────────
+SKIP_DEPLOYMENT=${SKIP_DEPLOYMENT:-false}
 SKIP_VALIDATION=${SKIP_VALIDATION:-false}
-SKIP_AUTH_CHECK=${SKIP_AUTH_CHECK:-true}  # TODO: Set to false once operator TLS fix lands
+SKIP_AUTH_CHECK=${SKIP_AUTH_CHECK:-true}
 INSECURE_HTTP=${INSECURE_HTTP:-false}
 EXTERNAL_OIDC=${EXTERNAL_OIDC:-false}
 
-# ODH operator deployment
 export MAAS_API_IMAGE=${MAAS_API_IMAGE:-}
 export MAAS_CONTROLLER_IMAGE=${MAAS_CONTROLLER_IMAGE:-}
+export AI_GATEWAY_OPERATOR_IMAGE=${AI_GATEWAY_OPERATOR_IMAGE:-}
+# Default to AIGC main (Konflux :latest after AIGC #91). odh-stable lags that merge.
+# Unset → install companion; explicit empty → skip.
+if [[ -z "${AI_GATEWAY_CONTROLLER_IMAGE+x}" ]]; then
+    export AI_GATEWAY_CONTROLLER_IMAGE="quay.io/opendatahub/odh-ai-gateway-controller:latest"
+else
+    export AI_GATEWAY_CONTROLLER_IMAGE
+fi
 export OPERATOR_CATALOG=${OPERATOR_CATALOG:-}
 export OPERATOR_IMAGE=${OPERATOR_IMAGE:-}
-AUTHORINO_NAMESPACE="kuadrant-system"
+export DEPLOY_MODE=${DEPLOY_MODE:-kustomize}
+export DEPLOY_MODE=${DEPLOY_MODE:-kustomize}
+export POLICY_ENGINE="${POLICY_ENGINE:-rhcl}"
+export RHCL_NAMESPACE="${RHCL_NAMESPACE:-kuadrant-system}"
+export RHCL_STARTING_CSV="${RHCL_STARTING_CSV:-}"
+export OLM_BUNDLE_UNPACK_RETRY="${OLM_BUNDLE_UNPACK_RETRY:-true}"
+
+AUTHORINO_NAMESPACE="${AUTHORINO_NAMESPACE:-$(resolve_authorino_namespace "$POLICY_ENGINE")}"
+export AUTHORINO_NAMESPACE
+
 DEPLOYMENT_NAMESPACE="${DEPLOYMENT_NAMESPACE:-opendatahub}"
 MAAS_SUBSCRIPTION_NAMESPACE="${MAAS_SUBSCRIPTION_NAMESPACE:-models-as-a-service}"
 MODEL_NAMESPACE="${MODEL_NAMESPACE:-llm}"
+GATEWAY_NAMESPACE="${GATEWAY_NAMESPACE:-openshift-ingress}"
+GATEWAY_NAME="${GATEWAY_NAME:-maas-default-gateway}"
+INGRESS_MODE="${INGRESS_MODE:-ocproute}"
+export INGRESS_MODE
+GATEWAY_PROGRAMMED_TIMEOUT="${GATEWAY_PROGRAMMED_TIMEOUT:-600}"
+OIDC_READINESS_STRICT="${OIDC_READINESS_STRICT:-true}"
+ENABLE_TENANT_NAMESPACE_DISCOVERY="${ENABLE_TENANT_NAMESPACE_DISCOVERY:-true}"
+AITENANT_NAMESPACE="${AITENANT_NAMESPACE:-ai-tenants}"
 
-# Artifact collection: OpenShift CI provides ARTIFACT_DIR (docs.ci.openshift.org/docs/architecture/step-registry).
-# Files written here are collected to artifacts/<job>/<step>/ in Prow. Fallbacks: ARTIFACTS, LOG_DIR, or local reports.
 ARTIFACTS_DIR="${ARTIFACT_DIR:-${ARTIFACTS:-${LOG_DIR:-$PROJECT_ROOT/test/e2e/reports}}}"
+mkdir -p "$ARTIFACTS_DIR"
 
-# Source auth utils (patch_authorino_debug, collect_e2e_artifacts)
-source "$PROJECT_ROOT/test/e2e/scripts/auth_utils.sh"
-
+# ── Helpers ──────────────────────────────────────────────────────────────
+# OIDC helpers (apply_default_oidc_for_keycloak, require_external_oidc_config)
+# are in auth_utils.sh, sourced above.
 print_header() {
     echo ""
     echo "----------------------------------------"
@@ -111,262 +142,126 @@ print_header() {
     echo ""
 }
 
-require_external_oidc_config() {
-    local required_vars=(OIDC_ISSUER_URL OIDC_TOKEN_URL OIDC_CLIENT_ID OIDC_USERNAME OIDC_PASSWORD)
-    local missing=()
-    local var_name
-
-    for var_name in "${required_vars[@]}"; do
-        if [[ -z "${!var_name:-}" ]]; then
-            missing+=("$var_name")
-        fi
-    done
-
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        echo "❌ ERROR: EXTERNAL_OIDC=true requires an externally provisioned OIDC provider"
-        echo "   Missing required variables: ${missing[*]}"
-        echo "   This branch no longer installs Keycloak automatically."
-        exit 1
-    fi
+phase_mark() {
+    local name="${1:?phase_mark requires a phase name}"
+    local event="${2:?phase_mark requires start or end}"
+    mkdir -p "$ARTIFACTS_DIR"
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ${name} ${event}" | tee -a "${ARTIFACTS_DIR}/phase-timings.txt"
 }
 
 check_prerequisites() {
     echo "Checking prerequisites..."
-    
-    # Get current user (also checks if logged in)
     local current_user
     if ! current_user=$(oc whoami 2>/dev/null); then
         echo "❌ ERROR: Not logged into OpenShift. Please run 'oc login' first"
         exit 1
     fi
-    
-    # Combined check: admin privileges + OpenShift cluster
     if ! oc auth can-i '*' '*' --all-namespaces >/dev/null 2>&1; then
         echo "❌ ERROR: User '$current_user' does not have admin privileges"
-        echo "   This script requires cluster-admin privileges to deploy and manage resources"
-        echo "   Please login as an admin user with 'oc login' or contact your cluster administrator"
         exit 1
     elif ! kubectl get --raw /apis/config.openshift.io/v1/clusterversions >/dev/null 2>&1; then
         echo "❌ ERROR: This script is designed for OpenShift clusters only"
         exit 1
     fi
-    
     echo "✅ Prerequisites met - logged in as: $current_user on OpenShift"
 }
 
-deploy_maas_platform() {
-    echo "Deploying MaaS platform via ODH operator..."
-    if [[ -n "${MAAS_API_IMAGE:-}" ]]; then
-        echo "Using custom MaaS API image: ${MAAS_API_IMAGE}"
-    fi
-    if [[ -n "${MAAS_CONTROLLER_IMAGE:-}" ]]; then
-        echo "Using custom MaaS controller image: ${MAAS_CONTROLLER_IMAGE}"
-    fi
-    if [[ -n "${OPERATOR_CATALOG:-}" ]]; then
-        echo "Using ODH catalog: ${OPERATOR_CATALOG}"
-    fi
-    if [[ -n "${OPERATOR_IMAGE:-}" ]]; then
-        echo "Using custom ODH operator image: ${OPERATOR_IMAGE}"
+enable_tenant_namespace_discovery_for_e2e() {
+    [[ "${ENABLE_TENANT_NAMESPACE_DISCOVERY}" == "true" ]] || return 0
+
+    echo "Enabling --enable-tenant-namespace-discovery on maas-controller..."
+    if ! oc get deployment maas-controller -n "$DEPLOYMENT_NAMESPACE" &>/dev/null; then
+        echo "❌ ERROR: maas-controller not found in ${DEPLOYMENT_NAMESPACE}"
+        return 1
     fi
 
-    # 1. Install cert-manager and LeaderWorkerSet (required for KServe/LLMInferenceService)
-    echo "Installing cert-manager and LeaderWorkerSet operators..."
-    if ! bash "$PROJECT_ROOT/.github/hack/install-cert-manager-and-lws.sh"; then
-        echo "❌ ERROR: cert-manager/LWS installation failed"
-        exit 1
+    local args_json
+    args_json="$(oc get deployment maas-controller -n "$DEPLOYMENT_NAMESPACE" -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null || echo '[]')"
+    if echo "$args_json" | grep -q 'enable-tenant-namespace-discovery'; then
+        echo "✅ maas-controller already has tenant namespace discovery enabled"
+    elif [[ -z "$args_json" || "$args_json" == "<no value>" ]]; then
+        oc patch deployment maas-controller -n "$DEPLOYMENT_NAMESPACE" --type=json -p='[
+          {"op": "add", "path": "/spec/template/spec/containers/0/args", "value": ["--enable-tenant-namespace-discovery=true"]}
+        ]' || { echo "❌ ERROR: failed to initialize args"; return 1; }
+    else
+        oc patch deployment maas-controller -n "$DEPLOYMENT_NAMESPACE" --type=json -p='[
+          {"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--enable-tenant-namespace-discovery=true"}
+        ]' || { echo "❌ ERROR: failed to patch args"; return 1; }
     fi
 
-    # 2. Install ODH operator with DataScienceCluster (KServe + ModelsAsService)
-    echo "Installing OpenDataHub operator..."
-    if ! bash "$PROJECT_ROOT/.github/hack/install-odh.sh"; then
-        echo "❌ ERROR: ODH installation failed"
-        exit 1
+    if ! echo "$args_json" | grep -q 'enable-tenant-namespace-discovery'; then
+        oc rollout status deployment/maas-controller -n "$DEPLOYMENT_NAMESPACE" --timeout=180s || { echo "❌ ERROR: rollout failed"; return 1; }
+        echo "✅ maas-controller patched with --enable-tenant-namespace-discovery=true"
     fi
+}
+
+setup_vars_for_tests() {
+    echo "-- Setting up variables for tests --"
+    K8S_CLUSTER_URL=$(oc whoami --show-server)
+    export K8S_CLUSTER_URL
+    [[ -z "$K8S_CLUSTER_URL" ]] && { echo "❌ ERROR: Failed to retrieve cluster URL"; exit 1; }
+    echo "K8S_CLUSTER_URL: ${K8S_CLUSTER_URL}"
+
+    export INSECURE_HTTP
+    [[ "$INSECURE_HTTP" == "true" ]] && echo "⚠️  INSECURE_HTTP=true - will use HTTP for tests"
+
+    export CLUSTER_DOMAIN="$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}')"
+    [[ -z "$CLUSTER_DOMAIN" ]] && { echo "❌ ERROR: Failed to detect cluster domain"; exit 1; }
+    # Route mode uses the MaaS GatewayClass and exposes an external load
+    # balancer address; clusterip mode uses the OpenShift ingress host.
+    gateway_class=$(oc get gateway maas-default-gateway -n openshift-ingress \
+        -o jsonpath='{.spec.gatewayClassName}' 2>/dev/null || echo "")
+    gateway_listener_host=$(oc get gateway maas-default-gateway -n openshift-ingress \
+        -o jsonpath='{.spec.listeners[?(@.protocol=="HTTPS")].hostname}' 2>/dev/null | awk '{print $1}')
+    HOST=""
+    if [[ -n "${MAAS_GATEWAY_HOST:-}" ]]; then
+        HOST="${MAAS_GATEWAY_HOST#*://}"
+    elif [[ -n "$gateway_listener_host" ]]; then
+        HOST="$gateway_listener_host"
+    elif [[ "$gateway_class" != "openshift-default" ]]; then
+        gateway_address=$(oc get gateway maas-default-gateway -n openshift-ingress \
+            -o jsonpath='{.status.addresses[0].value}' 2>/dev/null || echo "")
+        HOST="${gateway_address#*://}"
+    fi
+    [[ -z "$HOST" ]] && HOST="maas.${CLUSTER_DOMAIN}"
+    export HOST
+    export EXTERNAL_OIDC
 
     if [[ "${EXTERNAL_OIDC}" == "true" ]]; then
-        echo "Using externally provisioned OIDC configuration for external OIDC tests..."
+        apply_default_oidc_for_keycloak
         require_external_oidc_config
         export OIDC_ISSUER_URL OIDC_TOKEN_URL OIDC_CLIENT_ID OIDC_USERNAME OIDC_PASSWORD
-        echo "Using OIDC issuer: ${OIDC_ISSUER_URL}"
+        echo "OIDC_ISSUER_URL: ${OIDC_ISSUER_URL}"
     fi
 
-    # 3. Deploy MaaS via operator (Kuadrant, gateway, maas-api, maas-controller, policies)
-    # Note: ODH/catalog already installed by install-odh.sh; deploy.sh will skip duplicate installs
-    local deploy_cmd=(
-        "$PROJECT_ROOT/scripts/deploy.sh"
-        --deployment-mode kustomize
-    )
-    if [[ -n "${OPERATOR_CATALOG:-}" ]]; then
-        deploy_cmd+=(--operator-catalog "${OPERATOR_CATALOG}")
-    fi
-    if [[ -n "${OPERATOR_IMAGE:-}" ]]; then
-        deploy_cmd+=(--operator-image "${OPERATOR_IMAGE}")
-    fi
     if [[ "$INSECURE_HTTP" == "true" ]]; then
-        deploy_cmd+=(--disable-tls-backend)
-    fi
-    if [[ "${EXTERNAL_OIDC}" == "true" ]]; then
-        deploy_cmd+=(--external-oidc)
-    fi
-
-    if ! "${deploy_cmd[@]}"; then
-        echo "❌ ERROR: MaaS platform deployment failed"
-        exit 1
-    fi
-
-    # Wait for DataScienceCluster (install-odh already waited; deploy may have updated)
-    if ! wait_datasciencecluster_ready "default-dsc" "$CUSTOM_RESOURCE_TIMEOUT"; then
-        echo "⚠️  WARNING: DataScienceCluster readiness check had issues (timeout: ${CUSTOM_RESOURCE_TIMEOUT}s), continuing anyway"
-    fi
-
-    # Wait for Authorino to be ready and auth service cluster to be healthy
-    # TODO(https://issues.redhat.com/browse/RHOAIENG-48760): Remove SKIP_AUTH_CHECK
-    # once the operator creates the gateway→Authorino TLS EnvoyFilter at Gateway/AuthPolicy creation
-    # time, not at first LLMInferenceService creation. Currently there's a chicken-egg problem where
-    # auth checks fail before any model is deployed because the TLS config doesn't exist yet.
-    if [[ "${SKIP_AUTH_CHECK:-true}" == "true" ]]; then
-        echo "⚠️  WARNING: Skipping Authorino readiness check (SKIP_AUTH_CHECK=true)"
-        echo "   This is a temporary workaround for the gateway→Authorino TLS chicken-egg problem"
+        export MAAS_API_BASE_URL="http://${HOST}/maas-api"
     else
-        # Using configurable timeout (default suitable for Prow's 15m job limit)
-        echo "Waiting for Authorino and auth service to be ready (namespace: ${AUTHORINO_NAMESPACE})..."
-        if ! wait_authorino_ready "$AUTHORINO_NAMESPACE" "$AUTHORINO_TIMEOUT"; then
-            echo "⚠️  WARNING: Authorino readiness check had issues (timeout: ${AUTHORINO_TIMEOUT}s), continuing anyway"
-        fi
+        export MAAS_API_BASE_URL="https://${HOST}/maas-api"
     fi
 
-    echo "✅ MaaS platform deployment completed"
-}
-
-deploy_models() {
-    echo "Deploying MaaS system (free + premium: LLMIS + MaaSModelRef + MaaSAuthPolicy + MaaSSubscription)"
-    # Create llm namespace if it does not exist
-    if ! kubectl get namespace llm >/dev/null 2>&1; then
-        echo "Creating 'llm' namespace..."
-        if ! kubectl create namespace llm; then
-            echo "❌ ERROR: Failed to create 'llm' namespace"
-            exit 1
-        fi
-    else
-        echo "'llm' namespace already exists"
-    fi
-
-    # Create MaaS CRs namespace if it does not exist
-    if ! kubectl get namespace "$MAAS_SUBSCRIPTION_NAMESPACE" >/dev/null 2>&1; then
-        echo "Creating '$MAAS_SUBSCRIPTION_NAMESPACE' namespace..."
-        if ! kubectl create namespace "$MAAS_SUBSCRIPTION_NAMESPACE"; then
-            echo "❌ ERROR: Failed to create '$MAAS_SUBSCRIPTION_NAMESPACE' namespace"
-            exit 1
-        fi
-    else
-        echo "'$MAAS_SUBSCRIPTION_NAMESPACE' namespace already exists"
-    fi
-
-    # Deploy all at once so dependencies resolve correctly
-    # E2E test fixtures kustomization hardcodes namespace: models-as-a-service; override to $MAAS_SUBSCRIPTION_NAMESPACE
-    # so CRs land in the correct namespace.
-    if ! (cd "$PROJECT_ROOT" && kustomize build test/e2e/fixtures/ | \
-            sed "s/namespace: models-as-a-service/namespace: $MAAS_SUBSCRIPTION_NAMESPACE/g" | \
-            kubectl apply -f -); then
-        echo "❌ ERROR: Failed to deploy MaaS system with e2e fixtures"
-        exit 1
-    fi
-    echo "✅ MaaS system deployed (free + premium + e2e test fixtures)"
-
-    echo "Waiting for models to be ready (timeout: ${LLMIS_TIMEOUT}s)..."
-    if ! oc wait llminferenceservice/facebook-opt-125m-simulated -n llm --for=condition=Ready --timeout="${LLMIS_TIMEOUT}s"; then
-        echo "❌ ERROR: Timed out after ${LLMIS_TIMEOUT}s waiting for free simulator to be ready"
-        dump_llmis_diagnostics "facebook-opt-125m-simulated" "llm"
-        exit 1
-    fi
-    if ! oc wait llminferenceservice/premium-simulated-simulated-premium -n llm --for=condition=Ready --timeout="${LLMIS_TIMEOUT}s"; then
-        echo "❌ ERROR: Timed out after ${LLMIS_TIMEOUT}s waiting for premium simulator to be ready"
-        dump_llmis_diagnostics "premium-simulated-simulated-premium" "llm"
-        exit 1
-    fi
-    echo "✅ Simulator models ready"
-
-    # Wait for governed MaaSModelRefs to transition to Ready phase.
-    # Only models with MaaSSubscription + MaaSAuthPolicy pairings will reach Ready;
-    # ungoverned test fixtures (unconfigured, distinct, etc.) stay Pending by design.
-    local governed_models=("facebook-opt-125m-simulated" "premium-simulated-simulated-premium")
-    echo "Waiting for governed MaaSModelRefs to be Ready (timeout: ${MAASMODELREF_TIMEOUT}s)..."
-    local deadline=$((SECONDS + MAASMODELREF_TIMEOUT))
-    local all_ready=false
-
-    while [[ $SECONDS -lt $deadline ]]; do
-        all_ready=true
-        for model in "${governed_models[@]}"; do
-            phase=$(oc get maasmodelref "$model" -n "$MODEL_NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-            if [[ "$phase" != "Ready" ]]; then
-                all_ready=false
-                break
-            fi
-        done
-
-        if $all_ready; then
-            echo "✅ Governed MaaSModelRefs ready"
-            break
-        fi
-
-        sleep 5
-    done
-
-    if ! $all_ready; then
-        echo "❌ ERROR: Governed MaaSModelRefs did not reach Ready state within ${MAASMODELREF_TIMEOUT}s"
-        echo "Dumping MaaSModelRef status:"
-        oc get maasmodelrefs -n "$MODEL_NAMESPACE" -o yaml || true
-        echo "Dumping controller logs:"
-        kubectl logs deployment/maas-controller -n "$DEPLOYMENT_NAMESPACE" --tail=100 || true
-        exit 1
-    fi
-
-    wait_for_auth_policies_enforced
-}
-
-wait_for_auth_policies_enforced() {
-    local timeout="$AUTHPOLICY_TIMEOUT"
-    echo "Waiting for Kuadrant AuthPolicies to be enforced (timeout: ${timeout}s)..."
-
-    local namespaces
-    namespaces=$(oc get llminferenceservices -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' 2>/dev/null | sort -u)
-    if [[ -z "$namespaces" ]]; then
-        echo "  No LLMInferenceService namespaces found, skipping AuthPolicy wait"
-        return 0
-    fi
-
-    local deadline=$((SECONDS + timeout))
-    while [[ $SECONDS -lt $deadline ]]; do
-        local all_enforced=true
-        local total=0
-        for ns in $namespaces; do
-            while IFS= read -r status; do
-                total=$((total + 1))
-                if [[ "$status" != "True" ]]; then
-                    all_enforced=false
-                fi
-            done < <(oc get authpolicies -n "$ns" -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Enforced")].status}{"\n"}{end}' 2>/dev/null)
-        done
-        if $all_enforced && [[ $total -gt 0 ]]; then
-            echo "✅ All AuthPolicies enforced ($total policies)"
-            return 0
-        fi
-        echo "  Waiting... ($total policies found, not all enforced yet)"
-        sleep 10
-    done
-    echo "⚠️  WARNING: AuthPolicies not all enforced after ${timeout}s, tests may fail"
-    oc get authpolicies -A -o wide 2>/dev/null || true
+    echo "HOST: ${HOST}"
+    echo "MAAS_API_BASE_URL: ${MAAS_API_BASE_URL}"
+    echo "✅ Variables for tests setup completed"
 }
 
 validate_deployment() {
     echo "Deployment Validation"
-    echo "Using namespace: $DEPLOYMENT_NAMESPACE"
-    
-    if [ "$SKIP_VALIDATION" = false ]; then
-        if ! "$PROJECT_ROOT/scripts/validate-deployment.sh" --namespace "$DEPLOYMENT_NAMESPACE"; then
-            echo "⚠️  First validation attempt failed, waiting 30 seconds and retrying..."
-            sleep 30
-            if ! "$PROJECT_ROOT/scripts/validate-deployment.sh" --namespace "$DEPLOYMENT_NAMESPACE"; then
+    echo "Using controller namespace: $DEPLOYMENT_NAMESPACE"
+    echo "Using maas-api namespace: $MAAS_API_DEPLOYMENT_NAMESPACE"
+    echo "Using AITenant namespace: $AITENANT_NAMESPACE"
+
+    if [[ "$SKIP_VALIDATION" == "false" ]]; then
+        if ! "$PROJECT_ROOT/scripts/validate-deployment.sh"; then
+            echo "⚠️  First validation attempt failed; polling gateway and core deployments then retrying..."
+            wait_for_gateway_programmed "$GATEWAY_NAME" "$GATEWAY_NAMESPACE" 60 || true
+            kubectl wait --for=condition=Available --timeout=60s \
+                "deployment/maas-controller" -n "$DEPLOYMENT_NAMESPACE" 2>/dev/null || true
+            if [[ -n "${MAAS_API_DEPLOYMENT_NAMESPACE:-}" ]]; then
+                kubectl wait --for=condition=Available --timeout=60s \
+                    "deployment/maas-api" -n "$MAAS_API_DEPLOYMENT_NAMESPACE" 2>/dev/null || true
+            fi
+            if ! "$PROJECT_ROOT/scripts/validate-deployment.sh"; then
                 echo "❌ ERROR: Deployment validation failed after retry"
                 exit 1
             fi
@@ -377,157 +272,48 @@ validate_deployment() {
     fi
 }
 
-setup_vars_for_tests() {
-    echo "-- Setting up variables for tests --"
-    K8S_CLUSTER_URL=$(oc whoami --show-server)
-    export K8S_CLUSTER_URL
-    if [ -z "$K8S_CLUSTER_URL" ]; then
-        echo "❌ ERROR: Failed to retrieve Kubernetes cluster URL. Please check if you are logged in to the cluster."
-        exit 1
-    fi
-    echo "K8S_CLUSTER_URL: ${K8S_CLUSTER_URL}"
-
-    # Export INSECURE_HTTP for smoke.sh (it handles MAAS_API_BASE_URL detection)
-    # HTTPS is the default for MaaS.
-    # HTTP is used only when INSECURE_HTTP=true (opt-out mode).
-    # This aligns with deploy.sh which also respects TLS configuration
-    export INSECURE_HTTP
-    if [ "$INSECURE_HTTP" = "true" ]; then
-        echo "⚠️  INSECURE_HTTP=true - will use HTTP for tests"
-    fi
-       
-    export CLUSTER_DOMAIN="$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}')"
-    if [ -z "$CLUSTER_DOMAIN" ]; then
-        echo "❌ ERROR: Failed to detect cluster ingress domain (ingresses.config.openshift.io/cluster)"
-        exit 1
-    fi
-    export HOST="maas.${CLUSTER_DOMAIN}"
-    export EXTERNAL_OIDC
-
-    if [[ "${EXTERNAL_OIDC}" == "true" ]]; then
-        require_external_oidc_config
-        export OIDC_ISSUER_URL OIDC_TOKEN_URL OIDC_CLIENT_ID OIDC_USERNAME OIDC_PASSWORD
-        echo "OIDC_ISSUER_URL: ${OIDC_ISSUER_URL}"
-        echo "OIDC_TOKEN_URL: ${OIDC_TOKEN_URL}"
-    fi
-
-    if [ "$INSECURE_HTTP" = "true" ]; then
-        export MAAS_API_BASE_URL="http://${HOST}/maas-api"
-    else
-        export MAAS_API_BASE_URL="https://${HOST}/maas-api"
-    fi
-
-    echo "HOST: ${HOST}"
-    echo "MAAS_API_BASE_URL: ${MAAS_API_BASE_URL}"
-    echo "CLUSTER_DOMAIN: ${CLUSTER_DOMAIN}"
-    echo "✅ Variables for tests setup completed"
-}
-
-# Premium test token: use premium-service-account when oc whoami -t doesn't work (e.g. Prow).
-# TODO: Consolidate token strategies — consider always using SA for consistency across local/Prow.
-# TODO: Consider moving SA/namespace constants to a shared config or env defaults.
-PREMIUM_USERS_NS="premium-users-namespace"
-PREMIUM_SA="premium-service-account"
-
-setup_premium_test_token() {
-    echo "Setting up premium test token (SA-based, works when oc whoami -t is unavailable)..."
-    # Create namespace and SA
-    if ! kubectl get namespace "$PREMIUM_USERS_NS" &>/dev/null; then
-        echo "Creating namespace: $PREMIUM_USERS_NS"
-        kubectl create namespace "$PREMIUM_USERS_NS"
-    fi
-    if ! kubectl get sa "$PREMIUM_SA" -n "$PREMIUM_USERS_NS" &>/dev/null; then
-        echo "Creating service account: $PREMIUM_SA"
-        kubectl create sa "$PREMIUM_SA" -n "$PREMIUM_USERS_NS"
-    fi
-
-    # Add premium SA as user (not group) so it gets premium access.
-    local sa_user="system:serviceaccount:${PREMIUM_USERS_NS}:${PREMIUM_SA}"
-    echo "Patching MaaSAuthPolicy premium-simulator-access to include $sa_user..."
-    oc patch maasauthpolicy premium-simulator-access -n "$MAAS_SUBSCRIPTION_NAMESPACE" --type=merge -p="{\"spec\": {\"subjects\": {\"groups\": [{\"name\": \"premium-user\"}], \"users\": [\"$sa_user\"]}}}"
-
-    echo "Patching MaaSSubscription premium-simulator-subscription to include $sa_user..."
-    oc patch maassubscription premium-simulator-subscription -n "$MAAS_SUBSCRIPTION_NAMESPACE" --type=merge -p="{\"spec\": {\"owner\": {\"groups\": [{\"name\": \"premium-user\"}], \"users\": [\"$sa_user\"]}}}"
-
-    export E2E_TEST_TOKEN_SA_NAMESPACE="$PREMIUM_USERS_NS"
-    export E2E_TEST_TOKEN_SA_NAME="$PREMIUM_SA"
-
-    # Wait for subscriptions to reconcile after patches (race condition fix)
-    # Subscriptions must reach Active or Degraded phase before tests start,
-    # otherwise the OPA rule in subscription-valid will reject empty phase.
-    echo "Waiting for MaaSSubscriptions to reconcile after patch (timeout: 60s)..."
-    local timeout=60
-    local deadline=$((SECONDS + timeout))
-    local both_ready=false
-
-    while [[ $SECONDS -lt $deadline ]]; do
-        local sim_phase premium_phase
-        sim_phase=$(oc get maassubscription simulator-subscription -n "$MAAS_SUBSCRIPTION_NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-        premium_phase=$(oc get maassubscription premium-simulator-subscription -n "$MAAS_SUBSCRIPTION_NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-
-        # Accept Active or Degraded (both are valid for tests)
-        if [[ "$sim_phase" == "Active" || "$sim_phase" == "Degraded" ]] && \
-           [[ "$premium_phase" == "Active" || "$premium_phase" == "Degraded" ]]; then
-            echo "✅ Both subscriptions ready: simulator-subscription=$sim_phase, premium-simulator-subscription=$premium_phase"
-            both_ready=true
-            break
+_request_oidc_token() {
+    local username="${1:-${OIDC_USERNAME}}"
+    local password="${2:-${OIDC_PASSWORD}}"
+    local attempt token_response access_token
+    for ((attempt = 1; attempt <= 12; attempt++)); do
+        if token_response=$(curl -sk -m 10 \
+            -d "grant_type=password&client_id=${OIDC_CLIENT_ID}&username=${username}&password=${password}&scope=openid" \
+            "${OIDC_TOKEN_URL}" 2>/dev/null); then
+            access_token=$(printf '%s' "$token_response" | python3 -c \
+                "import sys,json; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null || true)
+            if [[ -n "$access_token" ]]; then
+                printf '%s' "$access_token"
+                return 0
+            fi
         fi
-
-        sleep 2
+        sleep 5
     done
-
-    if ! $both_ready; then
-        echo "❌ ERROR: Subscriptions did not reach Active/Degraded phase within ${timeout}s"
-        echo "Subscription status:"
-        oc get maassubscriptions -n "$MAAS_SUBSCRIPTION_NAMESPACE" -o yaml || true
-        exit 1
-    fi
-
-    echo "✅ Premium test token setup complete (E2E_TEST_TOKEN_SA_* exported)"
+    echo "Could not obtain an OIDC token for ${username} from ${OIDC_TOKEN_URL} after 12 attempts" >&2
+    return 1
 }
 
 run_e2e_tests() {
     echo "-- E2E Tests (API Keys + Subscription + Models Endpoint) --"
 
-    # Note: setup_premium_test_token() is called earlier in main execution
-    # (Phase 1: Admin Setup) while still logged in as system:admin
-
     export GATEWAY_HOST="${HOST}"
     export DEPLOYMENT_NAMESPACE
     export MAAS_SUBSCRIPTION_NAMESPACE
     export GATEWAY_NAMESPACE="${GATEWAY_NAMESPACE:-openshift-ingress}"
-    # Skip TLS verification in CI (self-signed certs)
+    export GATEWAY_NAME="${GATEWAY_NAME:-maas-default-gateway}"
+    export AITENANT_NAMESPACE
+    export ENABLE_TENANT_NAMESPACE_DISCOVERY
+    enable_tenant_namespace_discovery_for_e2e || exit 1
     export E2E_SKIP_TLS_VERIFY=true
-    # Set MODEL_NAME explicitly - maas-api /v1/models currently only lists MaaSModelRefs
-    # from its own namespace, but models are deployed in 'llm' namespace.
-    # TODO: Fix maas-api to list MaaSModelRefs from ALL namespaces (pass "" to ListFromMaaSModelRefLister)
     export MODEL_NAME="facebook-opt-125m-simulated"
     export E2E_MODEL_NAMESPACE="$MODEL_NAMESPACE"
-    # TOKEN and ADMIN_OC_TOKEN are already exported by setup_test_tokens()
-
-    local test_dir="$PROJECT_ROOT/test/e2e"
-    # Use ARTIFACTS_DIR so pytest reports go to Prow artifact collection (ARTIFACT_DIR)
-    mkdir -p "$ARTIFACTS_DIR"
-
-    if [[ ! -d "$test_dir/.venv" ]]; then
-        echo "Creating Python venv for e2e tests..."
-        python3 -m venv "$test_dir/.venv" --upgrade-deps
-    fi
-    source "$test_dir/.venv/bin/activate"
-    python -m pip install --upgrade pip --quiet
-    python -m pip install -r "$test_dir/requirements.txt" --quiet
-
-    local user
-    user="$(oc whoami 2>/dev/null || echo 'unknown')"
-    local html="$ARTIFACTS_DIR/e2e-${user}.html"
-    local xml="$ARTIFACTS_DIR/e2e-${user}.xml"
 
     echo "Running e2e tests with:"
     echo "  - TOKEN: $(echo "${TOKEN:-not set}" | cut -c1-20)..."
     echo "  - ADMIN_OC_TOKEN: $(echo "${ADMIN_OC_TOKEN:-not set}" | cut -c1-20)..."
     echo "  - GATEWAY_HOST: ${GATEWAY_HOST}"
 
-    # Wait for gateway to be reachable (DNS propagation + route readiness)
+    # Wait for gateway to be reachable
     local scheme="https"
     [[ "$INSECURE_HTTP" == "true" ]] && scheme="http"
     local gw_url="${scheme}://${GATEWAY_HOST}/maas-api/health"
@@ -543,268 +329,208 @@ run_e2e_tests() {
         fi
         sleep 1
     done
-    if [[ $SECONDS -ge $gw_deadline ]]; then
-        echo "⚠️  WARNING: Gateway not reachable after ${gw_timeout}s, proceeding anyway (tests may fail)"
-    fi
+    [[ $SECONDS -ge $gw_deadline ]] && echo "⚠️  WARNING: Gateway not reachable after ${gw_timeout}s, proceeding anyway"
 
-    # Run all e2e tests: API keys, namespace scoping, negative security, subscription, models, tenant
-    if ! PYTHONPATH="$test_dir:${PYTHONPATH:-}" pytest \
-        -v --maxfail=5 --disable-warnings \
-        --junitxml="$xml" \
-        --html="$html" --self-contained-html \
-        --capture=tee-sys --show-capture=all --log-level=INFO \
-        "$test_dir/tests/test_api_keys.py" \
-        "$test_dir/tests/test_namespace_scoping.py" \
-        "$test_dir/tests/test_negative_security.py" \
-        "$test_dir/tests/test_subscription.py" \
-        "$test_dir/tests/test_models_endpoint.py" \
-        "$test_dir/tests/test_external_models.py" \
-        "$test_dir/tests/test_tenant.py" \
-        "$test_dir/tests/test_config_tenant.py" ; then
-        echo "❌ ERROR: E2E tests failed"
+    # Wait for authenticated requests to work end-to-end
+    local api_base="${scheme}://${GATEWAY_HOST}/maas-api"
+    local auth_timeout=180
+    local auth_deadline=$((SECONDS + auth_timeout))
+    echo "Waiting for authenticated gateway access (timeout: ${auth_timeout}s)..."
+    while [[ $SECONDS -lt $auth_deadline ]]; do
+        local auth_code
+        auth_code=$(curl -sk -o /dev/null -w '%{http_code}' -m 5 \
+            -H "Authorization: Bearer ${TOKEN}" \
+            "${api_base}/v1/subscriptions" 2>/dev/null || echo "000")
+        if [[ "$auth_code" == "200" ]]; then
+            echo "✅ Authenticated gateway access working (HTTP $auth_code)"
+            break
+        fi
+        echo "  Auth check returned HTTP $auth_code, retrying..."
+        sleep 5
+    done
+    if [[ $SECONDS -ge $auth_deadline ]]; then
+        echo "❌ ERROR: Authenticated gateway access not working after ${auth_timeout}s"
+        echo "   Check AuthPolicy status: kubectl get authpolicy -A -o wide"
+        echo "   Check Authorino logs: kubectl logs -n ${AUTHORINO_NAMESPACE} -l app=authorino --tail=50"
         exit 1
     fi
 
-    echo "✅ E2E tests completed"
-    echo " - JUnit XML : ${xml}"
-    echo " - HTML      : ${html}"
-}
-
-
-# Namespace for admin SA in SA fallback (avoids both admin+regular in default → both would be admin)
-E2E_ADMIN_SA_NAMESPACE="${E2E_ADMIN_SA_NAMESPACE:-maas-admin}"
-
-setup_test_user() {
-    local username="$1"
-    local cluster_role="$2"
-    local namespace="${3:-default}"
-    
-    # Create namespace if it doesn't exist
-    if ! oc get namespace "$namespace" &>/dev/null; then
-        echo "Creating namespace: $namespace"
-        oc create namespace "$namespace"
-    fi
-    
-    # Check and create service account
-    if ! oc get serviceaccount "$username" -n "$namespace" >/dev/null 2>&1; then
-        echo "Creating service account: $username in $namespace"
-        oc create serviceaccount "$username" -n "$namespace"
-    else
-        echo "Service account $username already exists in $namespace"
-    fi
-    
-    # Check and create cluster role binding
-    if ! oc get clusterrolebinding "${username}-binding" >/dev/null 2>&1; then
-        echo "Creating cluster role binding for $username"
-        oc adm policy add-cluster-role-to-user "$cluster_role" "system:serviceaccount:${namespace}:${username}"
-    else
-        echo "Cluster role binding for $username already exists"
-    fi
-    
-    echo "✅ User setup completed: $username (namespace: $namespace)"
-}
-
-# Patch Auth CR to add system:serviceaccounts:${admin_namespace} so SA-based admin token works.
-# maas-api AdminChecker checks user.Groups against Auth CR spec.adminGroups.
-# SA in namespace X has groups: system:serviceaccounts, system:serviceaccounts:X.
-# We use a dedicated admin namespace (maas-admin) so the regular user (in default) is NOT admin.
-# Grant the minimal RBAC needed for the SAR-based admin check.
-# SARAdminChecker verifies: can this user "create maasauthpolicies" in the subscription namespace?
-# This creates a namespace-scoped Role + RoleBinding instead of cluster-admin.
-_grant_maas_admin_rbac() {
-    local user="$1"
-    local ns="${MAAS_SUBSCRIPTION_NAMESPACE}"
-    local role_name="maas-admin-e2e"
-
-    oc apply -f - <<EOF
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: ${role_name}
-  namespace: ${ns}
-rules:
-- apiGroups: ["maas.opendatahub.io"]
-  resources: ["maasauthpolicies"]
-  verbs: ["create"]
-EOF
-
-    local safe_name
-    safe_name=$(echo "$user" | tr ':/' '-' | cut -c1-50)
-    oc create rolebinding "${role_name}-${safe_name}" \
-        --role="$role_name" \
-        --user="$user" \
-        -n "$ns" 2>/dev/null || true
-}
-
-_patch_auth_cr_for_sa_admin() {
-    local admin_namespace="${1:-$E2E_ADMIN_SA_NAMESPACE}"
-    local admin_group="system:serviceaccounts:${admin_namespace}"
-    
-    local auth_cr
-    for gvr in "auths.services.platform.opendatahub.io" "auths.platform.opendatahub.io"; do
-        if oc get "$gvr" auth &>/dev/null; then
-            auth_cr="$gvr"
-            break
-        fi
-    done
-    if [[ -z "$auth_cr" ]]; then
-        echo "⚠️  Auth CR not found - admin tests may fail (SA token not in adminGroups)"
-        return 0
-    fi
-    local current
-    current=$(oc get "$auth_cr" auth -o jsonpath='{.spec.adminGroups[*]}' 2>/dev/null || true)
-    if [[ "$current" == *"${admin_group}"* ]]; then
-        echo "✅ Auth CR already has ${admin_group} in adminGroups"
-        return 0
-    fi
-    if oc patch "$auth_cr" auth --type=json -p="[{\"op\": \"add\", \"path\": \"/spec/adminGroups/-\", \"value\": \"${admin_group}\"}]" 2>/dev/null; then
-        echo "✅ Added ${admin_group} to Auth CR adminGroups (SA admin fallback)"
-    else
-        echo "⚠️  Failed to patch Auth CR - admin tests may fail"
-    fi
-}
-
-setup_test_tokens() {
-    # ═══════════════════════════════════════════════════════════════════════════
-    # Extract test tokens WITHOUT switching the main oc session.
-    # 
-    # Architecture: 
-    #   - Main oc session stays as system:admin (for any cluster operations)
-    #   - Test tokens are extracted into env vars using a TEMPORARY kubeconfig
-    #   - Tests use TOKEN/ADMIN_OC_TOKEN env vars for API authentication
-    #
-    # Why htpasswd users instead of SA tokens?
-    #   - htpasswd users have OpenShift group memberships (system:authenticated)
-    #   - SA tokens don't carry group memberships, so they can't see models
-    # ═══════════════════════════════════════════════════════════════════════════
-    
-    echo "Setting up test tokens (admin + regular user)..."
-    
-    local current_user api_server
-    current_user=$(oc whoami)
-    api_server=$(oc whoami --show-server)
-    echo "Current admin session: $current_user (will be preserved)"
-    
-    export ADMIN_OC_TOKEN=""
-    export TOKEN=""
-    
-    # Use a temporary kubeconfig for token extraction logins
-    # This prevents polluting the main oc session
-    local temp_kubeconfig
-    temp_kubeconfig=$(mktemp)
-    trap "rm -f '$temp_kubeconfig'" RETURN
-    
-    # 1. Try htpasswd users from idp-htpasswd step (Prow CI)
-    if [[ -f "${SHARED_DIR:-}/runtime_env" ]]; then
-        # shellcheck source=/dev/null
-        source "${SHARED_DIR}/runtime_env"
-        if [[ -n "${USERS:-}" ]]; then
-            echo "Found htpasswd users from idp-htpasswd step"
-            
-            # Admin user: testuser-1 (added to odh-admins)
-            local admin_creds
-            admin_creds=$(echo "$USERS" | tr ',' '\n' | grep "^testuser-1:" | head -1)
-            if [[ -n "$admin_creds" ]]; then
-                local admin_user admin_pass
-                admin_user="${admin_creds%%:*}"
-                admin_pass="${admin_creds#*:}"
-                
-                # Add to odh-admins group (using main session which is system:admin)
-                oc adm groups add-users odh-admins "$admin_user" 2>/dev/null || true
-
-                # Grant minimal RBAC so SAR-based admin check passes.
-                # maas-api SARAdminChecker verifies the user can "create maasauthpolicies";
-                # the odh-admins group alone doesn't provide this RBAC in e2e clusters.
-                _grant_maas_admin_rbac "$admin_user"
-                
-                # Extract token using temp kubeconfig (doesn't affect main session)
-                if KUBECONFIG="$temp_kubeconfig" oc login "$api_server" -u "$admin_user" -p "$admin_pass" --insecure-skip-tls-verify=true &>/dev/null; then
-                    ADMIN_OC_TOKEN=$(KUBECONFIG="$temp_kubeconfig" oc whoami -t)
-                    echo "✅ Admin token for $admin_user (htpasswd)"
-                fi
-            fi
-            
-            # Regular user: testuser-2 (NOT in odh-admins, but has system:authenticated)
-            local regular_creds
-            regular_creds=$(echo "$USERS" | tr ',' '\n' | grep "^testuser-2:" | head -1)
-            if [[ -n "$regular_creds" ]]; then
-                local regular_user regular_pass
-                regular_user="${regular_creds%%:*}"
-                regular_pass="${regular_creds#*:}"
-                
-                # Extract token using temp kubeconfig (doesn't affect main session)
-                if KUBECONFIG="$temp_kubeconfig" oc login "$api_server" -u "$regular_user" -p "$regular_pass" --insecure-skip-tls-verify=true &>/dev/null; then
-                    TOKEN=$(KUBECONFIG="$temp_kubeconfig" oc whoami -t)
-                    echo "✅ Regular user token for $regular_user (htpasswd)"
-                fi
+    # OIDC readiness check (when external OIDC is enabled)
+    if [[ "${EXTERNAL_OIDC}" == "true" ]] && [[ -n "${OIDC_TOKEN_URL:-}" ]]; then
+        if [[ -n "${OIDC_ISSUER_URL:-}" ]]; then
+            echo "Checking gateway AuthPolicy OIDC issuer matches OIDC_ISSUER_URL..."
+            if ! verify_gateway_oidc_authpolicy "${GATEWAY_NAMESPACE:-openshift-ingress}"; then
+                echo "❌ ERROR: Fix deploy (same OIDC_ISSUER_URL as tests) or see deployment-helpers.sh"
+                exit 1
             fi
         fi
-    fi
-    
-    # 2. Fallback for admin: use current user's token (local htpasswd user)
-    if [[ -z "$ADMIN_OC_TOKEN" ]]; then
-        ADMIN_OC_TOKEN=$(oc whoami -t 2>/dev/null || true)
-        if [[ -n "$ADMIN_OC_TOKEN" ]]; then
-            oc adm groups add-users odh-admins "$current_user" 2>/dev/null || true
-            _grant_maas_admin_rbac "$current_user"
-            echo "✅ Admin token for $current_user (added to odh-admins)"
+        local oidc_timeout=180
+        local oidc_deadline=$((SECONDS + oidc_timeout))
+        echo "Verifying OIDC token authentication works (timeout: ${oidc_timeout}s)..."
+        local oidc_readiness_username="${OIDC_READINESS_USERNAME:-${OIDC_USERNAME}}"
+        local oidc_readiness_password="${OIDC_READINESS_PASSWORD:-${OIDC_PASSWORD}}"
+        local oidc_token
+        local oidc_token_error_file="${ARTIFACTS_DIR}/oidc-readiness-token-error.log"
+        mkdir -p "$ARTIFACTS_DIR"
+        echo "Using OIDC readiness user: ${oidc_readiness_username}"
+        if ! oidc_token=$(_request_oidc_token "$oidc_readiness_username" "$oidc_readiness_password" 2>"$oidc_token_error_file"); then
+            echo "❌ ERROR: Could not obtain OIDC token from ${OIDC_TOKEN_URL}"
+            exit 1
+        fi
+        rm -f "$oidc_token_error_file"
+        if [[ -n "$oidc_token" ]]; then
+            if [[ "${OIDC_READINESS_VALIDATE_ORGANIZATIONS:-false}" == "true" ]]; then
+                local oidc_claim_summary
+                if ! oidc_claim_summary=$(OIDC_TOKEN="$oidc_token" \
+                    OIDC_CLIENT_ID="$OIDC_CLIENT_ID" \
+                    OIDC_AUDIENCE="${OIDC_AUDIENCE:-}" \
+                    OIDC_ACCESS_TOKEN_PURPOSE_CLAIM="${OIDC_ACCESS_TOKEN_PURPOSE_CLAIM:-}" \
+                    OIDC_ACCESS_TOKEN_PURPOSE="${OIDC_ACCESS_TOKEN_PURPOSE:-}" \
+                    python3 -c '
+import base64
+import json
+import os
+import uuid
+
+parts = os.environ["OIDC_TOKEN"].split(".")
+if len(parts) != 3:
+    raise SystemExit("OIDC readiness token is not a three-part JWT")
+payload = parts[1]
+payload += "=" * (-len(payload) % 4)
+claims = json.loads(base64.urlsafe_b64decode(payload))
+if not isinstance(claims, dict):
+    raise SystemExit("OIDC token claims must be a JSON object")
+
+client_id = os.environ.get("OIDC_CLIENT_ID", "")
+if client_id and claims.get("azp") != client_id:
+    actual_client_id = claims.get("azp")
+    raise SystemExit(f"OIDC azp mismatch: expected {client_id}, got {actual_client_id!r}")
+
+audience = os.environ.get("OIDC_AUDIENCE", "")
+token_audience = claims.get("aud")
+if audience and token_audience != audience and audience not in (token_audience if isinstance(token_audience, list) else []):
+    raise SystemExit(f"OIDC audience mismatch: expected {audience}, got {token_audience!r}")
+
+purpose_claim = os.environ.get("OIDC_ACCESS_TOKEN_PURPOSE_CLAIM", "")
+purpose = os.environ.get("OIDC_ACCESS_TOKEN_PURPOSE", "")
+if purpose_claim and claims.get(purpose_claim) != purpose:
+    raise SystemExit(f"OIDC purpose mismatch: {purpose_claim}={claims.get(purpose_claim)!r}, expected {purpose!r}")
+
+organization_id = claims.get("org_id")
+organization_name = claims.get("org_name")
+if "https://redhat.com/maas/orgs" in claims or "maasOrganizations" in claims:
+    raise SystemExit("OIDC token must not include nested MaaS organization claims")
+if not isinstance(organization_id, str):
+    raise SystemExit("OIDC org_id must be a canonical UUID string")
+try:
+    canonical_organization_id = str(uuid.UUID(organization_id))
+except ValueError:
+    raise SystemExit("OIDC org_id must be a canonical UUID string")
+if canonical_organization_id != organization_id:
+    raise SystemExit("OIDC org_id must be a canonical UUID string")
+
+if "org_name" in claims and (
+    not isinstance(organization_name, str)
+    or len(organization_name.encode("utf-8")) > 256
+):
+    raise SystemExit("OIDC org_name must be a string of at most 256 bytes")
+
+roles = claims.get("roles", [])
+if not isinstance(roles, list) or len(roles) > 64:
+    raise SystemExit("OIDC roles must be an array with at most 64 values")
+if any(
+    not isinstance(role, str) or not role or len(role.encode("utf-8")) > 128
+    for role in roles
+):
+    raise SystemExit("OIDC roles must contain non-empty strings of at most 128 bytes")
+
+groups = claims.get("groups", [])
+if not isinstance(groups, list) or len(groups) > 128:
+    raise SystemExit("OIDC groups must be an array with at most 128 values")
+if any(
+    not isinstance(group, str) or not group or len(group.encode("utf-8")) > 256
+    for group in groups
+):
+    raise SystemExit("OIDC groups must contain non-empty strings of at most 256 bytes")
+if len(groups) != len(set(groups)):
+    raise SystemExit("OIDC organization groups must be unique")
+
+authorized_party = claims.get("azp")
+print(f"azp={authorized_party}, audience={token_audience!r}")
+                    ' 2>&1); then
+                    printf '%s\n' "$oidc_claim_summary" > "${ARTIFACTS_DIR}/oidc-readiness-claim-error.log"
+                    echo "❌ ERROR: OIDC readiness token contract validation failed"
+                    echo "$oidc_claim_summary"
+                    exit 1
+                fi
+                echo "✅ OIDC token contract valid (${oidc_claim_summary})"
+            fi
+            local oidc_response_file="${ARTIFACTS_DIR}/oidc-readiness-last-response.json"
+            local oidc_headers_file="${ARTIFACTS_DIR}/oidc-readiness-last-headers.txt"
+            while [[ $SECONDS -lt $oidc_deadline ]]; do
+                local oidc_code
+                oidc_code=$(curl -sk -D "$oidc_headers_file" -o "$oidc_response_file" -w '%{http_code}' -m 5 \
+                    -H "Authorization: Bearer ${oidc_token}" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"name\": \"e2e-oidc-readiness-$(date +%s)\"}" \
+                    "${api_base}/v1/api-keys" 2>/dev/null || true)
+                oidc_code="${oidc_code:-000}"
+                if [[ "$oidc_code" =~ ^(200|201)$ ]]; then
+                    echo "✅ OIDC token authentication working (HTTP $oidc_code)"
+                    rm -f "$oidc_response_file" "$oidc_headers_file"
+                    break
+                fi
+                local oidc_reason
+                oidc_reason=$(tr -d '\r' < "$oidc_headers_file" 2>/dev/null | awk 'BEGIN{IGNORECASE=1} /^x-ext-auth-reason:/{sub(/^[^:]*: */, ""); print; exit}' || true)
+                local oidc_response
+                oidc_response=$(tr '\n' ' ' < "$oidc_response_file" 2>/dev/null | cut -c1-500 || true)
+                echo "  OIDC auth check returned HTTP $oidc_code${oidc_reason:+ (x-ext-auth-reason=${oidc_reason})}: ${oidc_response}"
+                if [[ "$oidc_code" == "401" ]]; then
+                    if ! oidc_token=$(_request_oidc_token "$oidc_readiness_username" "$oidc_readiness_password"); then
+                        echo "❌ ERROR: Could not refresh OIDC token from ${OIDC_TOKEN_URL}"
+                        exit 1
+                    fi
+                fi
+                sleep 5
+            done
+            if [[ $SECONDS -ge $oidc_deadline ]]; then
+                echo "⚠️  WARNING: OIDC gateway readiness failed after ${oidc_timeout}s"
+                if [[ "${OIDC_READINESS_STRICT}" == "true" ]]; then
+                    echo "❌ ERROR: OIDC_READINESS_STRICT=true — exiting before pytest."
+                    exit 1
+                fi
+                echo "   Continuing to pytest — OIDC tests will run and fail naturally."
+            fi
         else
-            echo "⚠️  No htpasswd token available - using SA token (admin tests may fail)"
-            setup_test_user "tester-admin-user" "view" "$E2E_ADMIN_SA_NAMESPACE"
-            _grant_maas_admin_rbac "system:serviceaccount:${E2E_ADMIN_SA_NAMESPACE}:tester-admin-user"
-            # maas-api AdminChecker uses Auth CR adminGroups; SA in maas-admin has system:serviceaccounts:maas-admin
-            # Patch Auth CR so only tester-admin-user is admin (regular user stays in default → not admin)
-            _patch_auth_cr_for_sa_admin "$E2E_ADMIN_SA_NAMESPACE"
-            ADMIN_OC_TOKEN=$(oc create token tester-admin-user -n "$E2E_ADMIN_SA_NAMESPACE" --duration=1h)
+            echo "❌ ERROR: Could not obtain OIDC token from ${OIDC_TOKEN_URL}"
+            exit 1
         fi
     fi
-    
-    # Grant odh-admins RBAC so SAR-based admin check passes.
-    # maas-api IsAdmin does a SubjectAccessReview: "can user create maasauthpolicies?"
-    # The ODH operator will provide this via opendatahub-operator#3301; until then, create it here.
-    oc apply -f - <<RBAC_EOF
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: maas-admin
-rules:
-- apiGroups: ["maas.opendatahub.io"]
-  resources: ["maasauthpolicies", "maassubscriptions"]
-  verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: odh-admins-maas-admin
-  namespace: $MAAS_SUBSCRIPTION_NAMESPACE
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: maas-admin
-subjects:
-- apiGroup: rbac.authorization.k8s.io
-  kind: Group
-  name: odh-admins
-RBAC_EOF
 
-    # 3. Fallback for regular user: always use a separate SA to ensure distinct users
-    # This is required for IDOR tests that verify users cannot access each other's keys
-    # Regular user stays in default namespace (system:serviceaccounts:default) - NOT in adminGroups
-    if [[ -z "$TOKEN" ]]; then
-        echo "Creating separate SA token for regular user (required for IDOR tests)..."
-        setup_test_user "tester-regular-user" "view" "default"
-        TOKEN=$(oc create token tester-regular-user -n default --duration=1h)
-        echo "✅ Regular user token for tester-regular-user (SA-based, namespace: default)"
+    # Delegate pytest execution to run_e2e_tests.sh
+    export ARTIFACTS_DIR
+    export E2E_PARALLEL_WORKERS="${E2E_PARALLEL_WORKERS:-5}"
+    # Full suite by default (nightly / local / unmarked callers). /group-test opts
+    # into the low-churn subset via Tekton: E2E_SMOKE_ONLY=true.
+    export E2E_SMOKE_ONLY="${E2E_SMOKE_ONLY:-false}"
+    # Run the whole parallel pass even when some tests fail. The cluster's
+    # control plane (kuadrant-operator, maas-controller) is shared by all
+    # workers and goes unhealthy in roughly one run in five; a low cap aborts
+    # the pass around 87%, so the summary undercounts the damage and the flake
+    # report covers only the part that ran. The serial pass still runs after a
+    # parallel failure so its own result is reported independently.
+    export E2E_MAXFAIL="${E2E_MAXFAIL:-0}"
+    export E2E_RECONCILE_WAIT="${E2E_RECONCILE_WAIT:-4}"
+    # Nightly tier (pass 3) only when EXTERNAL_OIDC is deployed; passes 1–2 always skip nightly.
+    if [[ "${EXTERNAL_OIDC}" == "true" ]]; then
+        export MAAS_PYTEST_INCLUDE_NIGHTLY="${MAAS_PYTEST_INCLUDE_NIGHTLY:-true}"
     fi
-    
-    echo "Token setup complete (main session unchanged: $(oc whoami))"
+    "${SCRIPT_DIR}/run_e2e_tests.sh"
 }
 
-# Main execution
-# On exit (success or failure): collect artifacts (authorino-debug.log, cluster state, pod logs) and auth report
+# ── Artifact collection (EXIT trap) ─────────────────────────────────────
 _run_exit_artifacts() {
     local exit_code=$?
-    # Disable exit-on-error in trap to ensure we collect all artifacts even if some fail
     set +e
     DEPLOYMENT_NAMESPACE="$DEPLOYMENT_NAMESPACE" MAAS_SUBSCRIPTION_NAMESPACE="$MAAS_SUBSCRIPTION_NAMESPACE" AUTHORINO_NAMESPACE="$AUTHORINO_NAMESPACE" ARTIFACTS_DIR="$ARTIFACTS_DIR" \
         collect_e2e_artifacts
@@ -818,6 +544,10 @@ _run_exit_artifacts() {
 }
 trap '_run_exit_artifacts' EXIT
 
+# ═════════════════════════════════════════════════════════════════════════
+# Main Execution: prereqs → deploy → models → tokens → validate → tests
+# ═════════════════════════════════════════════════════════════════════════
+
 print_header "Deploying Maas on OpenShift"
 check_prerequisites
 
@@ -825,45 +555,37 @@ if [[ "$SKIP_DEPLOYMENT" == "true" ]]; then
     echo "  Skipping deployment (SKIP_DEPLOYMENT=true)"
     echo "  Assuming MaaS platform and models are already deployed"
 else
-    deploy_maas_platform
+    phase_mark deploy_platform start
+    source "${SCRIPT_DIR}/deploy-platform.sh"
+    phase_mark deploy_platform end
 
-    print_header "Deploying Models"  
-    deploy_models
+    if [[ -n "${AI_GATEWAY_CONTROLLER_IMAGE:-}" ]]; then
+        print_header "Installing AIGC companion (praxis dataplane)"
+        phase_mark deploy_aigc start
+        bash "${SCRIPT_DIR}/deploy-aigc-companion.sh"
+        phase_mark deploy_aigc end
+    fi
+
+    print_header "Deploying Models"
+    phase_mark deploy_models start
+    source "${SCRIPT_DIR}/deploy-models.sh"
+    phase_mark deploy_models end
     patch_authorino_debug  # from auth_utils.sh
 fi
 
 print_header "Setting up variables for tests"
 setup_vars_for_tests
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Phase 1: Admin Setup (runs as system:admin)
-# All cluster operations requiring admin privileges happen here BEFORE
-# we extract test tokens. This avoids context-switching issues.
-# ═══════════════════════════════════════════════════════════════════════════════
 print_header "Admin Setup (Premium Test Resources)"
-setup_premium_test_token
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Phase 2: Extract Test Tokens
-# Uses a temporary kubeconfig so the main oc session stays as system:admin.
-# Tests will use TOKEN/ADMIN_OC_TOKEN env vars for API authentication.
-# ═══════════════════════════════════════════════════════════════════════════════
 print_header "Setting up test tokens"
-setup_test_tokens
-
-# 15m matches Prow step timeout; sleep leaves time for cluster debugging before tests
-# echo "Sleeping 15 minutes for cluster debugging (Ctrl+C to skip)..."
-# sleep 900
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Phase 3: Run Tests
-# Tests use TOKEN/ADMIN_OC_TOKEN env vars for API auth.
-# The main oc session is still system:admin for any kubectl/oc commands.
-# ═══════════════════════════════════════════════════════════════════════════════
-print_header "Running E2E Tests"
-run_e2e_tests
+source "${SCRIPT_DIR}/setup-test-tokens.sh"
 
 print_header "Validating Deployment"
+phase_mark validate start
 validate_deployment
+phase_mark validate end
+
+print_header "Running E2E Tests"
+run_e2e_tests
 
 echo "🎉 Deployment completed successfully!"

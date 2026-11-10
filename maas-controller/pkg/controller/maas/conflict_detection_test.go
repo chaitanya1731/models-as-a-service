@@ -57,9 +57,10 @@ func TestDetectConflictingAuthPolicies_NoConflicts(t *testing.T) {
 	const (
 		modelName      = "llm"
 		namespace      = "default"
-		httpRouteName  = modelName
+		httpRouteName  = "maas-" + modelName
 		authPolicyName = "maas-auth-" + modelName
 		maasPolicyName = "policy-a"
+		gatewayNS      = "openshift-ingress"
 	)
 
 	model := newMaaSModelRef(modelName, namespace, "ExternalModel", modelName)
@@ -70,11 +71,25 @@ func TestDetectConflictingAuthPolicies_NoConflicts(t *testing.T) {
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithRESTMapper(testRESTMapper()).
-		WithObjects(model, route, maasPolicy, maasAP).
+		WithObjects(
+			legacyNamespace(namespace),
+			model,
+			route,
+			maasPolicy,
+			maasAP,
+			newMaaSAPIEndpointSlice("maas-system", "maas-api", true),
+			newReadyGatewayAuthPolicy(gatewayNS, maasGatewayAuthPolicyName),
+		).
 		WithStatusSubresource(&maasv1alpha1.MaaSAuthPolicy{}).
 		Build()
 
-	r := &MaaSAuthPolicyReconciler{Client: c, Scheme: scheme, MaaSAPINamespace: "maas-system"}
+	r := &MaaSAuthPolicyReconciler{
+		Client:           c,
+		Scheme:           scheme,
+		InfraNamespace:   "maas-system",
+		GatewayNamespace: gatewayNS,
+		GatewayName:      "maas-default-gateway",
+	}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: maasPolicyName, Namespace: namespace}}
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
 		t.Fatalf("Reconcile: unexpected error: %v", err)
@@ -88,12 +103,13 @@ func TestDetectConflictingAuthPolicies_NoConflicts(t *testing.T) {
 	cond := apimeta.FindStatusCondition(policy.Status.Conditions, ConditionConflictingAuthPolicy)
 	if cond == nil {
 		t.Fatal("ConflictingAuthPolicy condition not found")
-	}
-	if cond.Status != metav1.ConditionFalse {
-		t.Errorf("expected ConflictingAuthPolicy=False, got %v", cond.Status)
-	}
-	if cond.Reason != "NoConflict" {
-		t.Errorf("expected reason NoConflict, got %q", cond.Reason)
+	} else {
+		if cond.Status != metav1.ConditionFalse {
+			t.Errorf("expected ConflictingAuthPolicy=False, got %v", cond.Status)
+		}
+		if cond.Reason != "NoConflict" {
+			t.Errorf("expected reason NoConflict, got %q", cond.Reason)
+		}
 	}
 }
 
@@ -103,9 +119,10 @@ func TestDetectConflictingAuthPolicies_RogueDetected(t *testing.T) {
 	const (
 		modelName      = "llm"
 		namespace      = "default"
-		httpRouteName  = modelName
+		httpRouteName  = "maas-" + modelName
 		maasPolicyName = "policy-a"
 		rogueName      = "kserve-route-authn"
+		gatewayNS      = "openshift-ingress"
 	)
 
 	model := newMaaSModelRef(modelName, namespace, "ExternalModel", modelName)
@@ -116,11 +133,11 @@ func TestDetectConflictingAuthPolicies_RogueDetected(t *testing.T) {
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithRESTMapper(testRESTMapper()).
-		WithObjects(model, route, maasPolicy, rogueAP).
+		WithObjects(legacyNamespace(namespace), model, route, maasPolicy, rogueAP, newReadyGatewayAuthPolicy(gatewayNS, maasGatewayAuthPolicyName)).
 		WithStatusSubresource(&maasv1alpha1.MaaSAuthPolicy{}).
 		Build()
 
-	r := &MaaSAuthPolicyReconciler{Client: c, Scheme: scheme, MaaSAPINamespace: "maas-system"}
+	r := &MaaSAuthPolicyReconciler{Client: c, Scheme: scheme, InfraNamespace: "maas-system", GatewayNamespace: gatewayNS, GatewayName: "maas-default-gateway"}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: maasPolicyName, Namespace: namespace}}
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
 		t.Fatalf("Reconcile: unexpected error: %v", err)
@@ -134,15 +151,16 @@ func TestDetectConflictingAuthPolicies_RogueDetected(t *testing.T) {
 	cond := apimeta.FindStatusCondition(policy.Status.Conditions, ConditionConflictingAuthPolicy)
 	if cond == nil {
 		t.Fatal("ConflictingAuthPolicy condition not found")
-	}
-	if cond.Status != metav1.ConditionTrue {
-		t.Errorf("expected ConflictingAuthPolicy=True, got %v", cond.Status)
-	}
-	if cond.Reason != "ConflictDetected" {
-		t.Errorf("expected reason ConflictDetected, got %q", cond.Reason)
-	}
-	if !strings.Contains(cond.Message, rogueName) {
-		t.Errorf("expected message to contain rogue policy name %q, got %q", rogueName, cond.Message)
+	} else {
+		if cond.Status != metav1.ConditionTrue {
+			t.Errorf("expected ConflictingAuthPolicy=True, got %v", cond.Status)
+		}
+		if cond.Reason != "ConflictDetected" {
+			t.Errorf("expected reason ConflictDetected, got %q", cond.Reason)
+		}
+		if !strings.Contains(cond.Message, rogueName) {
+			t.Errorf("expected message to contain rogue policy name %q, got %q", rogueName, cond.Message)
+		}
 	}
 }
 
@@ -152,8 +170,9 @@ func TestDetectConflictingAuthPolicies_MultipleRogues(t *testing.T) {
 	const (
 		modelName      = "llm"
 		namespace      = "default"
-		httpRouteName  = modelName
+		httpRouteName  = "maas-" + modelName
 		maasPolicyName = "policy-a"
+		gatewayNS      = "openshift-ingress"
 	)
 
 	model := newMaaSModelRef(modelName, namespace, "ExternalModel", modelName)
@@ -165,11 +184,11 @@ func TestDetectConflictingAuthPolicies_MultipleRogues(t *testing.T) {
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithRESTMapper(testRESTMapper()).
-		WithObjects(model, route, maasPolicy, rogue1, rogue2).
+		WithObjects(legacyNamespace(namespace), model, route, maasPolicy, rogue1, rogue2, newReadyGatewayAuthPolicy(gatewayNS, maasGatewayAuthPolicyName)).
 		WithStatusSubresource(&maasv1alpha1.MaaSAuthPolicy{}).
 		Build()
 
-	r := &MaaSAuthPolicyReconciler{Client: c, Scheme: scheme, MaaSAPINamespace: "maas-system"}
+	r := &MaaSAuthPolicyReconciler{Client: c, Scheme: scheme, InfraNamespace: "maas-system", GatewayNamespace: gatewayNS, GatewayName: "maas-default-gateway"}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: maasPolicyName, Namespace: namespace}}
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
 		t.Fatalf("Reconcile: unexpected error: %v", err)
@@ -183,18 +202,19 @@ func TestDetectConflictingAuthPolicies_MultipleRogues(t *testing.T) {
 	cond := apimeta.FindStatusCondition(policy.Status.Conditions, ConditionConflictingAuthPolicy)
 	if cond == nil {
 		t.Fatal("ConflictingAuthPolicy condition not found")
-	}
-	if cond.Status != metav1.ConditionTrue {
-		t.Errorf("expected ConflictingAuthPolicy=True, got %v", cond.Status)
-	}
-	if !strings.Contains(cond.Message, "2 non-MaaS AuthPolicies") {
-		t.Errorf("expected message to mention 2 policies, got %q", cond.Message)
-	}
-	if !strings.Contains(cond.Message, "kserve-route-authn") {
-		t.Errorf("expected message to contain 'kserve-route-authn', got %q", cond.Message)
-	}
-	if !strings.Contains(cond.Message, "custom-auth-policy") {
-		t.Errorf("expected message to contain 'custom-auth-policy', got %q", cond.Message)
+	} else {
+		if cond.Status != metav1.ConditionTrue {
+			t.Errorf("expected ConflictingAuthPolicy=True, got %v", cond.Status)
+		}
+		if !strings.Contains(cond.Message, "2 non-MaaS AuthPolicies") {
+			t.Errorf("expected message to mention 2 policies, got %q", cond.Message)
+		}
+		if !strings.Contains(cond.Message, "kserve-route-authn") {
+			t.Errorf("expected message to contain 'kserve-route-authn', got %q", cond.Message)
+		}
+		if !strings.Contains(cond.Message, "custom-auth-policy") {
+			t.Errorf("expected message to contain 'custom-auth-policy', got %q", cond.Message)
+		}
 	}
 }
 
@@ -204,8 +224,9 @@ func TestDetectConflictingAuthPolicies_DifferentRoute(t *testing.T) {
 	const (
 		modelName      = "llm"
 		namespace      = "default"
-		httpRouteName  = modelName
+		httpRouteName  = "maas-" + modelName
 		maasPolicyName = "policy-a"
+		gatewayNS      = "openshift-ingress"
 	)
 
 	model := newMaaSModelRef(modelName, namespace, "ExternalModel", modelName)
@@ -216,11 +237,11 @@ func TestDetectConflictingAuthPolicies_DifferentRoute(t *testing.T) {
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithRESTMapper(testRESTMapper()).
-		WithObjects(model, route, maasPolicy, unrelatedAP).
+		WithObjects(legacyNamespace(namespace), model, route, maasPolicy, unrelatedAP, newReadyGatewayAuthPolicy(gatewayNS, maasGatewayAuthPolicyName)).
 		WithStatusSubresource(&maasv1alpha1.MaaSAuthPolicy{}).
 		Build()
 
-	r := &MaaSAuthPolicyReconciler{Client: c, Scheme: scheme, MaaSAPINamespace: "maas-system"}
+	r := &MaaSAuthPolicyReconciler{Client: c, Scheme: scheme, InfraNamespace: "maas-system", GatewayNamespace: gatewayNS, GatewayName: "maas-default-gateway"}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: maasPolicyName, Namespace: namespace}}
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
 		t.Fatalf("Reconcile: unexpected error: %v", err)
@@ -234,8 +255,7 @@ func TestDetectConflictingAuthPolicies_DifferentRoute(t *testing.T) {
 	cond := apimeta.FindStatusCondition(policy.Status.Conditions, ConditionConflictingAuthPolicy)
 	if cond == nil {
 		t.Fatal("ConflictingAuthPolicy condition not found")
-	}
-	if cond.Status != metav1.ConditionFalse {
+	} else if cond.Status != metav1.ConditionFalse {
 		t.Errorf("expected ConflictingAuthPolicy=False (different route), got %v", cond.Status)
 	}
 }
@@ -248,8 +268,9 @@ func TestDetectConflictingAuthPolicies_CrossNamespaceIsolation(t *testing.T) {
 		modelNamespace = "model-ns"
 		policyNS       = "policy-ns"
 		otherNS        = "other-ns"
-		httpRouteName  = modelName
+		httpRouteName  = "maas-" + modelName
 		maasPolicyName = "policy-a"
+		gatewayNS      = "openshift-ingress"
 	)
 
 	model := newMaaSModelRef(modelName, modelNamespace, "ExternalModel", modelName)
@@ -260,11 +281,11 @@ func TestDetectConflictingAuthPolicies_CrossNamespaceIsolation(t *testing.T) {
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithRESTMapper(testRESTMapper()).
-		WithObjects(model, route, maasPolicy, rogueInOtherNS).
+		WithObjects(legacyNamespace(policyNS), model, route, maasPolicy, rogueInOtherNS, newReadyGatewayAuthPolicy(gatewayNS, maasGatewayAuthPolicyName)).
 		WithStatusSubresource(&maasv1alpha1.MaaSAuthPolicy{}).
 		Build()
 
-	r := &MaaSAuthPolicyReconciler{Client: c, Scheme: scheme, MaaSAPINamespace: "maas-system"}
+	r := &MaaSAuthPolicyReconciler{Client: c, Scheme: scheme, InfraNamespace: "maas-system", GatewayNamespace: gatewayNS, GatewayName: "maas-default-gateway"}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: maasPolicyName, Namespace: policyNS}}
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
 		t.Fatalf("Reconcile: unexpected error: %v", err)
@@ -278,8 +299,7 @@ func TestDetectConflictingAuthPolicies_CrossNamespaceIsolation(t *testing.T) {
 	cond := apimeta.FindStatusCondition(policy.Status.Conditions, ConditionConflictingAuthPolicy)
 	if cond == nil {
 		t.Fatal("ConflictingAuthPolicy condition not found")
-	}
-	if cond.Status != metav1.ConditionFalse {
+	} else if cond.Status != metav1.ConditionFalse {
 		t.Errorf("expected ConflictingAuthPolicy=False (rogue in different namespace), got %v", cond.Status)
 	}
 }
@@ -290,9 +310,10 @@ func TestDetectConflictingAuthPolicies_ConflictResolved(t *testing.T) {
 	const (
 		modelName      = "llm"
 		namespace      = "default"
-		httpRouteName  = modelName
+		httpRouteName  = "maas-" + modelName
 		maasPolicyName = "policy-a"
 		rogueName      = "kserve-route-authn"
+		gatewayNS      = "openshift-ingress"
 	)
 
 	model := newMaaSModelRef(modelName, namespace, "ExternalModel", modelName)
@@ -303,11 +324,11 @@ func TestDetectConflictingAuthPolicies_ConflictResolved(t *testing.T) {
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithRESTMapper(testRESTMapper()).
-		WithObjects(model, route, maasPolicy, rogueAP).
+		WithObjects(legacyNamespace(namespace), model, route, maasPolicy, rogueAP, newReadyGatewayAuthPolicy(gatewayNS, maasGatewayAuthPolicyName)).
 		WithStatusSubresource(&maasv1alpha1.MaaSAuthPolicy{}).
 		Build()
 
-	r := &MaaSAuthPolicyReconciler{Client: c, Scheme: scheme, MaaSAPINamespace: "maas-system"}
+	r := &MaaSAuthPolicyReconciler{Client: c, Scheme: scheme, InfraNamespace: "maas-system", GatewayNamespace: gatewayNS, GatewayName: "maas-default-gateway"}
 	ctx := context.Background()
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: maasPolicyName, Namespace: namespace}}
 
@@ -341,8 +362,7 @@ func TestDetectConflictingAuthPolicies_ConflictResolved(t *testing.T) {
 	cond = apimeta.FindStatusCondition(policy.Status.Conditions, ConditionConflictingAuthPolicy)
 	if cond == nil {
 		t.Fatal("ConflictingAuthPolicy condition not found after resolution")
-	}
-	if cond.Status != metav1.ConditionFalse {
+	} else if cond.Status != metav1.ConditionFalse {
 		t.Errorf("expected ConflictingAuthPolicy=False after conflict resolution, got %v", cond.Status)
 	}
 }
@@ -353,6 +373,7 @@ func TestDetectConflictingAuthPolicies_MissingModel(t *testing.T) {
 	const (
 		namespace      = "default"
 		maasPolicyName = "policy-a"
+		gatewayNS      = "openshift-ingress"
 	)
 
 	maasPolicy := newMaaSAuthPolicy(maasPolicyName, namespace, "team-a",
@@ -361,11 +382,11 @@ func TestDetectConflictingAuthPolicies_MissingModel(t *testing.T) {
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithRESTMapper(testRESTMapper()).
-		WithObjects(maasPolicy).
+		WithObjects(legacyNamespace(namespace), maasPolicy, newReadyGatewayAuthPolicy(gatewayNS, maasGatewayAuthPolicyName)).
 		WithStatusSubresource(&maasv1alpha1.MaaSAuthPolicy{}).
 		Build()
 
-	r := &MaaSAuthPolicyReconciler{Client: c, Scheme: scheme, MaaSAPINamespace: "maas-system"}
+	r := &MaaSAuthPolicyReconciler{Client: c, Scheme: scheme, InfraNamespace: "maas-system", GatewayNamespace: gatewayNS, GatewayName: "maas-default-gateway"}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: maasPolicyName, Namespace: namespace}}
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -379,8 +400,7 @@ func TestDetectConflictingAuthPolicies_MissingModel(t *testing.T) {
 	cond := apimeta.FindStatusCondition(policy.Status.Conditions, ConditionConflictingAuthPolicy)
 	if cond == nil {
 		t.Fatal("ConflictingAuthPolicy condition not found")
-	}
-	if cond.Status != metav1.ConditionFalse {
+	} else if cond.Status != metav1.ConditionFalse {
 		t.Errorf("expected ConflictingAuthPolicy=False (model not found, no route to check), got %v", cond.Status)
 	}
 }
@@ -392,7 +412,7 @@ func TestDetectConflictingAuthPolicies_GatewayTarget(t *testing.T) {
 	const (
 		modelName      = "llm"
 		namespace      = "default"
-		httpRouteName  = modelName
+		httpRouteName  = "maas-" + modelName
 		maasPolicyName = "policy-a"
 	)
 
@@ -400,9 +420,11 @@ func TestDetectConflictingAuthPolicies_GatewayTarget(t *testing.T) {
 	route := newHTTPRoute(httpRouteName, namespace)
 	maasPolicy := newMaaSAuthPolicy(maasPolicyName, namespace, "team-a", maasv1alpha1.ModelRef{Name: modelName, Namespace: namespace})
 
+	gatewayNS := "openshift-ingress"
+
 	gatewayAP := &unstructured.Unstructured{}
 	gatewayAP.SetGroupVersionKind(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1", Kind: "AuthPolicy"})
-	gatewayAP.SetName("gateway-default-auth")
+	gatewayAP.SetName("gateway-scoped-auth")
 	gatewayAP.SetNamespace(namespace)
 	_ = unstructured.SetNestedMap(gatewayAP.Object, map[string]any{
 		"targetRef": map[string]any{
@@ -415,11 +437,11 @@ func TestDetectConflictingAuthPolicies_GatewayTarget(t *testing.T) {
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithRESTMapper(testRESTMapper()).
-		WithObjects(model, route, maasPolicy, gatewayAP).
+		WithObjects(legacyNamespace(namespace), model, route, maasPolicy, gatewayAP, newReadyGatewayAuthPolicy(gatewayNS, maasGatewayAuthPolicyName)).
 		WithStatusSubresource(&maasv1alpha1.MaaSAuthPolicy{}).
 		Build()
 
-	r := &MaaSAuthPolicyReconciler{Client: c, Scheme: scheme, MaaSAPINamespace: "maas-system"}
+	r := &MaaSAuthPolicyReconciler{Client: c, Scheme: scheme, InfraNamespace: "maas-system", GatewayNamespace: gatewayNS, GatewayName: "maas-default-gateway"}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: maasPolicyName, Namespace: namespace}}
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -433,8 +455,7 @@ func TestDetectConflictingAuthPolicies_GatewayTarget(t *testing.T) {
 	cond := apimeta.FindStatusCondition(policy.Status.Conditions, ConditionConflictingAuthPolicy)
 	if cond == nil {
 		t.Fatal("ConflictingAuthPolicy condition not found")
-	}
-	if cond.Status != metav1.ConditionFalse {
+	} else if cond.Status != metav1.ConditionFalse {
 		t.Errorf("expected ConflictingAuthPolicy=False (Gateway target, not HTTPRoute), got %v", cond.Status)
 	}
 }
@@ -446,18 +467,19 @@ func TestDetectConflictingAuthPolicies_Deduplication(t *testing.T) {
 	const (
 		namespace      = "default"
 		sharedRoute    = "shared-route"
+		httpRouteName  = "maas-" + sharedRoute
 		maasPolicyName = "policy-a"
 		rogueName      = "kserve-route-authn"
 	)
 
 	modelA := newMaaSModelRef("model-a", namespace, "ExternalModel", sharedRoute)
 	modelB := newMaaSModelRef("model-b", namespace, "ExternalModel", sharedRoute)
-	route := newHTTPRoute(sharedRoute, namespace)
+	route := newExternalModelHTTPRoute(sharedRoute, namespace)
 	maasPolicy := newMaaSAuthPolicy(maasPolicyName, namespace, "team-a",
 		maasv1alpha1.ModelRef{Name: "model-a", Namespace: namespace},
 		maasv1alpha1.ModelRef{Name: "model-b", Namespace: namespace},
 	)
-	rogueAP := newRogueAuthPolicy(rogueName, namespace, sharedRoute)
+	rogueAP := newRogueAuthPolicy(rogueName, namespace, httpRouteName)
 
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -466,7 +488,7 @@ func TestDetectConflictingAuthPolicies_Deduplication(t *testing.T) {
 		WithStatusSubresource(&maasv1alpha1.MaaSAuthPolicy{}).
 		Build()
 
-	r := &MaaSAuthPolicyReconciler{Client: c, Scheme: scheme, MaaSAPINamespace: "maas-system"}
+	r := &MaaSAuthPolicyReconciler{Client: c, Scheme: scheme, InfraNamespace: "maas-system"}
 	log := ctrl.Log.WithName("test")
 
 	conflicts, err := r.detectConflictingAuthPolicies(context.Background(), log, maasPolicy)
@@ -524,15 +546,16 @@ func TestSetConflictingAuthPolicyCondition_Unit(t *testing.T) {
 			cond := apimeta.FindStatusCondition(policy.Status.Conditions, ConditionConflictingAuthPolicy)
 			if cond == nil {
 				t.Fatal("condition not set")
-			}
-			if cond.Status != tc.wantStatus {
-				t.Errorf("status = %v, want %v", cond.Status, tc.wantStatus)
-			}
-			if cond.Reason != tc.wantReason {
-				t.Errorf("reason = %q, want %q", cond.Reason, tc.wantReason)
-			}
-			if cond.ObservedGeneration != 1 {
-				t.Errorf("observedGeneration = %d, want 1", cond.ObservedGeneration)
+			} else {
+				if cond.Status != tc.wantStatus {
+					t.Errorf("status = %v, want %v", cond.Status, tc.wantStatus)
+				}
+				if cond.Reason != tc.wantReason {
+					t.Errorf("reason = %q, want %q", cond.Reason, tc.wantReason)
+				}
+				if cond.ObservedGeneration != 1 {
+					t.Errorf("observedGeneration = %d, want 1", cond.ObservedGeneration)
+				}
 			}
 		})
 	}

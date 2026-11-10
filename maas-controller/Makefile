@@ -67,10 +67,24 @@ $(BUILD_DIR):
 run: binary ##	build and run manager locally
 	"$(BUILD_DIR)/$(BINARY_NAME)"
 
+.PHONY: setup-envtest
+setup-envtest: $(SETUP_ENVTEST) ##	download the envtest binaries for ENVTEST_K8S_VERSION
+	"$(SETUP_ENVTEST)" use "$(ENVTEST_K8S_VERSION)" --bin-dir "$(LOCALBIN)"
+
+# setup-envtest stops the build when the binaries cannot be downloaded; the lookup
+# below only reads what it installed (-i), so it cannot fail on the network.
 TEST_FLAGS ?= -race -coverprofile=coverage.out
+# The group-name pattern sync test reads files outside this module (the
+# maas-api copy and the docs). Go's test
+# result cache cannot see those files, so the check runs with -count=1: a
+# cached result must never mask drift from a docs- or scripts-only change.
+.PHONY: test-groupname-sync
+test-groupname-sync:
+	go test -race -count=1 -run TestPatternCopiesInSync ./pkg/groupname/
+
 .PHONY: test
-test: tidy ##	run tests with coverage
-	go test $(TEST_FLAGS) ./...
+test: tidy setup-envtest test-groupname-sync ##	run tests with coverage, including envtest-backed tests
+	KUBEBUILDER_ASSETS="$$("$(SETUP_ENVTEST)" use "$(ENVTEST_K8S_VERSION)" --bin-dir "$(LOCALBIN)" -i -p path)" go test $(TEST_FLAGS) ./...
 	@go tool cover -html=coverage.out -o coverage.html
 	@echo "Test coverage report generated: $(abspath coverage.html)"
 
@@ -95,19 +109,21 @@ endif
 
 .PHONY: generate
 generate: $(CONTROLLER_GEN) ##	generate deepcopy code for API types
-	$(CONTROLLER_GEN) object paths="./api/..."
+	"$(CONTROLLER_GEN)" object paths="./api/..."
 
 .PHONY: manifests
 manifests: $(CONTROLLER_GEN) ##	generate CRD and RBAC manifests
-	$(CONTROLLER_GEN) crd paths="./api/..." output:crd:dir=../deployment/base/maas-controller/crd/bases
-	$(CONTROLLER_GEN) rbac:roleName=maas-controller-role paths="./..." output:rbac:dir=../deployment/base/maas-controller/rbac
+	"$(CONTROLLER_GEN)" crd paths="./api/..." output:crd:dir=../deployment/base/maas-controller/crd/bases
+	"$(CONTROLLER_GEN)" rbac:roleName=maas-controller-role paths=./cmd/... paths=./pkg/... paths=./api/... output:rbac:dir=../deployment/base/maas-controller/rbac
 	@mv ../deployment/base/maas-controller/rbac/role.yaml ../deployment/base/maas-controller/rbac/clusterrole.yaml
+	"$(CONTROLLER_GEN)" rbac:roleName=maas-controller-ocp-role paths=. output:rbac:dir=../deployment/base/maas-controller/rbac/ocp
+	@mv ../deployment/base/maas-controller/rbac/ocp/role.yaml ../deployment/base/maas-controller/rbac/ocp/clusterrole_ocp.yaml
 
 .PHONY: verify-codegen
 verify-codegen: generate manifests ##	run generate + manifests and fail if files changed (CI check)
-	@if ! git diff --quiet HEAD -- api/ ../deployment/base/maas-controller/crd/bases/ ../deployment/base/maas-controller/rbac/clusterrole.yaml; then \
+	@if ! git diff --quiet HEAD -- api/ ../deployment/base/maas-controller/crd/bases/ ../deployment/base/maas-controller/rbac/clusterrole.yaml ../deployment/base/maas-controller/rbac/ocp/clusterrole_ocp.yaml; then \
 		echo "ERROR: Generated files are out of date. Please run 'make -C maas-controller generate manifests' from the repo root and commit the results."; \
-		git diff --stat HEAD -- api/ ../deployment/base/maas-controller/crd/bases/ ../deployment/base/maas-controller/rbac/clusterrole.yaml; \
+		git diff --stat HEAD -- api/ ../deployment/base/maas-controller/crd/bases/ ../deployment/base/maas-controller/rbac/clusterrole.yaml ../deployment/base/maas-controller/rbac/ocp/clusterrole_ocp.yaml; \
 		exit 1; \
 	fi
 	@UNTRACKED=$$(git ls-files --others --exclude-standard -- api/ ../deployment/base/maas-controller/crd/bases/ ../deployment/base/maas-controller/rbac/); \
@@ -117,6 +133,15 @@ verify-codegen: generate manifests ##	run generate + manifests and fail if files
 		exit 1; \
 	fi
 	@echo "Generated files are up to date."
+
+##@ Chaos validation
+
+KNOWLEDGE_MODEL ?= ../chaos/knowledge/maas.yaml
+
+.PHONY: chaos-validate
+chaos-validate: $(OPERATOR_CHAOS) ##	validate knowledge model and run local preflight
+	"$(OPERATOR_CHAOS)" validate --knowledge "$(KNOWLEDGE_MODEL)"
+	"$(OPERATOR_CHAOS)" preflight --knowledge "$(KNOWLEDGE_MODEL)" --local
 
 ##@ Deployment
 

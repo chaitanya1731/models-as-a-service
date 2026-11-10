@@ -10,11 +10,28 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/openai/openai-go/v2/packages/pagination"
 
+	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/constant"
 	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/logger"
+	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/middleware"
 	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/models"
 	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/subscription"
 	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/token"
 )
+
+// MetricsRecorder is the subset of metrics.MetricsRecorder used by this handler.
+type MetricsRecorder interface {
+	RecordRejection(reason string)
+}
+
+func (h *ModelsHandler) withContext(c *gin.Context) *ModelsHandler {
+	requestHandler := *h
+	if requestLogger := middleware.GetLogger(c); requestLogger != nil {
+		requestHandler.logger = requestLogger
+	} else {
+		requestHandler.logger = h.logger.WithContext(c.Request.Context())
+	}
+	return &requestHandler
+}
 
 // ModelsHandler handles model-related endpoints.
 type ModelsHandler struct {
@@ -22,6 +39,7 @@ type ModelsHandler struct {
 	subscriptionSelector *subscription.Selector
 	logger               *logger.Logger
 	maasModelRefLister   models.MaaSModelRefLister
+	metrics              MetricsRecorder
 }
 
 // NewModelsHandler creates a new models handler.
@@ -31,6 +49,7 @@ func NewModelsHandler(
 	modelMgr *models.Manager,
 	subscriptionSelector *subscription.Selector,
 	maasModelRefLister models.MaaSModelRefLister,
+	metrics MetricsRecorder,
 ) *ModelsHandler {
 	if log == nil {
 		log = logger.Production()
@@ -40,6 +59,7 @@ func NewModelsHandler(
 		subscriptionSelector: subscriptionSelector,
 		logger:               log,
 		maasModelRefLister:   maasModelRefLister,
+		metrics:              metrics,
 	}
 }
 
@@ -122,21 +142,13 @@ func (h *ModelsHandler) handleSubscriptionSelectionError(c *gin.Context, err err
 		return
 	}
 
-	if errors.As(err, &accessDeniedErr) {
-		h.logger.Debug("Access denied to subscription")
+	// Unify "access denied" and "not found" responses to prevent callers from
+	// probing whether a subscription exists. (CWE-639 / FIND-009)
+	if errors.As(err, &accessDeniedErr) || errors.As(err, &notFoundErr) {
+		h.logger.Debug("Subscription access denied or not found")
 		c.JSON(http.StatusForbidden, gin.H{
 			"error": gin.H{
-				"message": err.Error(),
-				"type":    "permission_error",
-			}})
-		return
-	}
-
-	if errors.As(err, &notFoundErr) {
-		h.logger.Debug("Subscription not found")
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": gin.H{
-				"message": err.Error(),
+				"message": "access denied to requested subscription",
 				"type":    "permission_error",
 			}})
 		return
@@ -177,6 +189,9 @@ func (h *ModelsHandler) extractAndValidateAuth(c *gin.Context) (string, string, 
 	authHeader := strings.TrimSpace(c.GetHeader("Authorization"))
 	if authHeader == "" {
 		h.logger.Debug("Authorization header missing") // SAFE: Logging that header is missing, not the value itself
+		if h.metrics != nil {
+			h.metrics.RecordRejection(constant.RejectionUnauthorized)
+		}
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"error": gin.H{
 				"message": "Authorization required",
@@ -185,7 +200,8 @@ func (h *ModelsHandler) extractAndValidateAuth(c *gin.Context) (string, string, 
 		return "", "", false, errors.New("missing authorization")
 	}
 
-	// Extract x-maas-subscription header.
+	isAPIKeyRequest := strings.HasPrefix(authHeader, "Bearer sk-oai-")
+
 	requestedSubscription := ""
 	headerValues := c.Request.Header.Values("X-Maas-Subscription")
 	for i := len(headerValues) - 1; i >= 0; i-- {
@@ -195,7 +211,6 @@ func (h *ModelsHandler) extractAndValidateAuth(c *gin.Context) (string, string, 
 			break
 		}
 	}
-	isAPIKeyRequest := strings.HasPrefix(authHeader, "Bearer sk-oai-")
 
 	// Fail closed: API keys without a bound subscription must be rejected
 	if isAPIKeyRequest && requestedSubscription == "" {
@@ -243,6 +258,8 @@ func (h *ModelsHandler) getUserContextIfNeeded(c *gin.Context) (*token.UserConte
 }
 
 // aggregateModelsFromSubscriptions filters and aggregates models across multiple subscriptions.
+// When multiple subscriptions reference the same models, they are probed concurrently to avoid
+// sequential timeout accumulation.
 func (h *ModelsHandler) aggregateModelsFromSubscriptions(
 	c *gin.Context,
 	list []models.Model,
@@ -254,32 +271,65 @@ func (h *ModelsHandler) aggregateModelsFromSubscriptions(
 		url     string
 		ownedBy string
 	}
-	modelsByKey := make(map[modelKey]*models.Model)
+
+	// Use a channel and goroutines to probe subscriptions in parallel
+	type probeResult struct {
+		subscription *subscription.SelectResponse
+		models       []models.Model
+	}
+
+	resultChan := make(chan probeResult, len(subscriptionsToUse))
+	const maxConcurrentProbes = 10
+	probeSem := make(chan struct{}, maxConcurrentProbes)
+
+	// Capture context before spawning goroutines (gin.Context is not safe for concurrent use)
+	ctx := c.Request.Context()
 
 	for _, sub := range subscriptionsToUse {
-		// Pre-filter by modelRefs if available (optimization to reduce HTTP calls)
-		modelsToCheck := list
-		if len(sub.ModelRefs) > 0 {
+		go func(sub *subscription.SelectResponse) {
+			// Limit concurrent probes to prevent resource exhaustion
+			select {
+			case probeSem <- struct{}{}:
+				defer func() { <-probeSem }()
+			case <-ctx.Done():
+				resultChan <- probeResult{subscription: sub, models: nil}
+				return
+			}
+
+			// modelRefs are the access boundary: FilterModelsByAccess only checks readiness,
+			// so skipping this for a subscription without modelRefs would list every Ready model.
 			h.logger.Debug("Pre-filtering models by subscription modelRefs",
 				"subscription", sub.Name,
 				"totalModels", len(list),
 				"modelRefsCount", len(sub.ModelRefs),
 			)
-			modelsToCheck = filterModelsBySubscription(list, sub.ModelRefs)
+			modelsToCheck := filterModelsBySubscription(list, sub.ModelRefs)
 			h.logger.Debug("After modelRef filtering", "modelsToCheck", len(modelsToCheck))
+
+			probeSubscriptionHeader := sub.Name
+			h.logger.Debug("Filtering models by subscription", "subscription", sub.Name, "modelCount", len(modelsToCheck), "probeWithSubscriptionHeader", probeSubscriptionHeader != "")
+			filteredModels := h.modelMgr.FilterModelsByAccess(ctx, modelsToCheck, authHeader, probeSubscriptionHeader)
+
+			resultChan <- probeResult{
+				subscription: sub,
+				models:       filteredModels,
+			}
+		}(sub)
+	}
+
+	// Collect results from all subscription probes
+	modelsByKey := make(map[modelKey]*models.Model)
+	for range subscriptionsToUse {
+		result := <-resultChan
+
+		subInfo := models.SubscriptionInfo{
+			Name:        result.subscription.Name,
+			DisplayName: result.subscription.DisplayName,
+			Description: result.subscription.Description,
 		}
 
-		probeSubscriptionHeader := sub.Name
-		h.logger.Debug("Filtering models by subscription", "subscription", sub.Name, "modelCount", len(modelsToCheck), "probeWithSubscriptionHeader", probeSubscriptionHeader != "")
-		filteredModels := h.modelMgr.FilterModelsByAccess(c.Request.Context(), modelsToCheck, authHeader, probeSubscriptionHeader)
-
-		for _, model := range filteredModels {
-			subInfo := models.SubscriptionInfo{
-				Name:        sub.Name,
-				DisplayName: sub.DisplayName,
-				Description: sub.Description,
-			}
-
+		for idx := range result.models {
+			model := result.models[idx] // avoid taking address of loop variable
 			urlStr := ""
 			if model.URL != nil {
 				urlStr = model.URL.String()
@@ -294,6 +344,7 @@ func (h *ModelsHandler) aggregateModelsFromSubscriptions(
 			}
 		}
 	}
+	close(resultChan)
 
 	// Convert map to slice with deterministic ordering
 	keys := make([]modelKey, 0, len(modelsByKey))
@@ -319,6 +370,26 @@ func (h *ModelsHandler) aggregateModelsFromSubscriptions(
 
 // ListLLMs handles GET /v1/models.
 func (h *ModelsHandler) ListLLMs(c *gin.Context) {
+	h = h.withContext(c)
+
+	// When no user identity was extracted by the ExtractUserInfoOptional
+	// middleware, return an empty model list.  This covers the case where no
+	// LLMInferenceService is deployed (Authorino has no auth policy and does
+	// not inject identity headers) regardless of whether the caller sent an
+	// Authorization header.
+	_, hasUserContext := c.Get("user")
+	if !hasUserContext {
+		h.logger.Debug("No auth context present, returning empty model list")
+		c.Header("Cache-Control", "no-store")
+		c.Header("X-Access-Checked-At", time.Now().UTC().Format(time.RFC3339))
+		h.logger.Debug("GET /v1/models returning models", "count", 0)
+		c.JSON(http.StatusOK, pagination.Page[models.Model]{
+			Object: "list",
+			Data:   []models.Model{},
+		})
+		return
+	}
+
 	// Validate and extract authentication details
 	authHeader, requestedSubscription, isAPIKeyRequest, err := h.extractAndValidateAuth(c)
 	if err != nil {
@@ -342,6 +413,10 @@ func (h *ModelsHandler) ListLLMs(c *gin.Context) {
 	} else {
 		h.logger.Debug("User token request - returning all accessible models")
 	}
+
+	// Prevent clients and proxies from caching authorization-checked model listings.
+	// Set early so every return path (including early 403s) includes the header.
+	c.Header("Cache-Control", "no-store")
 
 	// Determine which subscriptions to use for model filtering
 	subscriptionsToUse, shouldReturn := h.selectSubscriptionsForListing(c, userContext, requestedSubscription, returnAllModels)
@@ -374,7 +449,6 @@ func (h *ModelsHandler) ListLLMs(c *gin.Context) {
 			} else {
 				// User has zero accessible subscriptions - return empty list
 				h.logger.Debug("User has zero accessible subscriptions, returning empty model list")
-				// modelList is already initialized to empty slice above
 			}
 		} else {
 			// Filter models by subscription(s) and aggregate subscriptions
@@ -387,10 +461,7 @@ func (h *ModelsHandler) ListLLMs(c *gin.Context) {
 		h.logger.Debug("MaaSModelRef lister not configured, returning empty model list")
 	}
 
-	// Prevent clients and proxies from caching authorization-checked model listings.
-	// The access check is a point-in-time snapshot; auth policies may change at any moment.
 	// X-Access-Checked-At lets clients assess the freshness of the authorization decision.
-	c.Header("Cache-Control", "no-store")
 	c.Header("X-Access-Checked-At", accessCheckedAt.Format(time.RFC3339))
 
 	h.logger.Debug("GET /v1/models returning models", "count", len(modelList))
@@ -401,11 +472,8 @@ func (h *ModelsHandler) ListLLMs(c *gin.Context) {
 }
 
 // filterModelsBySubscription filters models to only those matching the subscription's modelRefs.
+// A subscription without modelRefs grants no models.
 func filterModelsBySubscription(modelList []models.Model, modelRefs []subscription.ModelRefInfo) []models.Model {
-	if len(modelRefs) == 0 {
-		return modelList
-	}
-
 	// Build map of allowed models for fast lookup
 	allowed := make(map[string]bool)
 	for _, ref := range modelRefs {

@@ -32,10 +32,13 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	gatewayapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	maasv1alpha1 "github.com/opendatahub-io/models-as-a-service/maas-controller/api/maas/v1alpha1"
+	"github.com/opendatahub-io/models-as-a-service/maas-controller/pkg/modelnaming"
 	"github.com/opendatahub-io/models-as-a-service/maas-controller/pkg/platform/tenantreconcile"
 )
 
@@ -101,9 +104,10 @@ func TestManagedAnnotation_Service(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.testName, func(t *testing.T) {
+			resourceName := modelnaming.ExternalModelResourceName(name)
 			existingSvc := &corev1.Service{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:        name,
+					Name:        resourceName,
 					Namespace:   ns,
 					Annotations: tc.annotations,
 				},
@@ -121,7 +125,7 @@ func TestManagedAnnotation_Service(t *testing.T) {
 			require.NoError(t, err)
 
 			got := &corev1.Service{}
-			require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, got))
+			require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: resourceName, Namespace: ns}, got))
 
 			if tc.wantSpecChanged {
 				assert.Equal(t, endpoint, got.Spec.ExternalName, "expected Service ExternalName to be updated to endpoint")
@@ -161,9 +165,10 @@ func TestManagedAnnotation_ServiceEntry(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.testName, func(t *testing.T) {
+			resourceName := modelnaming.ExternalModelResourceName(name)
 			existingSE := &unstructured.Unstructured{}
 			existingSE.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "ServiceEntry"})
-			existingSE.SetName(name)
+			existingSE.SetName(resourceName)
 			existingSE.SetNamespace(ns)
 			existingSE.SetAnnotations(tc.annotations)
 			_ = unstructured.SetNestedStringSlice(existingSE.Object, []string{sentinelEndpoint}, "spec", "hosts")
@@ -177,7 +182,7 @@ func TestManagedAnnotation_ServiceEntry(t *testing.T) {
 
 			got := &unstructured.Unstructured{}
 			got.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "ServiceEntry"})
-			require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, got))
+			require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: resourceName, Namespace: ns}, got))
 
 			hosts, _, _ := unstructured.NestedStringSlice(got.Object, "spec", "hosts")
 			if tc.wantSpecChanged {
@@ -220,9 +225,10 @@ func TestManagedAnnotation_HTTPRoute(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.testName, func(t *testing.T) {
+			resourceName := modelnaming.ExternalModelResourceName(name)
 			existingHR := &gatewayapiv1.HTTPRoute{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:        name,
+					Name:        resourceName,
 					Namespace:   ns,
 					Annotations: tc.annotations,
 				},
@@ -243,7 +249,7 @@ func TestManagedAnnotation_HTTPRoute(t *testing.T) {
 			require.NoError(t, err)
 
 			got := &gatewayapiv1.HTTPRoute{}
-			require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, got))
+			require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: resourceName, Namespace: ns}, got))
 
 			if tc.wantSpecChanged {
 				require.Len(t, got.Spec.ParentRefs, 1)
@@ -292,10 +298,11 @@ func TestManagedAnnotation_DestinationRule_DeletePath(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.testName, func(t *testing.T) {
+			resourceName := modelnaming.ExternalModelResourceName(name)
 			// Pre-populate a stale DestinationRule (left over from when TLS was enabled).
 			existingDR := &unstructured.Unstructured{}
 			existingDR.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule"})
-			existingDR.SetName(name)
+			existingDR.SetName(resourceName)
 			existingDR.SetNamespace(ns)
 			existingDR.SetAnnotations(tc.annotations)
 
@@ -309,7 +316,7 @@ func TestManagedAnnotation_DestinationRule_DeletePath(t *testing.T) {
 
 			got := &unstructured.Unstructured{}
 			got.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule"})
-			getErr := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, got)
+			getErr := c.Get(context.Background(), types.NamespacedName{Name: resourceName, Namespace: ns}, got)
 
 			if tc.wantDeleted {
 				assert.True(t, apierrors.IsNotFound(getErr),
@@ -320,6 +327,188 @@ func TestManagedAnnotation_DestinationRule_DeletePath(t *testing.T) {
 			}
 		})
 	}
+}
+
+// newInferenceExternalModel creates a minimal inference.opendatahub.io ExternalModel
+// as an unstructured object for testing the supersede check. When routeName is
+// non-empty it is set on status.httpRouteName, marking the inference route as
+// programmed (Ready) — the signal that gates legacy teardown.
+func newInferenceExternalModel(name, ns, routeName string) *unstructured.Unstructured {
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "inference.opendatahub.io/v1alpha1",
+		"kind":       "ExternalModel",
+		"metadata": map[string]any{
+			"name":      name,
+			"namespace": ns,
+		},
+	}}
+	if routeName != "" {
+		obj.Object["status"] = map[string]any{"httpRouteName": routeName}
+	}
+	return obj
+}
+
+// TestReconcile_SupersededByInference verifies that when an inference.opendatahub.io
+// ExternalModel exists, the legacy reconciler tears down its maas-* children
+// instead of creating/updating them.
+func TestReconcile_SupersededByInference(t *testing.T) {
+	const (
+		name     = "gpt-4o"
+		ns       = "llm"
+		endpoint = "api.openai.com"
+	)
+	resourceName := modelnaming.ExternalModelResourceName(name)
+
+	// Pre-populate legacy children that should be torn down.
+	legacySvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: ns},
+		Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeExternalName, ExternalName: endpoint},
+	}
+	legacyHR := &gatewayapiv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: ns},
+		Spec:       gatewayapiv1.HTTPRouteSpec{},
+	}
+
+	em := newTestExternalModel(name, ns, endpoint, nil)
+	inferenceEM := newInferenceExternalModel(name, ns, resourceName)
+
+	c := fake.NewClientBuilder().WithScheme(testScheme).
+		WithStatusSubresource(&maasv1alpha1.ExternalModel{}).
+		WithObjects(em, legacySvc, legacyHR).
+		WithObjects(inferenceEM).
+		Build()
+	r := &Reconciler{Client: c, Scheme: testScheme, Log: ctrl.Log}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: name, Namespace: ns},
+	})
+	require.NoError(t, err)
+
+	// Legacy Service should be deleted.
+	gotSvc := &corev1.Service{}
+	assert.True(t, apierrors.IsNotFound(
+		c.Get(context.Background(), types.NamespacedName{Name: resourceName, Namespace: ns}, gotSvc)),
+		"expected legacy Service to be deleted")
+
+	// Legacy HTTPRoute should be deleted.
+	gotHR := &gatewayapiv1.HTTPRoute{}
+	assert.True(t, apierrors.IsNotFound(
+		c.Get(context.Background(), types.NamespacedName{Name: resourceName, Namespace: ns}, gotHR)),
+		"expected legacy HTTPRoute to be deleted")
+
+	// Legacy ExternalModel remains and exposes a durable signal that
+	// migration completed.
+	gotEM := &maasv1alpha1.ExternalModel{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, gotEM))
+	assert.Equal(t, "Migrated", gotEM.Status.Phase)
+	assert.Equal(t, "Model migrated to inference.opendatahub.io ExternalModel: gpt-4o", gotEM.Status.Message)
+}
+
+// TestReconcile_NoInferenceModel_ProceedsNormally verifies that without an
+// inference.opendatahub.io ExternalModel, the reconciler creates children as usual.
+func TestReconcile_NoInferenceModel_ProceedsNormally(t *testing.T) {
+	const (
+		name     = "gpt-4o"
+		ns       = "llm"
+		endpoint = "api.openai.com"
+	)
+
+	em := newTestExternalModel(name, ns, endpoint, nil)
+	c := fake.NewClientBuilder().WithScheme(testScheme).WithObjects(em).Build()
+	r := &Reconciler{Client: c, Scheme: testScheme, Log: ctrl.Log, GatewayName: "maas-gw", GatewayNamespace: "ingress"}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: name, Namespace: ns},
+	})
+	require.NoError(t, err)
+
+	resourceName := modelnaming.ExternalModelResourceName(name)
+
+	// Service should be created.
+	gotSvc := &corev1.Service{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: resourceName, Namespace: ns}, gotSvc))
+	assert.Equal(t, endpoint, gotSvc.Spec.ExternalName)
+
+	// HTTPRoute should be created.
+	gotHR := &gatewayapiv1.HTTPRoute{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: resourceName, Namespace: ns}, gotHR))
+}
+
+// TestReconcile_InferenceNotReady_ProceedsNormally verifies that when an
+// inference.opendatahub.io ExternalModel exists but has not yet published its
+// HTTPRoute (status.httpRouteName unset), the legacy reconciler does NOT tear down
+// its children — avoiding a routing gap before the replacement route is programmed.
+func TestReconcile_InferenceNotReady_ProceedsNormally(t *testing.T) {
+	const (
+		name     = "gpt-4o"
+		ns       = "llm"
+		endpoint = "api.openai.com"
+	)
+	resourceName := modelnaming.ExternalModelResourceName(name)
+
+	em := newTestExternalModel(name, ns, endpoint, nil)
+	// Inference CR exists but is not Ready yet (no status.httpRouteName).
+	inferenceEM := newInferenceExternalModel(name, ns, "")
+
+	c := fake.NewClientBuilder().WithScheme(testScheme).
+		WithObjects(em).
+		WithObjects(inferenceEM).
+		Build()
+	r := &Reconciler{Client: c, Scheme: testScheme, Log: ctrl.Log, GatewayName: "maas-gw", GatewayNamespace: "ingress"}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: name, Namespace: ns},
+	})
+	require.NoError(t, err)
+
+	// Legacy children should still be created, since the inference route is not live.
+	gotSvc := &corev1.Service{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: resourceName, Namespace: ns}, gotSvc),
+		"expected legacy Service to be created while inference route is not Ready")
+
+	gotHR := &gatewayapiv1.HTTPRoute{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: resourceName, Namespace: ns}, gotHR),
+		"expected legacy HTTPRoute to be created while inference route is not Ready")
+}
+
+// TestReconcile_SupersededDoesNotTeardownOptedOut verifies that teardown
+// respects the opendatahub.io/managed=false annotation on legacy children.
+func TestReconcile_SupersededDoesNotTeardownOptedOut(t *testing.T) {
+	const (
+		name     = "gpt-4o"
+		ns       = "llm"
+		endpoint = "api.openai.com"
+	)
+	resourceName := modelnaming.ExternalModelResourceName(name)
+
+	legacySvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        resourceName,
+			Namespace:   ns,
+			Annotations: map[string]string{tenantreconcile.AnnotationManaged: "false"},
+		},
+		Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeExternalName, ExternalName: endpoint},
+	}
+
+	em := newTestExternalModel(name, ns, endpoint, nil)
+	inferenceEM := newInferenceExternalModel(name, ns, resourceName)
+
+	c := fake.NewClientBuilder().WithScheme(testScheme).
+		WithStatusSubresource(&maasv1alpha1.ExternalModel{}).
+		WithObjects(em, legacySvc).
+		WithObjects(inferenceEM).
+		Build()
+	r := &Reconciler{Client: c, Scheme: testScheme, Log: ctrl.Log}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: name, Namespace: ns},
+	})
+	require.NoError(t, err)
+
+	// Service with managed=false should survive.
+	gotSvc := &corev1.Service{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: resourceName, Namespace: ns}, gotSvc),
+		"expected opted-out Service to survive teardown")
 }
 
 // TestIsManaged verifies the isManaged helper function covers all edge cases.
@@ -344,4 +533,211 @@ func TestIsManaged(t *testing.T) {
 			assert.Equal(t, tc.want, isManaged(obj))
 		})
 	}
+}
+
+// TestReconcile_SupersededReleasesMigratedResources verifies that the legacy
+// ExternalModel stops owning the inference ExternalModel and ExternalProvider
+// IPP's legacy migration created for it, so deleting the deprecated object
+// does not garbage-collect the live model.
+func TestReconcile_SupersededReleasesMigratedResources(t *testing.T) {
+	const (
+		name     = "gpt-4o"
+		ns       = "llm"
+		endpoint = "api.openai.com"
+	)
+	resourceName := modelnaming.ExternalModelResourceName(name)
+
+	em := newTestExternalModel(name, ns, endpoint, nil)
+	em.UID = "legacy-uid"
+	controller := true
+	legacyOwner := metav1.OwnerReference{
+		APIVersion: maasv1alpha1.GroupVersion.String(), Kind: "ExternalModel", Name: name, UID: em.UID,
+		Controller: &controller, BlockOwnerDeletion: &controller,
+	}
+	otherOwner := metav1.OwnerReference{APIVersion: "v1", Kind: "ConfigMap", Name: "other", UID: "other-uid"}
+	migrated := map[string]string{labelManagedBy: managedByIPPLegacyMigration, labelMigratedFrom: name}
+
+	inferenceEM := newInferenceExternalModel(name, ns, resourceName)
+	inferenceEM.SetLabels(migrated)
+	inferenceEM.SetOwnerReferences([]metav1.OwnerReference{legacyOwner, otherOwner})
+	inferenceEP := &unstructured.Unstructured{}
+	inferenceEP.SetGroupVersionKind(inferenceExternalProviderGVK)
+	inferenceEP.SetName(name)
+	inferenceEP.SetNamespace(ns)
+	inferenceEP.SetLabels(migrated)
+	inferenceEP.SetOwnerReferences([]metav1.OwnerReference{legacyOwner})
+
+	c := fake.NewClientBuilder().WithScheme(testScheme).
+		WithStatusSubresource(&maasv1alpha1.ExternalModel{}).
+		WithObjects(em, inferenceEM, inferenceEP).
+		Build()
+	r := &Reconciler{Client: c, Scheme: testScheme, Log: ctrl.Log}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: name, Namespace: ns},
+	})
+	require.NoError(t, err)
+
+	for _, gvk := range []schema.GroupVersionKind{inferenceExternalModelGVK, inferenceExternalProviderGVK} {
+		got := &unstructured.Unstructured{}
+		got.SetGroupVersionKind(gvk)
+		require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, got))
+		for _, ref := range got.GetOwnerReferences() {
+			assert.NotEqual(t, em.UID, ref.UID, "%s still owned by the legacy ExternalModel", gvk.Kind)
+		}
+	}
+	gotEM := &unstructured.Unstructured{}
+	gotEM.SetGroupVersionKind(inferenceExternalModelGVK)
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, gotEM))
+	assert.Equal(t, []metav1.OwnerReference{otherOwner}, gotEM.GetOwnerReferences(), "unrelated owners are kept")
+
+	gotLegacy := &maasv1alpha1.ExternalModel{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, gotLegacy))
+	assert.Equal(t, "Migrated", gotLegacy.Status.Phase, "the release must not hide the route name from the superseded check")
+}
+
+// TestReconcile_InferenceLookupGets verifies how often a reconcile reads the
+// inference resources: the ExternalModel once, and the ExternalProvider only
+// when that ExternalModel exists.
+func TestReconcile_InferenceLookupGets(t *testing.T) {
+	const (
+		name     = "gpt-4o"
+		ns       = "llm"
+		endpoint = "api.openai.com"
+	)
+	tests := []struct {
+		name         string
+		objects      []client.Object
+		wantProvider int
+	}{
+		{name: "no inference ExternalModel", wantProvider: 0},
+		{name: "inference ExternalModel exists", objects: []client.Object{newInferenceExternalModel(name, ns, "")}, wantProvider: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gets := map[schema.GroupVersionKind]int{}
+			c := fake.NewClientBuilder().WithScheme(testScheme).
+				WithStatusSubresource(&maasv1alpha1.ExternalModel{}).
+				WithObjects(newTestExternalModel(name, ns, endpoint, nil)).
+				WithObjects(tt.objects...).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+						if u, ok := obj.(*unstructured.Unstructured); ok {
+							gets[u.GroupVersionKind()]++
+						}
+						return cl.Get(ctx, key, obj, opts...)
+					},
+				}).
+				Build()
+			r := &Reconciler{Client: c, Scheme: testScheme, Log: ctrl.Log, GatewayName: "maas-gw", GatewayNamespace: "ingress"}
+			_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+			require.NoError(t, err)
+
+			assert.Equal(t, 1, gets[inferenceExternalModelGVK])
+			assert.Equal(t, tt.wantProvider, gets[inferenceExternalProviderGVK])
+		})
+	}
+}
+
+// TestReconcile_InferenceNotReadyReleasesMigratedResources verifies that the
+// legacy ExternalModel stops owning the migrated resources before the inference
+// ExternalModel has a route name, while keeping its legacy networking and phase.
+func TestReconcile_InferenceNotReadyReleasesMigratedResources(t *testing.T) {
+	const (
+		name     = "gpt-4o"
+		ns       = "llm"
+		endpoint = "api.openai.com"
+	)
+	em := newTestExternalModel(name, ns, endpoint, nil)
+	em.UID = "legacy-uid"
+	owner := metav1.OwnerReference{APIVersion: maasv1alpha1.GroupVersion.String(), Kind: "ExternalModel", Name: name, UID: em.UID}
+	migrated := map[string]string{labelManagedBy: managedByIPPLegacyMigration, labelMigratedFrom: name}
+
+	inferenceEM := newInferenceExternalModel(name, ns, "")
+	inferenceEM.SetLabels(migrated)
+	inferenceEM.SetOwnerReferences([]metav1.OwnerReference{owner})
+	inferenceEP := &unstructured.Unstructured{}
+	inferenceEP.SetGroupVersionKind(inferenceExternalProviderGVK)
+	inferenceEP.SetName(name)
+	inferenceEP.SetNamespace(ns)
+	inferenceEP.SetLabels(migrated)
+	inferenceEP.SetOwnerReferences([]metav1.OwnerReference{owner})
+
+	c := fake.NewClientBuilder().WithScheme(testScheme).
+		WithStatusSubresource(&maasv1alpha1.ExternalModel{}).
+		WithObjects(em, inferenceEM, inferenceEP).
+		Build()
+	r := &Reconciler{Client: c, Scheme: testScheme, Log: ctrl.Log, GatewayName: "maas-gw", GatewayNamespace: "ingress"}
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+	require.NoError(t, err)
+
+	for _, gvk := range []schema.GroupVersionKind{inferenceExternalModelGVK, inferenceExternalProviderGVK} {
+		got := &unstructured.Unstructured{}
+		got.SetGroupVersionKind(gvk)
+		require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, got))
+		assert.Empty(t, got.GetOwnerReferences(), "%s still owned by the legacy ExternalModel", gvk.Kind)
+	}
+
+	resourceName := modelnaming.ExternalModelResourceName(name)
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: resourceName, Namespace: ns}, &gatewayapiv1.HTTPRoute{}),
+		"legacy HTTPRoute must stay while the inference route is not Ready")
+	gotEM := &maasv1alpha1.ExternalModel{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, gotEM))
+	assert.NotEqual(t, "Migrated", gotEM.Status.Phase)
+}
+
+// TestReconcile_SupersededKeepsOwnersOfUnmigratedResources verifies that an
+// inference ExternalModel IPP's legacy migration did not create keeps its
+// owner references.
+func TestReconcile_SupersededKeepsOwnersOfUnmigratedResources(t *testing.T) {
+	const (
+		name     = "gpt-4o"
+		ns       = "llm"
+		endpoint = "api.openai.com"
+	)
+	em := newTestExternalModel(name, ns, endpoint, nil)
+	em.UID = "legacy-uid"
+	owner := metav1.OwnerReference{APIVersion: maasv1alpha1.GroupVersion.String(), Kind: "ExternalModel", Name: name, UID: em.UID}
+	inferenceEM := newInferenceExternalModel(name, ns, modelnaming.ExternalModelResourceName(name))
+	inferenceEM.SetOwnerReferences([]metav1.OwnerReference{owner})
+
+	c := fake.NewClientBuilder().WithScheme(testScheme).
+		WithStatusSubresource(&maasv1alpha1.ExternalModel{}).
+		WithObjects(em, inferenceEM).
+		Build()
+	r := &Reconciler{Client: c, Scheme: testScheme, Log: ctrl.Log}
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+	require.NoError(t, err)
+
+	got := &unstructured.Unstructured{}
+	got.SetGroupVersionKind(inferenceExternalModelGVK)
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, got))
+	assert.Equal(t, []metav1.OwnerReference{owner}, got.GetOwnerReferences())
+}
+
+// TestReconcile_MigratedStaysSuperseded verifies that a migrated legacy
+// ExternalModel does not get its networking back when its inference
+// ExternalModel loses its route name, for example while it is failing.
+func TestReconcile_MigratedStaysSuperseded(t *testing.T) {
+	const (
+		name     = "gpt-4o"
+		ns       = "llm"
+		endpoint = "api.openai.com"
+	)
+	em := newTestExternalModel(name, ns, endpoint, nil)
+	em.Status.Phase = "Migrated"
+	inferenceEM := newInferenceExternalModel(name, ns, "")
+
+	c := fake.NewClientBuilder().WithScheme(testScheme).
+		WithStatusSubresource(&maasv1alpha1.ExternalModel{}).
+		WithObjects(em, inferenceEM).
+		Build()
+	r := &Reconciler{Client: c, Scheme: testScheme, Log: ctrl.Log, GatewayName: "maas-gw", GatewayNamespace: "ingress"}
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+	require.NoError(t, err)
+
+	resourceName := modelnaming.ExternalModelResourceName(name)
+	assert.True(t, apierrors.IsNotFound(
+		c.Get(context.Background(), types.NamespacedName{Name: resourceName, Namespace: ns}, &gatewayapiv1.HTTPRoute{})),
+		"a migrated legacy ExternalModel must not recreate its HTTPRoute")
 }

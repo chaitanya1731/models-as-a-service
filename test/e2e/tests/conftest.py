@@ -1,10 +1,187 @@
+import collections
+import json
+import logging
 import os
+import socket
 import subprocess
+import time
+import uuid
+from urllib.parse import urlparse
 import pytest
 import requests
 
+from test_helper import (
+    MAAS_API_DEPLOYMENT_NAMESPACE,
+    _is_transient_gateway_response,
+    _request_with_gateway_retry,
+)
+
+
+log = logging.getLogger(__name__)
+
+_WORKER_ISOLATED_XDIST_GROUPS = frozenset({"api_keys", "models"})
+
+
+# pr_new marking lives in pr_new_selection.py (pytest_plugins) so it is not
+# overwritten by the trylast pytest_collection_modifyitems below.
+pytest_plugins = ["pr_new_selection"]
+
+
+def _xdist_worker_suffix() -> str:
+    """Stable suffix for per-worker session fixtures under pytest-xdist."""
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "master")
+    if worker == "master":
+        return "main"
+    return worker.replace("gw", "w")
+
+
+@pytest.fixture(scope="session")
+def worker_tenant_context():
+    """Create one isolated AITenant for tests explicitly marked worker_tenant."""
+    from worker_tenant_fixtures import (
+        bootstrap_worker_tenant,
+        build_worker_tenant_case,
+        teardown_worker_tenant,
+        worker_tenant_enabled,
+    )
+
+    if not worker_tenant_enabled():
+        pytest.skip("worker tenant isolation disabled by E2E_USE_WORKER_TENANT")
+
+    case = build_worker_tenant_case(_xdist_worker_suffix())
+    try:
+        case = bootstrap_worker_tenant(case)
+        print(
+            f"[worker_tenant] worker={_xdist_worker_suffix()} "
+            f"namespace={case.tenant_namespace} gateway={case.route_host}"
+        )
+        yield case
+    finally:
+        teardown_worker_tenant(case)
+
+
+@pytest.fixture
+def single_subscription_tenant(monkeypatch):
+    """Provide an empty test-owned tenant for single-subscription auto-selection."""
+    import test_helper
+    from worker_tenant_fixtures import (
+        activate_worker_tenant,
+        bootstrap_worker_tenant,
+        build_worker_tenant_case,
+        teardown_worker_tenant,
+        xdist_worker_suffix,
+    )
+
+    # Keep maas-api-key-cleanup-<tenant> within the 52-character CronJob limit.
+    context = build_worker_tenant_case(f"single-{xdist_worker_suffix()}")
+    try:
+        context = bootstrap_worker_tenant(context, baseline=False)
+        monkeypatch.setattr(
+            test_helper, "GATEWAY_AUTH_POLICY_NAME", context.gateway_authpolicy_name,
+        )
+        with activate_worker_tenant(context):
+            yield context
+    finally:
+        teardown_worker_tenant(context)
+
+
+@pytest.fixture(autouse=True)
+def _activate_marked_worker_tenant(request):
+    """Provision isolation only when the test explicitly opts in by marker."""
+    if (
+        request.node.get_closest_marker("worker_tenant")
+        and not request.node.get_closest_marker("serial")
+    ):
+        request.getfixturevalue("worker_tenant_context")
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(config, items):  # noqa: ARG001 - pytest hook signature
+    """Tag serial tests and activate explicitly marked worker isolation.
+
+    xdist_group alone does not block other workers from touching shared cluster
+    state (simulator-subscription, UNCONFIGURED model auth, MODEL_REF TRLP churn).
+    CI runs serial tests in a second pass.
+
+    Every xdist worker collects every test, so isolation must never be inferred
+    from the collected xdist groups. The worker_tenant marker is the opt-in.
+    """
+    for item in items:
+        if item.get_closest_marker("serial"):
+            item.add_marker(pytest.mark.xdist_group("serial"))
+
+        xdist_markers = list(item.iter_markers("xdist_group"))
+        if not xdist_markers:
+            raise pytest.UsageError(
+                f"{item.nodeid}: E2E tests require an explicit xdist_group marker"
+            )
+
+        grouped_state = {
+            marker.args[0]
+            for marker in xdist_markers
+            if marker.args and marker.args[0] in _WORKER_ISOLATED_XDIST_GROUPS
+        }
+        if (
+            grouped_state
+            and not item.get_closest_marker("serial")
+            and not item.get_closest_marker("worker_tenant")
+        ):
+            groups = ", ".join(sorted(grouped_state))
+            raise pytest.UsageError(
+                f"{item.nodeid}: mutable xdist group {groups} requires "
+                "@pytest.mark.worker_tenant or @pytest.mark.serial"
+            )
+
+    _order_grid_oidc_tests_first(items)
+
+
+def _order_grid_oidc_tests_first(items):
+    """Surface Grid OIDC failures before the longer legacy external suite."""
+    items.sort(
+        key=lambda item: 0 if item.get_closest_marker("grid_oidc") else 1
+    )
+
+
 # TLS verification flag - set E2E_SKIP_TLS_VERIFY=true to disable cert verification
 TLS_VERIFY = os.environ.get("E2E_SKIP_TLS_VERIFY", "").lower() != "true"
+
+# Session/module fixtures mint a key or read the catalog once on behalf of many
+# tests. A single transient 5xx there errors the whole module (or session), so
+# they retry further than a single request would.
+FIXTURE_GATEWAY_RETRIES = int(os.environ.get("E2E_FIXTURE_GATEWAY_RETRIES", "8"))
+
+# When using port-forward (GATEWAY_HOST=127.0.0.1:PORT), set GATEWAY_ROUTE_HOST to the
+# real route hostname so OpenShift gateway routing matches the Host header.
+_GATEWAY_ROUTE_HOST = os.environ.get("GATEWAY_ROUTE_HOST", "")
+
+
+def _maybe_inject_gateway_route_host(method, url, kwargs):
+    if not _GATEWAY_ROUTE_HOST:
+        return kwargs
+    url_str = str(url)
+    if "127.0.0.1" in url_str or "localhost" in url_str:
+        headers = dict(kwargs.get("headers") or {})
+        headers.setdefault("Host", _GATEWAY_ROUTE_HOST)
+        kwargs["headers"] = headers
+    return kwargs
+
+
+if _GATEWAY_ROUTE_HOST:
+    _orig_request = requests.api.request
+
+    def _request(method, url, **kwargs):
+        kwargs = _maybe_inject_gateway_route_host(method, url, kwargs)
+        return _orig_request(method, url, **kwargs)
+
+    requests.api.request = _request
+
+    _orig_session_request = requests.Session.request
+
+    def _session_request(self, method, url, **kwargs):
+        kwargs = _maybe_inject_gateway_route_host(method, url, kwargs)
+        return _orig_session_request(self, method, url, **kwargs)
+
+    requests.Session.request = _session_request
 
 
 @pytest.fixture(scope="session")
@@ -16,7 +193,7 @@ def gateway_host() -> str:
     host = os.environ.get("GATEWAY_HOST", "")
     if host:
         return host
-    
+
     # Fall back to deriving from MAAS_API_BASE_URL
     url = os.environ.get("MAAS_API_BASE_URL", "")
     if url:
@@ -28,8 +205,31 @@ def gateway_host() -> str:
         if "://" in url:
             url = url.split("://", 1)[1]
         return url
-    
+
     raise RuntimeError("GATEWAY_HOST or MAAS_API_BASE_URL env var is required")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _verify_gateway_dns(gateway_host: str):
+    """Verify the gateway hostname resolves before running any tests.
+
+    If DNS resolution fails, all tests are skipped. This catches CI
+    infrastructure issues (e.g. cluster teardown, network isolation)
+    early instead of producing cryptic ConnectionError stack traces
+    in every test.
+    """
+    host_port = gateway_host.rsplit(":", 1)
+    if len(host_port) == 2 and host_port[1].isdigit():
+        host, port = host_port[0], int(host_port[1])
+    else:
+        host, port = gateway_host, None
+    try:
+        socket.getaddrinfo(host, port or 0)
+    except socket.gaierror:
+        pytest.skip(
+            f"Gateway hostname '{gateway_host}' does not resolve "
+            f"— CI infrastructure issue, skipping all tests"
+        )
 
 
 @pytest.fixture(scope="session")
@@ -47,10 +247,34 @@ def maas_api_base_url(gateway_host: str, is_https: bool) -> str:
     url = os.environ.get("MAAS_API_BASE_URL", "")
     if url:
         return url.rstrip("/")
-    
+
     # Otherwise derive from gateway_host
     scheme = "https" if is_https else "http"
     return f"{scheme}://{gateway_host}/maas-api"
+
+
+@pytest.fixture(scope="session")
+def maas_api_internal_url() -> str:
+    """
+    MaaS API internal service URL (for internal-only endpoints like /v1/tenant).
+
+    These endpoints are NOT exposed through the Gateway and must be called
+    via the Kubernetes Service directly.
+
+    Can be overridden with MAAS_API_INTERNAL_URL env var for custom deployments.
+    """
+    # Allow override
+    url = os.environ.get("MAAS_API_INTERNAL_URL", "")
+    if url:
+        return url.rstrip("/")
+
+    # Default: cluster-internal service URL
+    # maas-api uses TLS on port 8443 (OpenShift service-serving cert)
+    namespace = os.environ.get("MAAS_NAMESPACE", MAAS_API_DEPLOYMENT_NAMESPACE)
+    service_name = os.environ.get("MAAS_API_SERVICE_NAME", "maas-api")
+    port = os.environ.get("MAAS_API_SERVICE_PORT", "8443")
+
+    return f"https://{service_name}.{namespace}.svc.cluster.local:{port}"
 
 @pytest.fixture(scope="session")
 def token() -> str:
@@ -77,9 +301,46 @@ def token() -> str:
 def headers(token: str):
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
+def _create_api_key(url: str, headers: dict, payload: dict, name_prefix: str) -> requests.Response:
+    """POST an API-key creation, retrying transient gateway responses.
+
+    Creation is not idempotent and the key is show-once: a 5xx can arrive after
+    the server already minted the key, and a retry under the same name would
+    collide with (or duplicate) a key whose plaintext was lost with the
+    response. Each attempt therefore gets a fresh name, so a retry can only
+    ever create a key the test goes on to use.
+    """
+    response = None
+    for attempt in range(1, FIXTURE_GATEWAY_RETRIES + 1):
+        body = dict(payload, name=f"{name_prefix}-{uuid.uuid4().hex[:6]}")
+        response = requests.post(url, headers=headers, json=body, timeout=30, verify=TLS_VERIFY)
+        if response.status_code in (200, 201):
+            return response
+        # A non-transient error is the answer, not a flake.
+        if not _is_transient_gateway_response(response) or attempt == FIXTURE_GATEWAY_RETRIES:
+            return response
+        log.info(
+            "API key creation returned %d (attempt %d/%d), retrying under a new name",
+            response.status_code,
+            attempt,
+            FIXTURE_GATEWAY_RETRIES,
+        )
+        time.sleep(min(2 * attempt, 10))
+    return response
+
+
 @pytest.fixture(scope="session")
 def model_catalog(maas_api_base_url: str, headers: dict):
-    r = requests.get(f"{maas_api_base_url}/v1/models", headers=headers, timeout=45, verify=TLS_VERIFY)
+    # Session-scoped: a single transient 5xx here would error every test that
+    # depends on the catalog, so it must ride out gateway/AuthPolicy reloads.
+    r = _request_with_gateway_retry(
+        requests.get,
+        f"{maas_api_base_url}/v1/models",
+        headers=headers,
+        timeout=45,
+        verify=TLS_VERIFY,
+        retries=FIXTURE_GATEWAY_RETRIES,
+    )
     r.raise_for_status()
     return r.json()
 
@@ -96,12 +357,21 @@ def model_id(model_catalog: dict):
 
 @pytest.fixture(scope="session")
 def model_base_url(model_catalog: dict, model_id: str, gateway_url: str) -> str:
+    # E2E_MODEL_PATH provides an explicit path override for clusters that use per-model
+    # path-based routing (e.g. /llm/{model-name}) rather than BBR gateway-root routing.
+    # Without this, the catalog url field (gateway root on BBR clusters) produces a path
+    # of "" which resolves to gateway_root — a path with no HTTPRoute → 404.
+    path_override = os.environ.get("E2E_MODEL_PATH")
+    if path_override:
+        return f"{gateway_url}{path_override}".rstrip("/")
     items = (model_catalog.get("data") or model_catalog.get("models") or [])
     match = next((m for m in items if m.get("id") == model_id), None)
     if match:
         url = match.get("url")
         if url:
-            return url.rstrip("/")
+            path = urlparse(url).path
+            if path.startswith("/") and path != "/":
+                return f"{gateway_url}{path}".rstrip("/")
     return f"{gateway_url}/llm/{model_id}".rstrip("/")
 
 @pytest.fixture(scope="session")
@@ -144,7 +414,7 @@ def admin_headers(admin_token: str):
         return None
     return {"Authorization": f"Bearer {admin_token}", "Content-Type": "application/json"}
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def api_key(api_keys_base_url: str, headers: dict) -> str:
     """
     Create an API key for model inference tests.
@@ -153,29 +423,242 @@ def api_key(api_keys_base_url: str, headers: dict) -> str:
     Note: The key inherits the authenticated user's groups, which should include
     system:authenticated to satisfy AuthPolicy requirements for model access.
     """
+    from multitenancy_helpers import response_summary
+
     sim_sub = os.environ.get("E2E_SIMULATOR_SUBSCRIPTION", "simulator-subscription")
-    print("[api_key] Creating API key for inference tests (subscription bound at mint)...")
-    r = requests.post(
+    key_name = f"e2e-test-inference-key-{_xdist_worker_suffix()}"
+    print(f"[api_key] Creating API key for inference tests ({key_name})...")
+    r = _create_api_key(
         api_keys_base_url,
-        headers=headers,
-        json={"name": "e2e-test-inference-key", "subscription": sim_sub},
-        timeout=30,
-        verify=TLS_VERIFY,
+        headers,
+        {"subscription": sim_sub},
+        key_name,
     )
     # Accept both 200 and 201 as success
     if r.status_code not in (200, 201):
-        raise RuntimeError(f"Failed to create API key: {r.status_code} {r.text}")
+        raise RuntimeError(f"Failed to create API key: {response_summary(r)}")
 
     data = r.json()
     key = data.get("key")
     if not key:
         raise RuntimeError("API key creation response missing 'key' field")
 
-    print(f"[api_key] Created API key id={data.get('id')}, key prefix={key[:15]}...")
+    print("[api_key] Created API key for inference tests")
     return key
 
+
 @pytest.fixture(scope="session")
+def worker_api_key(worker_tenant_context, headers: dict) -> str:
+    """Mint an inference key from the explicitly isolated worker MaaS API."""
+    from multitenancy_helpers import response_summary
+
+    key_name = f"e2e-worker-inference-key-{_xdist_worker_suffix()}"
+    r = _create_api_key(
+        f"{worker_tenant_context.api_base_url}/v1/api-keys",
+        headers,
+        {"subscription": worker_tenant_context.subscription_name},
+        key_name,
+    )
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"Failed to create worker API key: {response_summary(r)}")
+    key = r.json().get("key")
+    if not key:
+        raise RuntimeError("Worker API key creation response missing 'key' field")
+    return key
+
+@pytest.fixture(scope="module")
 def api_key_headers(api_key: str):
     """Headers with API key for model inference requests."""
     return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
+
+@pytest.fixture(scope="session")
+def tenant_external_model_tenants():
+    """
+    Shared AGC/Praxis tenants for multi-tenant external model tests.
+
+    Two AITenants with selector-admitting tenant gateways on the praxis
+    dataplane, enriched with gateway/maas-api URLs (see
+    tenant_external_model_helpers.bootstrap_external_model_tenant). Modules in the
+    tenant_external_model xdist group share these tenants; user namespaces, models and
+    tenant-scoped policies are created per module with unique names.
+
+    Skips session-wide when the installed cluster lacks the additive
+    ExternalModel schema (gatewayRefs + status.gateways), the
+    ai-gateway-controller deployment, the
+    AITenant CRD, or tenant namespace discovery.
+    """
+    from multitenancy_helpers import (
+        cleanup_discovery_case,
+        new_named_tenant_case,
+        require_aitenant_crd,
+        require_tenant_namespace_discovery,
+    )
+    from tenant_external_model_helpers import (
+        bootstrap_external_model_tenant,
+        record_tenant_external_model_evidence,
+        require_tenant_external_model_support,
+    )
+
+    require_tenant_external_model_support()
+    require_aitenant_crd()
+    require_tenant_namespace_discovery()
+    record_tenant_external_model_evidence()
+
+    # Tenant names must stay short: AGC renames per-tenant praxis resources
+    # to "<resource>-<tenant-name>" and the longest base name
+    # ("payload-processing-external-model-filters-") leaves only 20 characters
+    # for the tenant before hitting the Kubernetes 63-character name limit.
+    # bootstrap_external_model_tenant enforces this and fails fast.
+    case_a = new_named_tenant_case("e2e-extmod-a")
+    case_b = new_named_tenant_case("e2e-extmod-b")
+    try:
+        for case in (case_a, case_b):
+            bootstrap_external_model_tenant(case)
+        yield {"tenant_a": case_a, "tenant_b": case_b}
+    finally:
+        # Attempt both cleanups even if the first fails: one tenant's
+        # teardown error must not leak the other's cluster resources.
+        cleanup_errors: list[Exception] = []
+        for case in (case_a, case_b):
+            try:
+                cleanup_discovery_case(case)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("cleanup failed for tenant %s: %s", case["tenant_ns"], exc)
+                cleanup_errors.append(exc)
+        if cleanup_errors:
+            raise cleanup_errors[0]
+
+
+@pytest.fixture(scope="session")
+def shared_test_tenants(gateway_host: str, is_https: bool):
+    """
+    Shared tenant infrastructure for multi-tenant tests.
+
+    Creates two AITenant instances (tenant-a, tenant-b) that persist for the
+    entire test session. Tests requiring multiple tenants should use this fixture
+    instead of creating their own tenants.
+
+    Each tenant gets its own Gateway with a unique route hostname.
+
+    Returns:
+        tuple: (tenant_a_dict, tenant_b_dict) with keys:
+            - name: tenant label name (e.g., "e2e-shared-a-abc123")
+            - namespace: tenant namespace (e.g., "ai-tenant-e2e-shared-a-abc123")
+            - base_url: maas-api URL for this tenant (derived from tenant's gateway route)
+            - gateway_name: name of the Gateway CR for this tenant
+            - suffix: 6-character hex suffix for unique resource names
+            - policy_name: default auth policy name for this tenant
+            - subscription_name: default subscription name for this tenant
+
+    Requires:
+        - AITenant CRD installed
+        - Tenant namespace discovery enabled on maas-controller
+    """
+    from multitenancy_helpers import (
+        require_aitenant_crd,
+        new_named_tenant_case,
+        bootstrap_aitenant_tenant,
+        cleanup_discovery_case,
+        wait_for_route_admitted,
+        wait_for_deployment_available,
+        tenant_b_external_oidc_from_env,
+    )
+
+    require_aitenant_crd()
+
+    worker = _xdist_worker_suffix()
+    case_a = new_named_tenant_case(f"e2e-shared-a-{worker}")
+    case_b = new_named_tenant_case(f"e2e-shared-b-{worker}")
+
+    try:
+        # Bootstrap both tenants (creates gateway + AITenant CR)
+        bootstrap_aitenant_tenant(case_a)
+        bootstrap_aitenant_tenant(
+            case_b, external_oidc=tenant_b_external_oidc_from_env()
+        )
+
+        scheme = "https"
+        for case in (case_a, case_b):
+            route = wait_for_route_admitted(f"{case['gateway_name']}-route")
+            try:
+                host = route["spec"]["host"]
+            except KeyError as e:
+                raise RuntimeError(
+                    f"Route {case['gateway_name']}-route missing expected field: {e}. "
+                    f"Route structure: {route}"
+                ) from e
+            case["base_url"] = f"{scheme}://{host}/maas-api"
+
+            # Wait for maas-api deployment to be ready before tests run
+            # AITenant deployments are in MAAS_API_DEPLOYMENT_NAMESPACE, not tenant-specific namespace
+            deployment_name = f"maas-api-{case['tenant_label_name']}"
+            from test_helper import MAAS_API_DEPLOYMENT_NAMESPACE
+            wait_for_deployment_available(deployment_name, namespace=MAAS_API_DEPLOYMENT_NAMESPACE, timeout=180)
+
+        # Add aliases to match test expectations while keeping cleanup helper keys intact.
+        for case in (case_a, case_b):
+            case["name"] = case["tenant_label_name"]
+            case["namespace"] = case["tenant_ns"]
+
+        yield case_a, case_b
+
+    finally:
+        cleanup_discovery_case(case_a)
+        cleanup_discovery_case(case_b)
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """Report gateway flakes that retries absorbed, and write them as an artifact.
+
+    A green run that needed 40 transparent retries is not the same signal as a
+    green run that needed none. Each xdist worker appends its retries to
+    ``$ARTIFACTS_DIR/transient-retries-<worker>.jsonl``; this hook (runs on the
+    controller) aggregates them into ``flake-report.json`` next to the junit XML.
+    """
+    artifacts_dir = os.environ.get("ARTIFACTS_DIR")
+    if not artifacts_dir or not os.path.isdir(artifacts_dir):
+        return
+
+    entries = []
+    for name in sorted(os.listdir(artifacts_dir)):
+        if not (name.startswith("transient-retries-") and name.endswith(".jsonl")):
+            continue
+        path = os.path.join(artifacts_dir, name)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        except OSError:
+            continue
+    if not entries:
+        # Say so explicitly: a silent log would leave "zero retries" and
+        # "per-worker logging never ran" indistinguishable in CI output.
+        terminalreporter.write_sep("=", "gateway flake report (retried transient 5xx)")
+        terminalreporter.write_line("0 transient gateway responses retried")
+        return
+
+    counts = collections.Counter(entry.get("test", "<unknown>") for entry in entries)
+    report = {
+        "total_retries": len(entries),
+        "distinct_tests": len(counts),
+        "by_test": dict(counts.most_common()),
+        "entries": entries,
+    }
+    report_path = os.path.join(artifacts_dir, "flake-report.json")
+    try:
+        with open(report_path, "w", encoding="utf-8") as fh:
+            json.dump(report, fh, indent=2, sort_keys=False)
+    except OSError as exc:
+        log.warning("could not write %s: %s", report_path, exc)
+
+    terminalreporter.write_sep("=", "gateway flake report (retried transient 5xx)")
+    terminalreporter.write_line(
+        f"{len(entries)} transient gateway response(s) retried across "
+        f"{len(counts)} test(s); details in {report_path}"
+    )
+    for test, count in counts.most_common(10):
+        terminalreporter.write_line(f"  {count:>3}x  {test}")

@@ -1,10 +1,13 @@
 package config
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"net/url"
+	"strconv"
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -17,8 +20,12 @@ import (
 )
 
 const (
-	DefaultSecureAddr   = ":8443"
-	DefaultInsecureAddr = ":8080"
+	DefaultSecureAddr                  = ":8443"
+	DefaultInsecureAddr                = ":8080"
+	defaultAPIKeyDeletionRetentionDays = 90
+	// maxAPIKeyDeletionRetentionDays is the largest day count that can be
+	// safely converted to time.Duration without overflowing int64 nanoseconds.
+	maxAPIKeyDeletionRetentionDays = 106751
 )
 
 type Config struct {
@@ -30,16 +37,40 @@ type Config struct {
 
 	MaaSSubscriptionNamespace string
 
+	// TenantName is the tenant identifier for this maas-api instance.
+	// Set to "models-as-a-service" for default tenant, or AITenant name (e.g., "redteam") for other tenants.
+	// Used to filter database queries to enforce tenant isolation.
+	TenantName string
+
+	// AITenantName is the AITenant CR name for this MaaS API instance.
+	// Defaults to TenantName and identifies the tenant used for guardrail resolution.
+	AITenantName string
+
+	// AITenantNamespace is the namespace where AITenant CRs are created.
+	// Default: "ai-tenants"
+	AITenantNamespace string
+
 	// Server configuration
 	Address string // Listen address for HTTPS (host:port)
 	Secure  bool   // Use HTTPS
 	TLS     TLSConfig
 
 	DebugMode bool
+	LogFormat logger.Format
 
 	// DBConnectionURL is the PostgreSQL connection URL.
 	// Format: postgresql://user:password@host:port/database
 	DBConnectionURL string
+
+	// DBReadConnectionURL is the optional cluster-local PostgreSQL read-replica URL.
+	// It is empty for deployments that intentionally use only the writable primary.
+	//
+	// The URL is stored separately from DBConnectionURL because the two endpoints have
+	// different consistency and availability contracts. DBConnectionURL must always
+	// remain writable: it runs migrations and mutations and is the fallback for reads.
+	// The optional URL serves cluster-local reads, including API-key hash validation,
+	// but must never become an implicit replacement for the primary.
+	DBReadConnectionURL string
 
 	// APIKeyMaxExpirationDays is the maximum allowed expiration in days for API keys.
 	// Users cannot create API keys with expiration longer than this value.
@@ -56,7 +87,52 @@ type Config struct {
 	// Bounds memory usage under high-cardinality user traffic. Default: 8192.
 	SARCacheMaxSize int
 
+	// LastUsedDebounceSecs is the minimum number of seconds between consecutive
+	// last_used_at writes to Postgres for the same API key. When many requests
+	// share a single key (e.g. load tests), only one UPDATE is issued per window
+	// instead of one per request, preventing row-lock contention.
+	// Set to 0 to disable debouncing (every validation writes to DB). Default: 60.
+	LastUsedDebounceSecs int
+
+	// APIKeyDeletionRetentionDays controls how long lifecycle-invalidated API keys
+	// remain soft-deleted for audit purposes before physical deletion.
+	APIKeyDeletionRetentionDays int
+
 	MetricsPort int
+
+	// MetricsSecure serves /metrics over HTTPS with authn/authz when true.
+	// Default: true (OpenShift). Set false for non-OpenShift/xKS.
+	MetricsSecure bool
+
+	// MetricsCertDir is the directory containing tls.crt/tls.key for the metrics server.
+	// Populated by OpenShift service-ca via the maas-api-metrics Service annotation.
+	MetricsCertDir string
+
+	// DiscoveryEnableHTTP2 enables HTTP/2 ALPN negotiation on the TLS client used
+	// by model discovery probes. Default: false (HTTP/1.1 only).
+	DiscoveryEnableHTTP2 bool
+
+	// LokiReadEndpoint is the base URL of the upstream Loki read API that
+	// /v1/logs proxies to (e.g. https://loki-gateway.example.svc:8080/api/logs/v1/application).
+	// The Loki proxy routes are only registered when it is set.
+	LokiReadEndpoint string
+
+	// LokiReadToken is the service account token sent as the Bearer credential
+	// on proxied upstream Loki requests (LOKI_READ_TOKEN, sourced from the
+	// usage-logs-loki Secret). When empty the proxy sends no Authorization
+	// header upstream.
+	LokiReadToken string
+
+	// OTELEndpoint is the OTLP gRPC endpoint for trace export (e.g., "localhost:4317").
+	// Tracing is disabled when empty.
+	OTELEndpoint string
+
+	// OTELInsecure disables TLS for the OTLP exporter connection.
+	OTELInsecure bool
+
+	// OTELSampleRate controls the fraction of traces sampled (0.0 to 1.0).
+	// Default: 1.0 (sample everything). Set lower in production for high-volume APIs.
+	OTELSampleRate float64
 
 	// Deprecated flag (backward compatibility with pre-TLS version)
 	deprecatedHTTPPort string
@@ -70,23 +146,59 @@ func Load() *Config {
 	maxExpirationDays, _ := env.GetInt("API_KEY_MAX_EXPIRATION_DAYS", constant.DefaultAPIKeyMaxExpirationDays)
 	accessCheckTimeoutSeconds, _ := env.GetInt("ACCESS_CHECK_TIMEOUT_SECONDS", 15)
 	sarCacheMaxSize, _ := env.GetInt("SAR_CACHE_MAX_SIZE", constant.DefaultSARCacheMaxSize)
+	lastUsedDebounceSecs, _ := env.GetInt("LAST_USED_DEBOUNCE_SECS", 60)
+	apiKeyDeletionRetentionDays, _ := env.GetInt("API_KEY_DELETION_RETENTION_DAYS", defaultAPIKeyDeletionRetentionDays)
 	metricsPort, _ := env.GetInt("METRICS_PORT", constant.DefaultMetricsPort)
+	metricsSecure, _ := env.GetBool("METRICS_SECURE", true)
+	metricsCertDir := env.GetString("METRICS_CERT_DIR", constant.DefaultMetricsCertDir)
+	discoveryEnableHTTP2, _ := env.GetBool("DISCOVERY_ENABLE_HTTP2", false)
+	logFormat := logger.Format(env.GetString("LOG_FORMAT", string(logger.FormatZap)))
+	otelInsecure, _ := env.GetBool("OTEL_EXPORTER_OTLP_INSECURE", false)
+	otelSampleRate := 1.0
+	if rateStr := env.GetString("OTEL_TRACES_SAMPLE_RATE", ""); rateStr != "" {
+		if parsed, err := strconv.ParseFloat(rateStr, 64); err == nil && parsed >= 0 && parsed <= 1 {
+			otelSampleRate = parsed
+		}
+	}
+
+	tenantName := strings.TrimSpace(env.GetString("TENANT_NAME", "models-as-a-service"))
+	if tenantName == "" {
+		panic("TENANT_NAME environment variable must be non-empty (tenant isolation required)")
+	}
+
+	aitenantName := env.GetString("AITENANT_NAME", tenantName)
+	aitenantNamespace := env.GetString("AITENANT_NAMESPACE", "ai-tenants")
 
 	c := &Config{
-		Name:                      env.GetString("INSTANCE_NAME", gatewayName),
-		Namespace:                 env.GetString("NAMESPACE", constant.DefaultNamespace),
-		GatewayName:               gatewayName,
-		GatewayNamespace:          env.GetString("GATEWAY_NAMESPACE", constant.DefaultGatewayNamespace),
-		MaaSSubscriptionNamespace: env.GetString("MAAS_SUBSCRIPTION_NAMESPACE", constant.DefaultMaaSSubscriptionNamespace),
-		Address:                   env.GetString("ADDRESS", ""),
-		Secure:                    secure,
-		TLS:                       loadTLSConfig(),
-		DebugMode:                 debugMode,
-		DBConnectionURL:           "", // Loaded from K8s secret via LoadDatabaseURL()
-		APIKeyMaxExpirationDays:   maxExpirationDays,
-		AccessCheckTimeoutSeconds: accessCheckTimeoutSeconds,
-		SARCacheMaxSize:           sarCacheMaxSize,
-		MetricsPort:               metricsPort,
+		Name:                        env.GetString("INSTANCE_NAME", gatewayName),
+		Namespace:                   env.GetString("NAMESPACE", constant.DefaultNamespace),
+		GatewayName:                 gatewayName,
+		GatewayNamespace:            env.GetString("GATEWAY_NAMESPACE", constant.DefaultGatewayNamespace),
+		MaaSSubscriptionNamespace:   env.GetString("MAAS_SUBSCRIPTION_NAMESPACE", constant.DefaultMaaSSubscriptionNamespace),
+		TenantName:                  tenantName,
+		AITenantName:                aitenantName,
+		AITenantNamespace:           aitenantNamespace,
+		Address:                     env.GetString("ADDRESS", ""),
+		Secure:                      secure,
+		TLS:                         loadTLSConfig(),
+		DebugMode:                   debugMode,
+		LogFormat:                   logFormat,
+		DBConnectionURL:             "", // Loaded from K8s secret via LoadDatabaseURLs()
+		DBReadConnectionURL:         "", // Loaded from K8s secret via LoadDatabaseURLs()
+		APIKeyMaxExpirationDays:     maxExpirationDays,
+		AccessCheckTimeoutSeconds:   accessCheckTimeoutSeconds,
+		SARCacheMaxSize:             sarCacheMaxSize,
+		LastUsedDebounceSecs:        lastUsedDebounceSecs,
+		APIKeyDeletionRetentionDays: apiKeyDeletionRetentionDays,
+		MetricsPort:                 metricsPort,
+		MetricsSecure:               metricsSecure,
+		MetricsCertDir:              metricsCertDir,
+		DiscoveryEnableHTTP2:        discoveryEnableHTTP2,
+		LokiReadEndpoint:            env.GetString("LOKI_READ_ENDPOINT", ""),
+		LokiReadToken:               env.GetString("LOKI_READ_TOKEN", ""),
+		OTELEndpoint:                env.GetString("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+		OTELInsecure:                otelInsecure,
+		OTELSampleRate:              otelSampleRate,
 		// Deprecated env var (backward compatibility with pre-TLS version)
 		deprecatedHTTPPort: env.GetString("PORT", ""),
 	}
@@ -112,6 +224,18 @@ func (c *Config) bindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.deprecatedHTTPPort, "port", c.deprecatedHTTPPort, "DEPRECATED: use --address with --secure=false")
 
 	fs.BoolVar(&c.DebugMode, "debug", c.DebugMode, "Enable debug mode")
+	fs.Func("log-format", "Log output format (one of 'zap' or 'otel-json').", func(value string) error {
+		format, err := logger.ParseFormat(value)
+		if err != nil {
+			return err
+		}
+		c.LogFormat = format
+		return nil
+	})
+	fs.BoolVar(&c.MetricsSecure, "metrics-secure", c.MetricsSecure,
+		"Serve metrics via HTTPS with authentication and authorization (default: true)")
+	fs.StringVar(&c.MetricsCertDir, "metrics-cert-dir", c.MetricsCertDir,
+		"Directory containing tls.crt and tls.key for the metrics HTTPS server")
 	// Note: DBConnectionURL is loaded from K8s secret 'maas-db-config', not from CLI flag
 }
 
@@ -119,11 +243,24 @@ func (c *Config) bindFlags(fs *flag.FlagSet) {
 // It returns an error if the configuration is invalid.
 func (c *Config) Validate() error {
 	// Handle backward compatibility for deprecated flags
-	c.handleDeprecatedFlags()
+	if err := c.handleDeprecatedFlags(); err != nil {
+		return err
+	}
+
+	logFormat, err := logger.ParseFormat(string(c.LogFormat))
+	if err != nil {
+		return err
+	}
+	c.LogFormat = logFormat
 
 	// Validate required fields
 	if c.DBConnectionURL == "" {
 		return errors.New("db connection URL is required (loaded from K8s secret 'maas-db-config')")
+	}
+	if c.DBReadConnectionURL != "" {
+		if err := validatePostgresURL([]byte(c.DBReadConnectionURL)); err != nil {
+			return fmt.Errorf("invalid db read connection URL: %w", err)
+		}
 	}
 
 	if err := c.TLS.validate(); err != nil {
@@ -154,6 +291,11 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("MAAS_SUBSCRIPTION_NAMESPACE %q is invalid: %v", c.MaaSSubscriptionNamespace, errs)
 	}
 
+	// Validate TenantName is non-empty and non-whitespace to ensure tenant isolation
+	if strings.TrimSpace(c.TenantName) == "" {
+		return errors.New("TENANT_NAME must be non-empty and non-whitespace to ensure tenant isolation")
+	}
+
 	// Validate API key max expiration days
 	if c.APIKeyMaxExpirationDays < 1 {
 		return errors.New("API_KEY_MAX_EXPIRATION_DAYS must be at least 1")
@@ -163,22 +305,60 @@ func (c *Config) Validate() error {
 		return errors.New("ACCESS_CHECK_TIMEOUT_SECONDS must be at least 1")
 	}
 
+	if c.LastUsedDebounceSecs < 0 {
+		return errors.New("LAST_USED_DEBOUNCE_SECS must be greater than or equal to 0")
+	}
+
+	if c.APIKeyDeletionRetentionDays == 0 {
+		c.APIKeyDeletionRetentionDays = defaultAPIKeyDeletionRetentionDays
+	}
+	if c.APIKeyDeletionRetentionDays < 1 {
+		return errors.New("API_KEY_DELETION_RETENTION_DAYS must be at least 1")
+	}
+	if c.APIKeyDeletionRetentionDays > maxAPIKeyDeletionRetentionDays {
+		return fmt.Errorf("API_KEY_DELETION_RETENTION_DAYS must be at most %d", maxAPIKeyDeletionRetentionDays)
+	}
+
 	if c.MetricsPort < 1 || c.MetricsPort > 65535 {
 		return errors.New("METRICS_PORT must be between 1 and 65535")
+	}
+
+	if c.MetricsSecure && strings.TrimSpace(c.MetricsCertDir) == "" {
+		return errors.New("METRICS_CERT_DIR must be non-empty when METRICS_SECURE is true")
+	}
+
+	if strings.TrimSpace(c.LokiReadEndpoint) != "" {
+		upstream, err := url.Parse(strings.TrimSpace(c.LokiReadEndpoint))
+		if err != nil || upstream.Host == "" || (upstream.Scheme != "http" && upstream.Scheme != "https") {
+			return fmt.Errorf("LOKI_READ_ENDPOINT must be a valid http(s) URL, got %q", c.LokiReadEndpoint)
+		}
 	}
 
 	return nil
 }
 
 // handleDeprecatedFlags maps deprecated flags to new configuration.
-func (c *Config) handleDeprecatedFlags() {
-	// If deprecated --port flag is used, map to new model (HTTP mode)
-	if c.deprecatedHTTPPort != "" {
-		c.Secure = false
-		if c.Address == "" {
-			c.Address = ":" + c.deprecatedHTTPPort
-		}
+// Returns an error if the deprecated --port flag conflicts with TLS settings
+// (CWE-319/CWE-757 mitigation: refuse to silently downgrade to plaintext).
+func (c *Config) handleDeprecatedFlags() error {
+	if c.deprecatedHTTPPort == "" {
+		return nil
 	}
+
+	port, err := strconv.Atoi(c.deprecatedHTTPPort)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("deprecated --port/PORT value %q is not a valid TCP port (1-65535)", c.deprecatedHTTPPort)
+	}
+
+	if c.Secure || c.TLS.Enabled() {
+		return fmt.Errorf("deprecated --port/PORT cannot be used with --secure or TLS configuration; "+
+			"use --address=:%s with TLS flags instead", c.deprecatedHTTPPort)
+	}
+
+	if c.Address == "" {
+		c.Address = ":" + c.deprecatedHTTPPort
+	}
+	return nil
 }
 
 // PrintDeprecationWarnings prints warnings for deprecated flags to stderr.
@@ -195,18 +375,21 @@ func (c *Config) MetricsAddress() string {
 	return fmt.Sprintf(":%d", c.MetricsPort)
 }
 
-// LoadDatabaseURL reads the database connection URL from the Kubernetes secret.
+// LoadDatabaseURLs reads the writable and optional read-only PostgreSQL connection
+// URLs from the Kubernetes secret.
 // This replaces the previous approach of reading from environment variables.
 //
 // Secret: maas-db-config (in the same namespace as the pod)
-// Key: DB_CONNECTION_URL
+// Keys: DB_CONNECTION_URL and optional DB_READ_CONNECTION_URL
 //
-// Returns an error if the secret is missing or the key is not found.
-func (c *Config) LoadDatabaseURL(ctx context.Context, clientset *kubernetes.Clientset) error {
+// Returns an error if the secret is missing, the writable key is missing, or either
+// configured value is not a supported PostgreSQL URL. Values are never logged.
+func (c *Config) LoadDatabaseURLs(ctx context.Context, clientset kubernetes.Interface) error {
 	const (
 		//nolint:gosec // This is the documented name of the secret, not a hardcoded credential.
-		secretName = "maas-db-config"
-		secretKey  = "DB_CONNECTION_URL"
+		secretName  = "maas-db-config"
+		writeSecret = "DB_CONNECTION_URL"
+		readSecret  = "DB_READ_CONNECTION_URL"
 	)
 
 	secret, err := clientset.CoreV1().Secrets(c.Namespace).Get(ctx, secretName, metav1.GetOptions{})
@@ -214,11 +397,40 @@ func (c *Config) LoadDatabaseURL(ctx context.Context, clientset *kubernetes.Clie
 		return fmt.Errorf("failed to read secret %s/%s: %w (ensure the secret exists before starting maas-api)", c.Namespace, secretName, err)
 	}
 
-	dbURL, ok := secret.Data[secretKey]
-	if !ok || len(dbURL) == 0 {
-		return fmt.Errorf("key %q not found or empty in secret %s/%s", secretKey, c.Namespace, secretName)
+	writeURL, ok := secret.Data[writeSecret]
+	if !ok || len(bytes.TrimSpace(writeURL)) == 0 {
+		return fmt.Errorf("key %q not found or empty in secret %s/%s", writeSecret, c.Namespace, secretName)
 	}
 
-	c.DBConnectionURL = string(dbURL)
+	c.DBConnectionURL = string(bytes.TrimSpace(writeURL))
+	c.DBReadConnectionURL = string(bytes.TrimSpace(secret.Data[readSecret]))
+
+	// Validation happens here, before Validate and store construction, so a bad URL is
+	// attributed to its Secret key without exposing the URL or credentials. Whitespace is
+	// removed before assignment because Kubernetes Secret values commonly include a
+	// trailing newline when generated from files or templates.
+
+	if err := validatePostgresURL(writeURL); err != nil {
+		return fmt.Errorf("invalid %q in secret %s/%s: %w", writeSecret, c.Namespace, secretName, err)
+	}
+	if c.DBReadConnectionURL != "" {
+		if err := validatePostgresURL([]byte(c.DBReadConnectionURL)); err != nil {
+			return fmt.Errorf("invalid %q in secret %s/%s: %w", readSecret, c.Namespace, secretName, err)
+		}
+	}
+	return nil
+}
+
+// LoadDatabaseURL is a compatibility wrapper for callers that only need the
+// writable connection URL. It still loads and validates the optional read URL.
+func (c *Config) LoadDatabaseURL(ctx context.Context, clientset kubernetes.Interface) error {
+	return c.LoadDatabaseURLs(ctx, clientset)
+}
+
+func validatePostgresURL(value []byte) error {
+	value = bytes.TrimSpace(value)
+	if !bytes.HasPrefix(value, []byte("postgresql://")) && !bytes.HasPrefix(value, []byte("postgres://")) {
+		return errors.New("must start with postgresql:// or postgres://")
+	}
 	return nil
 }

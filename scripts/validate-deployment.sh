@@ -9,6 +9,22 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/deployment-helpers.sh"
 
+# Derive infrastructure namespace from controller namespace (matches Go code logic)
+derive_infra_namespace() {
+  local controller_ns="$1"
+  case "$controller_ns" in
+    redhat-ods-applications)
+      echo "redhat-ai-gateway-infra"
+      ;;
+    opendatahub)
+      echo "odh-ai-gateway-infra"
+      ;;
+    *)
+      echo "$controller_ns"
+      ;;
+  esac
+}
+
 # MaaS Platform Deployment Validation Script
 # This script validates that the MaaS platform is correctly deployed and functional
 #
@@ -25,7 +41,24 @@ INFERENCE_ENDPOINT="chat/completions"  # Default to chat completions
 CUSTOM_MODEL_PATH=""  # Custom path for model endpoint (overrides --endpoint)
 RATE_LIMIT_TEST_COUNT=10  # Default number of requests for rate limit testing
 MAX_TOKENS=50  # Default max_tokens for requests
-MAAS_API_NAMESPACE="${MAAS_API_NAMESPACE:-opendatahub}"  # Default namespace for MaaS API (use --namespace to override)
+# Detect platform (RHOAI vs ODH) if NAMESPACE not set
+detect_controller_namespace() {
+  if kubectl get namespace redhat-ods-applications &>/dev/null; then
+    echo "redhat-ods-applications"
+  else
+    echo "opendatahub"
+  fi
+}
+
+# Infrastructure namespace - defaults to AUTO (namespace separation enabled)
+INFRA_NAMESPACE_RAW="${INFRA_NAMESPACE:-AUTO}"
+if [ "$INFRA_NAMESPACE_RAW" = "AUTO" ]; then
+  # Derive from NAMESPACE (controller namespace) or auto-detect platform
+  CONTROLLER_NS="${NAMESPACE:-$(detect_controller_namespace)}"
+  INFRA_NAMESPACE=$(derive_infra_namespace "$CONTROLLER_NS")
+else
+  INFRA_NAMESPACE="$INFRA_NAMESPACE_RAW"
+fi
 
 # Show help if requested
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
@@ -54,12 +87,15 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     echo "  --max-tokens N            Maximum number of tokens to generate per request"
     echo "                            Default: 50"
     echo "  -n, --namespace NS        Namespace where MaaS API is deployed"
-    echo "                            Default: opendatahub (or MAAS_API_NAMESPACE env var)"
+    echo "                            Default: AUTO (auto-derived from controller namespace)"
     echo ""
     echo "Environment Variables:"
     echo "  MAAS_GATEWAY_HOST         Override gateway URL when cluster domain is not readable"
     echo "                            e.g. export MAAS_GATEWAY_HOST=https://maas.apps.your-cluster.example.com"
-    echo "  MAAS_API_NAMESPACE        Namespace where MaaS API is deployed (default: opendatahub)"
+    echo "  INFRA_NAMESPACE           Namespace where MaaS API is deployed (default: AUTO)"
+    echo "  OIDC_ISSUER_URL           When set, validates maas-api-auth-policy jwt.issuerUrl matches"
+    echo "                            (external OIDC; avoids deploy vs test issuer drift / HTTP 401)"
+    echo "  OIDC_CLIENT_ID            When set with OIDC_ISSUER_URL, checks oidc-client-bound client id"
     echo ""
     echo "Note: This script uses connection timeouts from curl (10s connect, 30s max)"
     echo "      For cluster-level timeouts, see deployment-helpers.sh timeout constants"
@@ -124,7 +160,7 @@ while [ $# -gt 0 ]; do
                 echo "Error: --namespace requires a value (e.g., --namespace maas-api)" >&2
                 exit 1
             fi
-            MAAS_API_NAMESPACE="$2"
+            INFRA_NAMESPACE="$2"
             shift 2
             ;;
         -*)
@@ -231,12 +267,39 @@ print_info() {
     echo -e "${BLUE}ℹ️  $1${NC}"
 }
 
+should_retry_api_key_mint() {
+    local http_code="$1"
+    local body="$2"
+    local compact_body
+    compact_body="$(echo "$body" | tr -d '[:space:]')"
+
+    # Empty 403 = gateway/AuthPolicy propagation delay.
+    if [[ "$http_code" == "403" ]] && [[ -z "$compact_body" ]]; then
+        return 0
+    fi
+
+    # 401 and the two 500 bodies below are observed while Authorino/Envoy has
+    # accepted the policy but identity headers are not consistently injected yet.
+    if [[ "$http_code" == "401" ]]; then
+        return 0
+    fi
+    if [[ "$http_code" == "500" ]] && {
+        [[ "$body" == *"AUTH_FAILURE"* ]] || [[ "$body" == *"Internal Server Error."* ]]
+    }; then
+        return 0
+    fi
+
+    return 1
+}
+
 # Check if running on OpenShift
-# First check if kubectl is working, then check for OpenShift-specific API resources
+# First check if kubectl is working, then check for OpenShift-specific API resources.
+# Use a here-string (not echo|grep -q): with pipefail, grep -q exits early on match and
+# the writer gets SIGPIPE (141), which falsely looks like "not OpenShift".
 api_resources=$(kubectl api-resources 2>/dev/null)
 if [ $? -ne 0 ]; then
     print_warning "Could not query API resources (kubectl may be slow to respond)" "Continuing validation anyway..."
-elif ! echo "$api_resources" | grep -q "route.openshift.io"; then
+elif ! grep -Fq "route.openshift.io" <<<"$api_resources"; then
     print_fail "Not running on OpenShift" "This validation script is designed for OpenShift clusters" "Use a different validation approach for vanilla Kubernetes"
     exit 1
 fi
@@ -254,26 +317,33 @@ print_header "1️⃣ Component Status Checks"
 
 # Check MaaS API pods
 print_check "MaaS API pods"
-MAAS_PODS=$(kubectl get pods -n "$MAAS_API_NAMESPACE" -l app.kubernetes.io/name=maas-api --no-headers 2>/dev/null | grep -c "Running" || true)
+MAAS_PODS=$(kubectl get pods -n "$INFRA_NAMESPACE" -l app.kubernetes.io/name=maas-api --no-headers 2>/dev/null | grep -c "Running" || true)
 # Ensure MAAS_PODS is a valid integer (fixes edge case with empty/multiline output)
 [[ "$MAAS_PODS" =~ ^[0-9]+$ ]] || MAAS_PODS=0
 if [ "$MAAS_PODS" -gt 0 ]; then
     print_success "MaaS API has $MAAS_PODS running pod(s)"
 else
-    print_fail "No MaaS API pods running" "Pods may be starting or failed" "Check: kubectl get pods -n $MAAS_API_NAMESPACE -l app.kubernetes.io/name=maas-api"
+    print_fail "No MaaS API pods running" "Pods may be starting or failed" "Check: kubectl get pods -n $INFRA_NAMESPACE -l app.kubernetes.io/name=maas-api"
 fi
 
-# Check Kuadrant pods
-print_check "Kuadrant system pods"
+# Check policy engine pods (RHCL or Kuadrant)
+print_check "Policy engine pods (RHCL/Kuadrant)"
+POLICY_ENGINE_NAMESPACE=""
 if kubectl get namespace kuadrant-system &>/dev/null; then
-    KUADRANT_PODS=$(kubectl get pods -n kuadrant-system --no-headers 2>/dev/null | grep -c "Running" || echo "0")
-    if [ "$KUADRANT_PODS" -gt 0 ]; then
-        print_success "Kuadrant has $KUADRANT_PODS running pod(s)"
+    POLICY_ENGINE_NAMESPACE="kuadrant-system"
+elif kubectl get namespace rh-connectivity-link &>/dev/null; then
+    POLICY_ENGINE_NAMESPACE="rh-connectivity-link"
+fi
+if [[ -n "$POLICY_ENGINE_NAMESPACE" ]]; then
+    POLICY_ENGINE_PODS=$(kubectl get pods -n "$POLICY_ENGINE_NAMESPACE" --no-headers 2>/dev/null | grep -c "Running" || true)
+    [[ "$POLICY_ENGINE_PODS" =~ ^[0-9]+$ ]] || POLICY_ENGINE_PODS=0
+    if [ "$POLICY_ENGINE_PODS" -gt 0 ]; then
+        print_success "Policy engine has $POLICY_ENGINE_PODS running pod(s) in $POLICY_ENGINE_NAMESPACE"
     else
-        print_fail "No Kuadrant pods running" "Kuadrant operators may not be installed" "Check: kubectl get pods -n kuadrant-system"
+        print_fail "No policy engine pods running" "RHCL/Kuadrant operators may not be installed" "Check: kubectl get pods -n $POLICY_ENGINE_NAMESPACE"
     fi
 else
-    print_fail "Kuadrant namespace not found" "Kuadrant may not be installed" "Run: ./scripts/install-dependencies.sh --kuadrant"
+    print_fail "Policy engine namespace not found" "RHCL or Kuadrant may not be installed" "Run deploy.sh with --policy-engine rhcl or --policy-engine kuadrant"
 fi
 
 # Check OpenDataHub/KServe pods
@@ -345,10 +415,11 @@ else
 fi
 
 print_check "HTTPRoute for maas-api"
-if kubectl get httproute maas-api-route -n "$MAAS_API_NAMESPACE" &>/dev/null; then
+if kubectl get httproute maas-api-route -n "$INFRA_NAMESPACE" &>/dev/null; then
     # Check if any parent has an Accepted condition with status True
     # HTTPRoutes can have multiple parents (Kuadrant policies + gateway controller)
-    HTTPROUTE_ACCEPTED=$(kubectl get httproute maas-api-route -n "$MAAS_API_NAMESPACE" -o jsonpath='{.status.parents[*].conditions[?(@.type=="Accepted")].status}' 2>/dev/null | grep -q "True" && echo "True" || echo "False")
+    HTTPROUTE_STATUS=$(kubectl get httproute maas-api-route -n "$INFRA_NAMESPACE" -o jsonpath='{.status.parents[*].conditions[?(@.type=="Accepted")].status}' 2>/dev/null || true)
+    HTTPROUTE_ACCEPTED=$(grep -Fq "True" <<<"$HTTPROUTE_STATUS" && echo "True" || echo "False")
     if [ "$HTTPROUTE_ACCEPTED" = "True" ]; then
         print_success "HTTPRoute maas-api-route is configured and accepted"
     else
@@ -356,17 +427,20 @@ if kubectl get httproute maas-api-route -n "$MAAS_API_NAMESPACE" &>/dev/null; th
         print_warning "HTTPRoute maas-api-route exists but acceptance status unclear" "This is usually fine if other checks pass"
     fi
 else
-    print_fail "HTTPRoute maas-api-route not found" "API routing may not be configured" "Check: kubectl get httproute -n $MAAS_API_NAMESPACE"
+    print_fail "HTTPRoute maas-api-route not found" "API routing may not be configured" "Check: kubectl get httproute -n $INFRA_NAMESPACE"
 fi
 
 print_check "Gateway hostname"
 # Resolve MaaS gateway host: prefer env override, then Gateway listener (no cluster-admin), then cluster ingress config
+HOST=""
 if [ -n "${MAAS_GATEWAY_HOST:-}" ]; then
     # Normalize to https://host (strip existing protocol if present)
     HOST="${MAAS_GATEWAY_HOST#*://}"
     HOST="https://${HOST}"
     print_success "Gateway hostname (from MAAS_GATEWAY_HOST): $HOST"
 else
+    GATEWAY_CLASS=$(kubectl get gateway maas-default-gateway -n openshift-ingress \
+        -o jsonpath='{.spec.gatewayClassName}' 2>/dev/null || echo "")
     GATEWAY_HOSTNAME=$(kubectl get gateway maas-default-gateway -n openshift-ingress -o jsonpath='{.spec.listeners[?(@.protocol=="HTTPS")].hostname}' 2>/dev/null | awk '{print $1}')
     if [ -z "$GATEWAY_HOSTNAME" ]; then
         GATEWAY_HOSTNAME=$(kubectl get gateway maas-default-gateway -n openshift-ingress -o jsonpath='{.spec.listeners[0].hostname}' 2>/dev/null)
@@ -374,7 +448,15 @@ else
     if [ -n "$GATEWAY_HOSTNAME" ]; then
         HOST="https://${GATEWAY_HOSTNAME}"
         print_success "Gateway hostname: $HOST"
-    else
+    elif [ "$GATEWAY_CLASS" != "openshift-default" ]; then
+        GATEWAY_ADDRESS=$(kubectl get gateway maas-default-gateway -n openshift-ingress \
+            -o jsonpath='{.status.addresses[0].value}' 2>/dev/null || echo "")
+        if [ -n "$GATEWAY_ADDRESS" ]; then
+            HOST="https://${GATEWAY_ADDRESS#*://}"
+            print_success "Gateway hostname (from Gateway status address): $HOST"
+        fi
+    fi
+    if [ -z "$HOST" ]; then
         CLUSTER_DOMAIN=$(kubectl get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}' 2>/dev/null || echo "")
         if [ -n "$CLUSTER_DOMAIN" ]; then
             HOST="https://maas.${CLUSTER_DOMAIN}"
@@ -394,7 +476,7 @@ print_header "3️⃣ Policy Status"
 print_check "AuthPolicy"
 AUTHPOLICY_COUNT=$(kubectl get authpolicy -A --no-headers 2>/dev/null | wc -l || echo "0")
 if [ "$AUTHPOLICY_COUNT" -gt 0 ]; then
-    AUTHPOLICY_STATUS=$(kubectl get authpolicy -n openshift-ingress gateway-default-auth -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}' 2>/dev/null || echo "NotFound")
+    AUTHPOLICY_STATUS=$(kubectl get authpolicy -n openshift-ingress maas-gateway-auth -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}' 2>/dev/null || echo "NotFound")
     if [ "$AUTHPOLICY_STATUS" = "True" ]; then
         print_success "AuthPolicy is configured and accepted"
     else
@@ -402,6 +484,18 @@ if [ "$AUTHPOLICY_COUNT" -gt 0 ]; then
     fi
 else
     print_fail "No AuthPolicy found" "Authentication may not be enforced" "Check: kubectl get authpolicy -A"
+fi
+
+if [ -n "${OIDC_ISSUER_URL:-}" ]; then
+    print_check "maas-gateway-auth AuthPolicy OIDC issuer (OIDC_ISSUER_URL)"
+    if verify_gateway_oidc_authpolicy "${GATEWAY_NAMESPACE:-openshift-ingress}"; then
+        print_success "maas-gateway-auth jwt.issuerUrl matches OIDC_ISSUER_URL"
+    else
+        print_fail "maas-gateway-auth AuthPolicy OIDC config does not match OIDC_ISSUER_URL / OIDC_CLIENT_ID" \
+            "Authorino will reject Keycloak JWTs (HTTP 401) until issuers align" \
+            "Deploy with the same OIDC_ISSUER_URL as tests: ./scripts/deploy.sh ... --external-oidc" \
+            "Check: kubectl get authpolicy maas-gateway-auth -n ${GATEWAY_NAMESPACE:-openshift-ingress} -o yaml"
+    fi
 fi
 
 print_check "TokenRateLimitPolicy"
@@ -446,18 +540,31 @@ else
     fi
 
     # Create a MaaS API key using the OC token
+    # Retry on empty 403 (gateway propagation delay — Envoy may not have loaded AuthPolicy yet)
     if [ -n "$OC_TOKEN" ]; then
         print_check "MaaS API key creation"
         API_KEY_NAME="validate-test-$(date +%s)"
-        API_KEY_RESPONSE=$(curl -sSk --connect-timeout 10 --max-time 30 \
-            -H "Authorization: Bearer $OC_TOKEN" \
-            -H "Content-Type: application/json" \
-            -X POST \
-            -d "{\"expiresIn\": \"1h\", \"name\": \"$API_KEY_NAME\"}" \
-            -w "\n%{http_code}" \
-            "${HOST}/maas-api/v1/api-keys" 2>/dev/null || echo "")
-        API_KEY_HTTP_CODE=$(echo "$API_KEY_RESPONSE" | tail -n1)
-        API_KEY_BODY=$(echo "$API_KEY_RESPONSE" | sed '$d')
+        mint_retries=12
+        mint_delay=5
+        for mint_attempt in $(seq 1 $mint_retries); do
+            API_KEY_RESPONSE=$(curl -sSk --connect-timeout 10 --max-time 30 \
+                -H "Authorization: Bearer $OC_TOKEN" \
+                -H "Content-Type: application/json" \
+                -X POST \
+                -d "{\"expiresIn\": \"1h\", \"name\": \"$API_KEY_NAME\"}" \
+                -w "\n%{http_code}" \
+                "${HOST}/maas-api/v1/api-keys" 2>/dev/null || echo "")
+            API_KEY_HTTP_CODE=$(echo "$API_KEY_RESPONSE" | tail -n1)
+            API_KEY_BODY=$(echo "$API_KEY_RESPONSE" | sed '$d')
+            if should_retry_api_key_mint "$API_KEY_HTTP_CODE" "$API_KEY_BODY"; then
+                if [[ $mint_attempt -lt $mint_retries ]]; then
+                    echo "  API key mint auth path not ready yet (HTTP $API_KEY_HTTP_CODE, attempt $mint_attempt/$mint_retries), retrying in ${mint_delay}s..."
+                    sleep $mint_delay
+                    continue
+                fi
+            fi
+            break
+        done
 
         if [ "$API_KEY_HTTP_CODE" = "201" ]; then
             TOKEN=$(echo "$API_KEY_BODY" | jq -r '.key // empty' 2>/dev/null)
@@ -558,11 +665,20 @@ else
                 
                 # Set the inference endpoint if we have a valid model
                 if [ -n "$MODEL_CHAT" ] && [ "$MODEL_CHAT" != "null" ]; then
+                    # The URL returned by /v1/models is the in-cluster service URL
+                    # (e.g. https://<service>.svc.cluster.local/llm/<model>).
+                    # When running from outside the cluster (CI/Prow) rewrite it to
+                    # use the external gateway hostname so the request is routable.
+                    if grep -q "\.svc\.cluster\.local" <<<"$MODEL_CHAT"; then
+                        MODEL_PATH=$(echo "$MODEL_CHAT" | sed 's|https\?://[^/]*||')
+                        MODEL_CHAT="${HOST}${MODEL_PATH}"
+                        print_info "Rewrote internal model URL to external gateway: $MODEL_CHAT"
+                    fi
                     # Use custom model path if provided, otherwise use endpoint
                     if [ -n "$CUSTOM_MODEL_PATH" ]; then
                         MODEL_CHAT_ENDPOINT="${MODEL_CHAT}${CUSTOM_MODEL_PATH}"
                     else
-                        MODEL_CHAT_ENDPOINT="${MODEL_CHAT}/v1/${INFERENCE_ENDPOINT}"
+                        MODEL_CHAT_ENDPOINT="${MODEL_CHAT%/}/v1/${INFERENCE_ENDPOINT}"
                     fi
                 elif [ -n "$MODEL_NAME" ]; then
                     print_warning "Model endpoint not found" "Model endpoint not found for $MODEL_NAME" "Check model HTTPRoute configuration: kubectl get httproute -n llm"
@@ -577,13 +693,13 @@ else
         elif [ "$HTTP_CODE" = "404" ]; then
             print_fail "Endpoint not found (HTTP 404)" \
                 "Path is incorrect - traffic reaching pods but wrong path" \
-                "Check HTTPRoute: kubectl describe httproute maas-api-route -n $MAAS_API_NAMESPACE"
+                "Check HTTPRoute: kubectl describe httproute maas-api-route -n $INFRA_NAMESPACE"
             MODEL_NAME=""
             MODEL_CHAT_ENDPOINT=""
         elif [ "$HTTP_CODE" = "502" ] || [ "$HTTP_CODE" = "503" ]; then
             print_fail "Gateway/Service error (HTTP $HTTP_CODE)" \
                 "Gateway cannot reach backend service" \
-                "Check MaaS API pods and service: kubectl get pods,svc -n $MAAS_API_NAMESPACE -l app.kubernetes.io/name=maas-api"
+                "Check MaaS API pods and service: kubectl get pods,svc -n $INFRA_NAMESPACE -l app.kubernetes.io/name=maas-api"
             MODEL_NAME=""
             MODEL_CHAT_ENDPOINT=""
         else

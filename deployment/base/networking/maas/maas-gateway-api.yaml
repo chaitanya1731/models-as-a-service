@@ -15,20 +15,13 @@ metadata:
 spec:
   gatewayClassName: openshift-default
   listeners:
-   - name: http
-     hostname: maas.${CLUSTER_DOMAIN}
-     port: 80
-     protocol: HTTP
-     allowedRoutes:
-       namespaces:
-         from: All
    - name: https
      hostname: maas.${CLUSTER_DOMAIN}
      port: 443
      protocol: HTTPS
      allowedRoutes:
        namespaces:
-         from: All
+         from: Same
      tls:
        certificateRefs:
        - group: ''

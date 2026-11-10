@@ -1,5 +1,7 @@
 package api_keys
 
+import "time"
+
 // Status represents the lifecycle state of an API key.
 // API keys follow a one-way state transition: active → revoked/expired.
 type Status string
@@ -20,17 +22,19 @@ func (s Status) String() string {
 // Note: KeyPrefix is NOT included - it's only shown once at creation (show-once pattern).
 // Users should identify keys by name/description for security.
 type ApiKey struct {
-	ID             string   `json:"id"`
-	Name           string   `json:"name"`
-	Description    string   `json:"description,omitempty"`
-	Username       string   `json:"username,omitempty"`
-	Subscription   string   `json:"subscription,omitempty"`   // MaaSSubscription name bound at mint time
-	Groups         []string `json:"groups,omitempty"`         // User's groups at creation (immutable snapshot for authorization)
-	CreationDate   string   `json:"creationDate"`
-	ExpirationDate string   `json:"expirationDate,omitempty"` // Empty for permanent keys
-	Status         Status   `json:"status"`                   // "active", "expired", "revoked"
-	LastUsedAt     string   `json:"lastUsedAt,omitempty"`     // Tracks when key was last used for validation
-	Ephemeral      bool     `json:"ephemeral"`                // Short-lived programmatic key
+	ID             string            `json:"id"`
+	Name           string            `json:"name"`
+	Description    string            `json:"description,omitempty"`
+	Username       string            `json:"username,omitempty"`
+	Subscription   string            `json:"subscription,omitempty"` // MaaSSubscription name bound at mint time
+	Tenant         string            `json:"tenant,omitempty"`
+	Groups         []string          `json:"groups,omitempty"` // User's groups at creation (immutable snapshot for authorization)
+	CreationDate   string            `json:"creationDate"`
+	ExpirationDate string            `json:"expirationDate,omitempty"` // Empty for permanent keys
+	Status         Status            `json:"status"`                   // "active", "expired", "revoked"
+	LastUsedAt     string            `json:"lastUsedAt,omitempty"`     // Tracks when key was last used for validation
+	Ephemeral      bool              `json:"ephemeral"`                // Short-lived programmatic key
+	Labels         map[string]string `json:"labels,omitempty"`         // Structured key-value pairs for API key metadata
 }
 
 // ValidationResult holds the result of API key validation (for Authorino HTTP callback).
@@ -39,8 +43,11 @@ type ValidationResult struct {
 	UserID       string   `json:"userId,omitempty"`
 	Username     string   `json:"username,omitempty"`
 	KeyID        string   `json:"keyId,omitempty"`
+	KeyName      string   `json:"keyName,omitempty"`      // User-provided name for the key
 	Groups       []string `json:"groups,omitempty"`       // User groups for subscription-based authorization
+	GroupsJSON   string   `json:"groupsJSON,omitempty"`   // JSON-encoded group array for trusted header injection
 	Subscription string   `json:"subscription,omitempty"` // MaaSSubscription name from DB (Authorino → subscription-info)
+	Tenant       string   `json:"tenant"`                 // Tenant bound at key creation (always present, empty string for legacy keys)
 	Reason       string   `json:"reason,omitempty"`       // If invalid: "key not found", "revoked", etc.
 }
 
@@ -89,10 +96,14 @@ type SearchFilters struct {
 	HasBeenUsed   *bool `json:"hasBeenUsed,omitempty"`   // true = used, false = never used
 
 	// Subscription filter
-	Subscription *string `json:"subscription,omitempty"` // Filter by bound subscription name
+	Subscription      *string  `json:"subscription,omitempty"` // Filter by bound subscription name
+	SubscriptionNames []string `json:"-"`
 
 	// Ephemeral key filter
 	IncludeEphemeral *bool `json:"includeEphemeral,omitempty"` // Include ephemeral keys in results (default: false)
+
+	// Labels filter
+	LabelsContain map[string]string `json:"labelsContain,omitempty"` // Filter by structured key-value pairs for API key metadata
 }
 
 // SortParams specifies sorting criteria.
@@ -144,14 +155,37 @@ type SearchAPIKeysResponse struct {
 // ============================================================
 
 // BulkRevokeRequest for POST /v1/api-keys/bulk-revoke.
+// At least one of Username or Subscription must be provided.
 type BulkRevokeRequest struct {
-	Username string `binding:"required" json:"username"`
+	Username     string `json:"username,omitempty"`
+	Subscription string `json:"subscription,omitempty"`
+	DryRun       bool   `json:"dryRun,omitempty"`
 }
 
 // BulkRevokeResponse returns count of revoked keys.
 type BulkRevokeResponse struct {
 	RevokedCount int    `json:"revokedCount"`
 	Message      string `json:"message"`
+	DryRun       bool   `json:"dryRun,omitempty"`
+}
+
+// TenantRevokeResponse returns count of revoked keys for tenant-wide cleanup.
+type TenantRevokeResponse struct {
+	// RevokedCount is retained for compatibility with the original internal
+	// endpoint. It is equal to DeletedCount for lifecycle cleanup responses.
+	RevokedCount int       `json:"revokedCount"`
+	DeletedCount int       `json:"deletedCount"`
+	DeletedAt    time.Time `json:"deletedAt"`
+	Message      string    `json:"message"`
+}
+
+// SubscriptionRevokeResponse returns the result of subscription-scoped cleanup.
+type SubscriptionRevokeResponse struct {
+	// RevokedCount is retained for consistency with TenantRevokeResponse.
+	RevokedCount int       `json:"revokedCount"`
+	DeletedCount int       `json:"deletedCount"`
+	DeletedAt    time.Time `json:"deletedAt"`
+	Message      string    `json:"message"`
 }
 
 // ============================================================

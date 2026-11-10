@@ -5,20 +5,31 @@ Complete [Operator Setup](platform-setup.md) before proceeding.
 **Installation flow:**
 
 1. [Database Setup](#database-setup) — Create the PostgreSQL connection Secret
-2. [Create Gateway](#create-gateway) — Deploy maas-default-gateway (required before modelsAsService)
-3. [Configure DataScienceCluster](#configure-datasciencecluster) — Enable KServe and modelsAsService in your DataScienceCluster
+2. [Create Gateway](#create-gateway) — Deploy maas-default-gateway (required before modelsAsAService)
+3. [Configure DataScienceCluster](#configure-datasciencecluster) — Enable modelsAsAService in your DataScienceCluster
 4. [Model Setup](model-setup.md) — Deploy sample models
 5. [Validation](validation.md) — Verify the deployment
+6. [Enable Observability](../observability/setup.md) — Set up metrics, dashboards, and monitoring (recommended)
 
 ## Database Setup
 
 `maas-api` uses PostgreSQL as its persistence layer for API key metadata: hashed tokens, subscription bindings, expiration dates, and revocation state. The database must be reachable before `maas-api` starts; the pod will crash-loop until the connection succeeds and the schema migration completes.
 
-Create the `maas-db-config` Secret in your ODH/RHOAI namespace (typically `opendatahub` for ODH or `redhat-ods-applications` for RHOAI):
+!!! warning "Namespace Separation"
+    When infrastructure namespace separation is enabled (the default), create `maas-db-config`
+    in the **infrastructure namespace** (e.g., `odh-ai-gateway-infra` for ODH or
+    `redhat-ai-gateway-infra` for RHOAI), not the controller namespace. The infrastructure
+    namespace is the source of truth for database credentials. See
+    [Infrastructure Namespace Separation](../configuration-and-management/infra-namespace-migration.md)
+    for details.
+
+Create the `maas-db-config` Secret in your infrastructure namespace. The default is
+`odh-ai-gateway-infra` for ODH or `redhat-ai-gateway-infra` for RHOAI:
 
 ```bash
+INFRA_NAMESPACE=odh-ai-gateway-infra
 kubectl create secret generic maas-db-config \
-  -n opendatahub \
+  -n "$INFRA_NAMESPACE" \
   --from-literal=DB_CONNECTION_URL='postgresql://username:password@hostname:5432/database?sslmode=require'
 ```
 
@@ -26,6 +37,51 @@ kubectl create secret generic maas-db-config \
 ```
 postgresql://USERNAME:PASSWORD@HOSTNAME:PORT/DATABASE?sslmode=require
 ```
+
+### Optional PostgreSQL read replica
+
+`DB_CONNECTION_URL` always identifies the writable primary. To use a cluster-local
+read replica for API-key validation and administrative reads, add
+`DB_READ_CONNECTION_URL` to the same Secret:
+
+```bash
+INFRA_NAMESPACE=odh-ai-gateway-infra
+kubectl patch secret maas-db-config \
+  -n "$INFRA_NAMESPACE" \
+  --type merge \
+  -p '{"stringData":{"DB_READ_CONNECTION_URL":"postgresql://username:password@maas-read-ro.maas-db.svc.cluster.local:5432/database?sslmode=require"}}'
+```
+
+Use `redhat-ai-gateway-infra` for the default RHOAI infrastructure namespace, or set
+`INFRA_NAMESPACE` to your configured custom infrastructure namespace. If namespace
+separation is disabled, use the controller namespace where `maas-api` runs instead.
+
+`DB_READ_CONNECTION_URL` is optional. When it is absent or empty, `maas-api` uses only
+the writable pool and existing behavior is unchanged. When it is present, the URL must
+use `postgresql://` or `postgres://` and the replica must be reachable when `maas-api`
+starts; an invalid or unreachable read URL is a startup error rather than a silent
+fallback.
+
+Migrations and writes always use the writable primary. API-key hash validation and key
+search, get, and list queries use the read replica and fall back to the primary once if
+the replica fails. A not-found result is a completed read and is not retried on the
+primary. Secret changes continue to require a `maas-api` pod restart. The
+`DB_READ_REPLICA_LAG_WARNING_SECONDS` and `DB_READ_REPLICA_LAG_CRITICAL_SECONDS`
+environment variables configure the lag thresholds exposed as metrics.
+
+When the read URL is configured, primary commits—including newly created keys and
+revocations—become visible to API-key validation after PostgreSQL replication lag plus
+any brief Authorino cache delay. A new key may therefore be rejected until its local
+replica catches up. Omit `DB_READ_CONNECTION_URL` if strict read-your-writes behavior is
+required. The asynchronous, debounced `last_used_at` write continues to use the writable
+primary and does not block validation.
+
+During rollout, monitor `maas_api_database_queries_total` to confirm local reads select the
+`read` pool, `maas_api_database_read_fallbacks_total` for unexpected primary traffic, and
+`maas_api_database_replication_lag_seconds` for replica lag. The `/health/database`
+endpoint reports whether the optional read pool is degraded, while `/health` remains
+healthy because the writable primary can continue serving writes and API-key
+validation.
 
 !!! note "Development"
     For development, you can deploy a PostgreSQL instance and Secret using the setup script:
@@ -54,88 +110,57 @@ postgresql://USERNAME:PASSWORD@HOSTNAME:PORT/DATABASE?sslmode=require
     ```
 
 !!! note "Restarting maas-api"
-    If you add or update the Secret after the DataScienceCluster already has modelsAsService in managed state, restart the maas-api deployment to pick up the config:
+    If you add or update the Secret after the DataScienceCluster already has modelsAsAService in managed state, restart the maas-api deployment to pick up the config:
 
     ```bash
     kubectl rollout restart deployment/maas-api -n opendatahub
     ```
 
-    This is not required when the Secret exists before enabling modelsAsService in your DataScienceCluster.
+    This is not required when the Secret exists before enabling modelsAsAService in your DataScienceCluster.
 
 ## Create Gateway
 
-The Gateway must exist before enabling modelsAsService in your DataScienceCluster. Create the MaaS Gateway:
+Create `maas-default-gateway` in `openshift-ingress` **before** enabling `aigateway.modelsAsAService` in your DataScienceCluster.
 
-!!! warning "Example Gateway Configuration"
-    The Gateway configuration below is an example. You may need TLS certificates, specific listener settings, or custom infrastructure labels depending on your cluster. For TLS setup, see [TLS Configuration](../configuration-and-management/tls-configuration.md). To quickly apply Authorino TLS for maas-api communication, run:
+`scripts/deploy.sh` runs this step automatically in **loadbalancer** mode. Run the script yourself when installing via DataScienceCluster first, using **ocproute** mode, or on disconnected clusters.
 
-    ```bash
-    ./scripts/setup-authorino-tls.sh
-    ```
+| Deployment Model | Command |
+|---|---|
+| External LoadBalancer (default) | `./scripts/setup-gateway.sh` |
+| OpenShift Route (any cluster) | `INGRESS_MODE=ocproute ./scripts/setup-gateway.sh` |
+| Air-gapped / No GitHub fetch | `DISCONNECTED=true INGRESS_MODE=ocproute ./scripts/setup-gateway.sh` |
 
-    **Setting the namespace:** The script defaults to `kuadrant-system` (ODH with Kuadrant). Set `AUTHORINO_NAMESPACE` for RHOAI, which uses RHCL:
+Common overrides: `CLUSTER_DOMAIN`, `CERT_NAME` (loadbalancer mode only), `DRY_RUN`, `MAAS_MANIFEST_REF` (pinned git ref for remote kustomize fallback). For the full variable list, TLS auto-detection order, and examples, see [scripts/README.md](https://github.com/opendatahub-io/models-as-a-service/blob/main/scripts/README.md#setup-gatewaysh).
 
-    ```bash
-    AUTHORINO_NAMESPACE=rh-connectivity-link ./scripts/setup-authorino-tls.sh
-    ```
+**Verify:**
+
+```bash
+kubectl wait --for=condition=Programmed gateway/maas-default-gateway -n openshift-ingress --timeout=120s
+```
+
+Expected output:
+```
+gateway.gateway.networking.k8s.io/maas-default-gateway condition met
+```
+
+For ClusterIP mode, also verify the Route:
+```bash
+kubectl get route maas-gateway-route -n openshift-ingress
+```
+
+Expected output:
+```
+NAME                  HOST/PORT                           PATH   SERVICES                           PORT   TERMINATION   WILDCARD
+maas-gateway-route    maas.apps.example.cluster.com              maas-default-gateway-openshift-default   443    reencrypt     None
+```
+
+For ClusterIP architecture and troubleshooting, see [Gateway patterns — ClusterIP + Route](../configuration-and-management/gateway-patterns.md#clusterip-gateway-with-openshift-route-re-encrypt).
 
 !!! note "Required annotations"
-    The Gateway **must** include these annotations to trust Authorino's certificates:
+    The script applies `opendatahub.io/managed: "false"` and `security.opendatahub.io/authorino-tls-bootstrap: "true"` on the Gateway. See [TLS Configuration](../configuration-and-management/tls-configuration.md) for custom certificates and Authorino integration. The `authorino-tls-bootstrap` annotation is interim until [CONNLINK-528](https://issues.redhat.com/browse/CONNLINK-528).
 
-    | Annotation | Purpose |
-    |------------|---------|
-    | `opendatahub.io/managed: "false"` | Read by **maas-controller**: allows it to manage AuthPolicies and related resources; prevents the ODH Model Controller from overwriting them. |
-    | `security.opendatahub.io/authorino-tls-bootstrap: "true"` | Used by the ODH platform (not maas-controller) to create the EnvoyFilter for Gateway → Authorino TLS when Authorino uses a TLS listener. Required when Authorino TLS is enabled. |
-
-    The `authorino-tls-bootstrap` annotation is an interim solution until [CONNLINK-528](https://issues.redhat.com/browse/CONNLINK-528) ships native support for configuring TLS between the Gateway and Authorino without mesh sidecars. It decouples TLS configuration from AuthPolicy management, allowing TLS even when `opendatahub.io/managed` is `"false"`.
-
-```yaml
-CLUSTER_DOMAIN=$(kubectl get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}')
-# Use default ingress cert for HTTPS, or set CERT_NAME to your TLS secret name
-CERT_NAME=${CERT_NAME:-$(kubectl get ingresscontroller default -n openshift-ingress-operator -o jsonpath='{.spec.defaultCertificate.name}' 2>/dev/null)}
-[[ -z "$CERT_NAME" ]] && CERT_NAME="router-certs-default"
-
-kubectl apply -f - <<EOF
-apiVersion: gateway.networking.k8s.io/v1
-kind: Gateway
-metadata:
-  name: maas-default-gateway
-  namespace: openshift-ingress
-  annotations:
-    opendatahub.io/managed: "false"
-    security.opendatahub.io/authorino-tls-bootstrap: "true"
-spec:
-  gatewayClassName: openshift-default
-  listeners:
-   - name: http
-     hostname: maas.${CLUSTER_DOMAIN}
-     port: 80
-     protocol: HTTP
-     allowedRoutes:
-       namespaces:
-         from: All
-   - name: https
-     hostname: maas.${CLUSTER_DOMAIN}
-     port: 443
-     protocol: HTTPS
-     allowedRoutes:
-       namespaces:
-         from: All
-     tls:
-       certificateRefs:
-       - group: ""
-         kind: Secret
-         name: ${CERT_NAME}
-       mode: Terminate
-EOF
-```
-
-!!! note "TLS certificate"
-    The HTTPS listener uses a Secret in `openshift-ingress`. The script auto-detects the default ingress cert; if that fails, it uses `router-certs-default`. If the Gateway fails to program, ensure the Secret exists: `kubectl get secret -n openshift-ingress`. See [TLS Configuration](../configuration-and-management/tls-configuration.md) for custom certs.
-
-```shell
-kubectl wait --for=condition=Programmed gateway/maas-default-gateway -n openshift-ingress --timeout=60s
-```
+!!! tip "Authorino TLS"
+    After the Gateway exists, run `./scripts/setup-authorino-tls.sh`. For RHOAI/RHCL, set `AUTHORINO_NAMESPACE=rh-connectivity-link`.
 
 ## Configure DataScienceCluster
 
@@ -143,7 +168,10 @@ After creating the database Secret and Gateways, create or update your DataScien
 
 === "Managed (Recommended)"
 
-    The operator deploys `maas-controller`, which self-bootstraps a `default-tenant` CR and reconciles the MaaS platform workloads (maas-api, gateway policies, telemetry). Create or update your DataScienceCluster with `modelsAsService` in Managed state:
+    The AI Gateway Operator deploys `maas-controller`, which self-bootstraps `AITenant/models-as-a-service`; that AITenant creates or adopts `MaasTenantConfig/default-tenant` and reconciles the MaaS platform workloads (maas-api, gateway policies, telemetry). Create or update your DataScienceCluster with `modelsAsAService` in Managed state:
+
+    !!! note "KServe not required for MaaS"
+        MaaS is now deployed as a sub-component of the **AI Gateway Operator** (`aigateway.modelsAsAService`), not KServe. You no longer need KServe enabled to use MaaS. Include KServe only if you need model serving capabilities independently.
 
     ```yaml
     kubectl apply -f - <<EOF
@@ -153,10 +181,9 @@ After creating the database Secret and Gateways, create or update your DataScien
       name: default-dsc
     spec:
       components:
-        kserve:
+        aigateway:
           managementState: Managed
-          rawDeploymentServiceConfig: Headed
-          modelsAsService:
+          modelsAsAService:
             managementState: Managed
         dashboard:
           managementState: Managed
@@ -172,7 +199,7 @@ After creating the database Secret and Gateways, create or update your DataScien
         see [OdhDashboardConfig Feature Flags](#odhdashboardconfig-feature-flags) below.
 
     !!! note "Connectivity Link warning (ODH with Kuadrant)"
-        When using ODH with Kuadrant (upstream), you may see `Warning: Red Hat Connectivity Link is not installed, LLMInferenceService cannot be used` in the Kserve status initially. This typically resolves after a few minutes as the operator reconciles. If it persists, run `kubectl describe datasciencecluster default-dsc` and check that the Kuadrant/Connectivity Link operator is installed and healthy.
+        When using ODH with Kuadrant (upstream), you may see `Warning: Red Hat Connectivity Link is not installed, LLMInferenceService cannot be used` initially. This typically resolves after a few minutes as the operator reconciles. If it persists, run `kubectl describe datasciencecluster default-dsc` and check that the Kuadrant/Connectivity Link operator is installed and healthy.
 
     **Validate DataScienceCluster:**
 
@@ -180,9 +207,7 @@ After creating the database Secret and Gateways, create or update your DataScien
     # Check DataScienceCluster status
     kubectl get datasciencecluster default-dsc
 
-    # Wait for KServe and ModelsAsService to be ready (optional)
-    kubectl wait --for=jsonpath='{.status.conditions[?(@.type=="KserveReady")].status}'=True \
-      datasciencecluster/default-dsc --timeout=300s
+    # Wait for MaaS to be ready (optional)
     kubectl wait --for=jsonpath='{.status.conditions[?(@.type=="ModelControllerReady")].status}'=True \
       datasciencecluster/default-dsc --timeout=300s
 
@@ -191,7 +216,7 @@ After creating the database Secret and Gateways, create or update your DataScien
     kubectl rollout status deployment/maas-api -n opendatahub --timeout=120s
     ```
 
-    The `maas-controller` (deployed by the operator) will automatically create a `default-tenant` CR and reconcile:
+    The `maas-controller` (deployed by the operator) will automatically create `AITenant/models-as-a-service`, which creates or adopts `MaasTenantConfig/default-tenant` and reconciles:
 
     - **MaaS API** (Deployment, Service, ServiceAccount, ClusterRole, ClusterRoleBinding, HTTPRoute)
     - **MaaS API AuthPolicy** (maas-api-auth-policy) - Protects the MaaS API endpoint
@@ -201,49 +226,49 @@ After creating the database Secret and Gateways, create or update your DataScien
     - **DestinationRule** (when TLS is enabled)
     - **NetworkPolicy** (maas-authorino-allow) - Allows Authorino to reach MaaS API
 
-    ### Tenant CR
+    ### MaasTenantConfig CR
 
-    With `modelsAsService` **Managed**, the [Open Data Hub operator](https://github.com/opendatahub-io/opendatahub-operator) deploys `maas-controller`, which self-bootstraps a **namespace-scoped** `Tenant` object on startup. The resource name **must** be `default-tenant` (enforced via CEL validation). The `Tenant` CR lives in the `models-as-a-service` namespace (same namespace as `MaaSSubscription` and `MaaSAuthPolicy`). The authoritative API definition is in the maas-controller repo: [`tenant_types.go`](https://github.com/opendatahub-io/models-as-a-service/blob/main/maas-controller/api/maas/v1alpha1/tenant_types.go).
+    With `modelsAsAService` **Managed**, the ODH/RHOAI operator (via the `aigateway` component) deploys `maas-controller`, which self-bootstraps `AITenant/models-as-a-service` in `ai-tenants`. The AITenant reconciler creates or adopts a **namespace-scoped** `MaasTenantConfig` object. The resource name **must** be `default-tenant` (enforced via CEL validation). The `MaasTenantConfig` CR lives in the `models-as-a-service` namespace (same namespace as `MaaSSubscription` and `MaaSAuthPolicy`). The authoritative API definition is in the maas-controller repo: [`maastenantconfig_types.go`](https://github.com/opendatahub-io/models-as-a-service/blob/main/maas-controller/api/maas/v1alpha1/maastenantconfig_types.go).
 
-    **Nothing in `spec` is required for a default install.** If you omit `spec`, the controller uses the same defaults as this guide: Gateway **`openshift-ingress` / `maas-default-gateway`**, and telemetry metric toggles use the defaults described below.
+    **Nothing in `spec` is required for a default install.** If you omit `spec`, telemetry metric toggles use the defaults described below. During bootstrap, existing `Tenant/default-tenant.spec.externalOIDC` settings are automatically migrated to `AITenant/models-as-a-service.spec.oidc`, and existing `Tenant/default-tenant.spec.apiKeys` and `spec.telemetry` settings are copied into `MaasTenantConfig/default-tenant` when those fields are unset. Going forward, set OIDC and Gateway on `AITenant`; set API key and telemetry settings on `MaasTenantConfig`.
 
     | Field | What to set |
     | ----- | ----------- |
-    | `spec.gatewayRef.namespace` | Namespace of your Gateway API `Gateway` (default `openshift-ingress`). |
-    | `spec.gatewayRef.name` | Name of that `Gateway` (default `maas-default-gateway`). Set these if your MaaS hostname is exposed through a different Gateway than the default. |
     | `spec.apiKeys.maxExpirationDays` | Maximum allowed API key lifetime in **days**. When set, users cannot mint keys with a longer lifetime than this value (via `expiresIn`). Optional; if unset, the controller does not apply a cap through this field (see also `maas-api` / `API_KEY_MAX_EXPIRATION_DAYS` in your deployment). |
-    | `spec.externalOIDC.issuerUrl` | OIDC issuer URL for external identity provider (optional; enables OIDC on the maas-api AuthPolicy). |
-    | `spec.externalOIDC.clientId` | OIDC client ID (required when `issuerUrl` is set). |
+    | `spec.apiKeys.deletionRetentionDays` | Retention in **days** for lifecycle-invalidated API keys before physical deletion. Defaults to 90 and must be at least 1. |
     | `spec.telemetry.enabled` | Enable TelemetryPolicy and Istio Telemetry (default `true`). |
     | `spec.telemetry.metrics.captureOrganization` | Include `organization_id` on metrics (default `true`). |
     | `spec.telemetry.metrics.captureUser` | Include user labels on metrics (default `false`; privacy-sensitive). |
     | `spec.telemetry.metrics.captureGroup` | Include group labels on metrics (default `false`; higher cardinality). |
     | `spec.telemetry.metrics.captureModelUsage` | Include model labels on usage metrics (default `true`). |
+    | `spec.telemetry.logs.captureUser` | Include `user_id` on usage logs (default `false`; privacy-sensitive). Independent of `metrics.captureUser`. |
+    | `spec.telemetry.logs.captureOrganization` | Include `organization_id` on usage logs (default `true`). Independent of `metrics.captureOrganization`. |
 
     Example (patch common values):
 
     ```yaml
     apiVersion: maas.opendatahub.io/v1alpha1
-    kind: Tenant
+    kind: MaasTenantConfig
     metadata:
       name: default-tenant
       namespace: models-as-a-service
     spec:
-      gatewayRef:
-        namespace: openshift-ingress
-        name: maas-default-gateway
       apiKeys:
         maxExpirationDays: 90
+        deletionRetentionDays: 90
       telemetry:
         enabled: true
         metrics:
           captureUser: false
           captureGroup: false
+        logs:
+          captureUser: false
+          captureOrganization: true
     ```
 
     ```bash
-    kubectl apply -f tenant.yaml
-    kubectl get tenant default-tenant -n models-as-a-service -o yaml
+    kubectl apply -f maas-tenant-config.yaml
+    kubectl get maastenantconfig default-tenant -n models-as-a-service -o yaml
     ```
 
 === "Kustomize"
@@ -251,7 +276,7 @@ After creating the database Secret and Gateways, create or update your DataScien
     !!! note "Development and early testing"
         Kustomize deployment can be used for **development and early testing purposes**. For production, use the Managed tab above.
 
-    Set `modelsAsService` to **Removed** so the operator does not deploy the MaaS API, then deploy MaaS directly from the canonical build root:
+    Set `modelsAsAService` to **Removed** so the AI Gateway Operator does not deploy MaaS, then deploy MaaS directly from the canonical build root:
 
     ```yaml
     kubectl apply -f - <<EOF
@@ -261,10 +286,9 @@ After creating the database Secret and Gateways, create or update your DataScien
       name: default-dsc
     spec:
       components:
-        kserve:
+        aigateway:
           managementState: Managed
-          rawDeploymentServiceConfig: Headed
-          modelsAsService:
+          modelsAsAService:
             managementState: Removed
         dashboard:
           managementState: Managed
@@ -286,7 +310,7 @@ After creating the database Secret and Gateways, create or update your DataScien
 
 The RHOAI Dashboard uses feature flags in the `OdhDashboardConfig` resource to control which tabs
 and features are visible in the UI. The operator creates this resource automatically when the
-Dashboard component is deployed, but the following flags may need to be enabled manually.
+Dashboard component is deployed. Enable `genAiStudio` manually if you need GenAI Studio.
 
 Patch the `OdhDashboardConfig` in your applications namespace (typically `redhat-ods-applications`
 for RHOAI or `opendatahub` for ODH):
@@ -294,13 +318,34 @@ for RHOAI or `opendatahub` for ODH):
 ```bash
 kubectl patch odhdashboardconfig odh-dashboard-config \
   -n redhat-ods-applications --type=merge \
-  -p '{"spec":{"dashboardConfig":{"genAiStudio":true,"observabilityDashboard":true}}}'
+  -p '{"spec":{"dashboardConfig":{"genAiStudio":true}}}'
 ```
 
 | Flag | Effect | Prerequisites |
 |------|--------|---------------|
 | `genAiStudio: true` | Shows the **GenAI Studio** tab in the Dashboard | `llamastackoperator` set to `Managed` in DSC |
-| `observabilityDashboard: true` | Shows the **Observability** tab in the Dashboard | COO, OpenTelemetry Operator installed; DSCI `monitoring.metrics` configured |
+| `observabilityDashboard: true` (default) | Shows the **Observability** tab in the Dashboard | COO, OpenTelemetry Operator installed; DSCI `monitoring.metrics` configured |
+
+When using the **Managed** deployment path (i.e. `aigateway.modelsAsAService` set to `Managed` in
+the DSC), also enable the MaaS-specific dashboard flags:
+
+```bash
+kubectl patch odhdashboardconfig odh-dashboard-config \
+  -n redhat-ods-applications --type=merge \
+  -p '{"spec":{"dashboardConfig":{"modelAsService":true,"vLLMDeploymentOnMaaS":true}}}'
+```
+
+| Flag | Effect | Prerequisites |
+|------|--------|---------------|
+| `modelAsService: true` | Enables the **Models as a Service** UI in the Dashboard | `aigateway.modelsAsAService` set to `Managed` in DSC |
+| `vLLMDeploymentOnMaaS: true` | Enables vLLM model deployment via the MaaS Dashboard UI | `modelAsService` enabled |
+
+!!! warning "Deprecated field: `maasAuthPolicies`"
+    The field `maasAuthPolicies` is **deprecated** and frozen via a CEL transition rule in the
+    `OdhDashboardConfig` CRD. On new installs, setting it returns a validation error. Clusters
+    upgraded from RHOAI 3.4 that already had the field set will retain the existing value without
+    error, but the field is no longer used. The field will be removed in a future release.
+    Use `modelAsService: true` instead.
 
 !!! note "Namespace"
     For ODH installations, replace `redhat-ods-applications` with `opendatahub` (or your configured
@@ -311,8 +356,193 @@ kubectl patch odhdashboardconfig odh-dashboard-config \
     API version `opendatahub.io/v1alpha`. The operator re-creates this resource with factory
     defaults if it is deleted, but does not overwrite user changes to existing fields.
 
+## Creating Additional Tenants (Optional)
+
+The default installation creates a single tenant in the `models-as-a-service` namespace. To create additional isolated tenants:
+
+### 1. Create a Gateway
+
+Each tenant requires its own Gateway. Follow the [Gateway Patterns](../configuration-and-management/gateway-patterns.md) guide to create a gateway using the same pattern as `maas-default-gateway`.
+
+!!! warning "Avoid hostname filters"
+    Do not add `hostname` fields to Gateway listeners. Hostname-based routing can cause TLS/SNI issues. Use the default pattern with no hostname filter.
+
+### 2. Create AITenant CR
+
+Create an `AITenant` resource in the `ai-tenants` namespace:
+
+```yaml
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: AITenant
+metadata:
+  name: team-red
+  namespace: ai-tenants
+spec:
+  gateway:
+    name: team-red-gateway  # Must already exist in openshift-ingress
+```
+
+Apply the manifest:
+
+```bash
+kubectl apply -f aitenant.yaml
+```
+
+The controller will automatically create:
+- Tenant namespace: `ai-tenant-team-red`
+- MaasTenantConfig CR: `default-tenant` in the tenant namespace
+- maas-api deployment: `maas-api-team-red`
+- HTTPRoute and AuthPolicy for the tenant
+
+### 3. Verify
+
+```bash
+# Check AITenant status
+kubectl get aitenant team-red -n ai-tenants -o yaml
+
+# Check tenant namespace was created
+kubectl get namespace ai-tenant-team-red
+
+# Check MaasTenantConfig CR
+kubectl get maastenantconfig default-tenant -n ai-tenant-team-red
+```
+
+For complete AITenant configuration options (OIDC, RBAC), see the [AITenant CRD reference](../reference/crds/ai-tenant.md).
+
+### Delete a tenant
+
+Delete the `AITenant` resource to start tenant cleanup:
+
+!!! warning "Do not delete the default tenant"
+    Do not delete `AITenant/models-as-a-service` in `ai-tenants` unless you are intentionally tearing down MaaS. The controller bootstraps the default AITenant only once per `Config/default`; after deletion it is not automatically recreated. MaaS UI and API workflows that depend on the default tenant may stop working until the default tenant state is restored.
+
+```bash
+kubectl delete aitenant team-red -n ai-tenants
+```
+
+Deletion invalidates all API keys and removes per-tenant maas-api resources, MaaS CRs (`MaaSSubscription`, `MaaSAuthPolicy`), and AITenant-owned RBAC. Lifecycle-invalidated keys are soft-deleted for the configured retention period before physical deletion. The tenant namespace is kept so non-MaaS user objects and workloads there survive; AITenant ownership metadata (labels and annotations) is cleared from the namespace. The `AITenant` can remain in `Terminating` phase while cleanup is in progress, or report `Ready=False` with reason `DeletionBlocked` if a cleanup step fails. The shared Gateway object and user model workloads outside the tenant namespace are also preserved.
+
+## Operand NetworkPolicies
+
+MaaS operand NetworkPolicies follow [ODH-ADR-Operator-0016](https://github.com/opendatahub-io/architecture-decision-records/blob/main/architecture-decision-records/operator/ODH-ADR-Operator-0016-networkpolicy-platform-contract.md). `maas-controller` reconciles operand policies (server-side apply) and recreates them if deleted. The operator bundle policy `maas-controller-allow-monitoring` is managed separately by the platform operator.
+
+| Policy | Workload | Direction | Allowed peers |
+| ------ | -------- | --------- | ------------- |
+| `maas-api-allow-gateway` | `maas-api` | Ingress | Gateway pods in `openshift-ingress` → `:8443` |
+| `maas-authorino-allow` | `maas-api` | Ingress | Authorino pods in Kuadrant/RHCL namespaces → `:8443` |
+| `maas-api-allow-monitoring` | `maas-api` | Ingress | `redhat-ods-monitoring` → `:9090` |
+| `maas-api-egress-restrict` | `maas-api` | Egress | OpenShift CoreDNS; Kubernetes API; allow-all by default (overridable or opt-out via `maasconfig/default`; see [PostgreSQL egress](#postgresql-egress)) |
+| `usage-logs-collector-egress-restrict` | usage-logs collector | Egress | CoreDNS; LokiStack gateway pods (`app.kubernetes.io/name=lokistack`, `app.kubernetes.io/instance=usage`, `app.kubernetes.io/component=lokistack-gateway`) → `:8080` |
+| `usage-tenancy-proxy-allow-perses` | tenancy proxy | Ingress | Perses pods and kubelet probes (`host-network`) → `:8443` |
+| `usage-tenancy-proxy-egress-restrict` | tenancy proxy | Egress | CoreDNS; Kubernetes API; LokiStack gateway pods (`app.kubernetes.io/name=lokistack`, `app.kubernetes.io/component=lokistack-gateway`, `app.kubernetes.io/instance=data-science-lokistack`; `usage` when `usageLogging` is true) → `:8080` |
+
+### PostgreSQL egress
+
+`maas-api` connects using `maas-db-config` only. PostgreSQL is **customer-provided**: bundled POC Postgres from
+`scripts/setup-database.sh`, shared in-cluster instances (any namespace or labels), and external databases (for example
+RDS) are all valid. MaaS does **not** require `app=postgres` on database pods and does **not** infer database topology
+from `maas-db-config`.
+
+#### Default egress (no `maasconfig` overrides)
+
+`maas-controller` reconciles `maas-api-egress-restrict` with explicit egress per
+[ODH-ADR-Operator-0016](https://github.com/opendatahub-io/architecture-decision-records/blob/main/architecture-decision-records/operator/ODH-ADR-Operator-0016-networkpolicy-platform-contract.md#explicit-egress-behavior):
+
+1. DNS to OpenShift CoreDNS (ports `53` and `5353`)
+2. Kubernetes API (TCP `443` and `6443`, port-only rule — see below)
+3. **Allow-all** remaining egress (`egress: - {}`)
+
+This works for any database topology without extra configuration. A separate companion `NetworkPolicy` **cannot**
+narrow egress while allow-all is present (NetworkPolicies are unioned).
+
+#### Restricting egress (recommended for production)
+
+For least-privilege egress, configure `maasconfig/default` (same pattern as the
+[MLflow operator](https://github.com/opendatahub-io/mlflow-operator)). MaaS does not guess your database labels or
+namespaces — you declare the peers explicitly.
+
+**Replace the default egress block** with `spec.networkPolicyEgressRules`. You are responsible for including DNS,
+Kubernetes API, and database destinations:
+
+```yaml
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: Config
+metadata:
+  name: default
+spec:
+  networkPolicyEgressRules:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-dns
+          podSelector:
+            matchLabels:
+              dns.operator.openshift.io/daemonset-dns: default
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+        - protocol: UDP
+          port: 5353
+        - protocol: TCP
+          port: 5353
+    - ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: <postgres-namespace>
+          podSelector:
+            matchLabels:
+              app: <postgres-app-label>
+      ports:
+        - protocol: TCP
+          port: 5432
+```
+
+Replace `<postgres-namespace>` and `<postgres-app-label>` with your Postgres workload labels. For external databases
+with stable CIDRs, use `ipBlock` instead of `namespaceSelector`/`podSelector`.
+
+**Append rules** while keeping the default allow-all block with `spec.networkPolicyAdditionalEgressRules` (for example
+a non-standard database port). This does not remove allow-all; use `networkPolicyEgressRules` when you need a
+restrictive policy.
+
+After changing `maasconfig/default`, `maas-controller` updates `maas-api-egress-restrict` on the next reconcile (or
+delete the NetworkPolicy to force immediate recreation).
+
+#### Customer-owned egress (opt-out)
+
+When your platform team manages `maas-api` egress NetworkPolicies separately (for example namespace-level lock-down
+or bespoke database peers), set `spec.maasApiEgressNetworkPolicy: Disabled` on `maasconfig/default`. MaaS stops
+reconciling `maas-api-egress-restrict` and deletes any Config-owned instance on the next reconcile. You must not set
+`networkPolicyEgressRules` or `networkPolicyAdditionalEgressRules` when opting out.
+
+If no other egress `NetworkPolicy` selects the `maas-api` pods, Kubernetes allows all outbound
+traffic from them.
+
+```yaml
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: Config
+metadata:
+  name: default
+spec:
+  maasApiEgressNetworkPolicy: Disabled
+```
+
+Apply your own egress `NetworkPolicy`(ies) targeting the `maas-api` pods. Other MaaS operand policies (ingress,
+usage logging, and so on) continue to be reconciled by `maas-controller`.
+
+### Kubernetes API egress (port-only rule)
+
+`maas-api-egress-restrict` and `usage-tenancy-proxy-egress-restrict` allow egress to TCP ports `443` and `6443` without a `to` peer. This is a documented platform exception: in-cluster clients reach the API through the `kubernetes.default` Service ClusterIP, and on OVN-Kubernetes the policy may be evaluated against that VIP before apiserver endpoint DNAT. A `namespaceSelector` for `openshift-kube-apiserver` does not match that path and can block required API access (token projection, TokenReview). [ODH-ADR-Operator-0016](https://github.com/opendatahub-io/architecture-decision-records/blob/main/architecture-decision-records/operator/ODH-ADR-Operator-0016-networkpolicy-platform-contract.md) does not define a shared API-server peer mapping; components document this limitation instead of adding a broad ingress or egress allow-all.
+
 ## Next steps
 
 * **Deploy models.** See [Model Setup](model-setup.md) for sample model deployments.
 * **Perform validation.** Follow the [validation guide](validation.md) to verify that
   MaaS is working correctly.
+* **Enable observability.** See [Observability Setup](../observability/setup.md).

@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	netwv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -25,12 +26,31 @@ const (
 	ConfigKind = "Config"
 	// ConfigInstanceName is the singleton resource name enforced by the API.
 	ConfigInstanceName = "default"
+
+	// ConfigConditionTenantsHealthy is the condition type set on Config.Status
+	// to report the aggregate health of all AITenant CRs across the cluster.
+	// It follows the ADR ODH-ADR-MS-0003 three-state model (Healthy/Degraded/Blocked).
+	ConfigConditionTenantsHealthy = "TenantsHealthy"
+)
+
+// MaaSAPIEgressNetworkPolicyMode controls maas-controller reconciliation of
+// maas-api-egress-restrict.
+// +kubebuilder:validation:Enum=Managed;Disabled
+type MaaSAPIEgressNetworkPolicyMode string
+
+const (
+	// MaaSAPIEgressNetworkPolicyManaged applies maas-api-egress-restrict (default).
+	MaaSAPIEgressNetworkPolicyManaged MaaSAPIEgressNetworkPolicyMode = "Managed"
+	// MaaSAPIEgressNetworkPolicyDisabled stops reconciling maas-api-egress-restrict
+	// so customers can manage egress NetworkPolicies themselves.
+	MaaSAPIEgressNetworkPolicyDisabled MaaSAPIEgressNetworkPolicyMode = "Disabled"
 )
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster,shortName=maasconfig
 // +kubebuilder:validation:XValidation:rule="self.metadata.name == 'default'",message="Config name must be default"
+// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`,description="Ready"
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // Config is a cluster-scoped anchor for MaaS platform resources. Namespaced and
@@ -46,11 +66,83 @@ type Config struct {
 }
 
 // ConfigSpec defines the desired state of Config.
-// Reserved for future cluster-wide configuration; v1alpha1 uses an empty spec.
-type ConfigSpec struct{}
+// Admission CEL keeps a low-cost shape check; strict restricted-egress validation
+// (both to and ports, except the Kubernetes API port-only rule) runs at reconcile
+// time in tenantreconcile.validateRestrictedEgressRules.
+// +kubebuilder:validation:XValidation:rule="!has(self.networkPolicyEgressRules) || self.networkPolicyEgressRules.all(r, (has(r.ports) && size(r.ports) > 0) || (has(r.to) && size(r.to) > 0))",message="each networkPolicyEgressRules entry must specify at least one port or one destination"
+// +kubebuilder:validation:XValidation:rule="!has(self.networkPolicyAdditionalEgressRules) || self.networkPolicyAdditionalEgressRules.all(r, (has(r.ports) && size(r.ports) > 0) || (has(r.to) && size(r.to) > 0))",message="each networkPolicyAdditionalEgressRules entry must specify at least one port or one destination"
+// +kubebuilder:validation:XValidation:rule="!has(self.maasApiEgressNetworkPolicy) || self.maasApiEgressNetworkPolicy != 'Disabled' || ((!has(self.networkPolicyEgressRules) || size(self.networkPolicyEgressRules) == 0) && (!has(self.networkPolicyAdditionalEgressRules) || size(self.networkPolicyAdditionalEgressRules) == 0))",message="networkPolicyEgressRules and networkPolicyAdditionalEgressRules must be unset when maasApiEgressNetworkPolicy is Disabled"
+type ConfigSpec struct {
+	// LimitadorScrapeInterval defines the scrape interval for Limitador metrics in the ServiceMonitor.
+	// Defaults to "30s" if not specified.
+	// +optional
+	// +kubebuilder:default="30s"
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ms|s|m|h))+$`
+	// +kubebuilder:validation:MaxLength=16
+	LimitadorScrapeInterval string `json:"limitadorScrapeInterval,omitempty"`
+
+	// UsageLogging is retained for compatibility and does not gate deployment.
+	// When true, the gateway EnvoyFilter exports usage logs to usage-logs-collector.
+	// When false or unset, it exports over TLS to the headless
+	// data-science-usage-logs-collector-headless Service.
+	// When MaasTenantConfig telemetry is enabled and usageLogging is false or unset,
+	// MaasTenantConfig is Degraded unless DSCInitialization reports
+	// UsageLogsCollectorAvailable and PersesAvailable as True.
+	// When usageLogging is true and telemetry is enabled, MaasTenantConfig is Degraded
+	// unless PersesAvailable is True.
+	// User identity (user_id) is included in those logs only when
+	// MaasTenantConfig.spec.telemetry.logs.captureUser is true.
+	// +kubebuilder:default=false
+	// +kubebuilder:validation:Optional
+	UsageLogging *bool `json:"usageLogging,omitempty"`
+
+	// MaasAPIEgressNetworkPolicy controls whether maas-controller reconciles
+	// maas-api-egress-restrict. Managed (default) applies the operand egress policy;
+	// Disabled deletes it so customers can manage egress NetworkPolicies themselves.
+	// +optional
+	// +kubebuilder:validation:Enum=Managed;Disabled
+	// +kubebuilder:default=Managed
+	MaasAPIEgressNetworkPolicy MaaSAPIEgressNetworkPolicyMode `json:"maasApiEgressNetworkPolicy,omitempty"`
+
+	// NetworkPolicyEgressRules, when non-empty, replaces the default egress block of
+	// maas-api-egress-restrict. The caller must include DNS, Kubernetes API, database,
+	// and any other required destinations. When empty, the operator applies DNS, API
+	// ports, and allow-all egress for customer-provided dependencies.
+	// Rules from NetworkPolicyAdditionalEgressRules are appended after this list.
+	// +optional
+	// +kubebuilder:validation:MaxItems=32
+	NetworkPolicyEgressRules []netwv1.NetworkPolicyEgressRule `json:"networkPolicyEgressRules,omitempty"`
+
+	// NetworkPolicyAdditionalEgressRules specifies egress rules appended after the
+	// base egress block (either defaults or NetworkPolicyEgressRules). Use for
+	// non-standard ports or extra database peers when retaining default allow-all.
+	// +optional
+	// +kubebuilder:validation:MaxItems=32
+	NetworkPolicyAdditionalEgressRules []netwv1.NetworkPolicyEgressRule `json:"networkPolicyAdditionalEgressRules,omitempty"`
+
+	// UsageMetricsDashboard deploys the legacy Prometheus-based Perses usage dashboard
+	// (dashboard-3-maas-usage-admin). When disabled (the default), the controller
+	// removes any controller-owned copy of that dashboard and does not mark
+	// MaasTenantConfig Degraded when the ODH monitoring stack is unavailable.
+	// When enabled and MaasTenantConfig telemetry is enabled, an unavailable monitoring
+	// stack sets MaasTenantConfig phase to Degraded.
+	// Prefer the logs-based usage dashboards, which are deployed with the usage-log resources.
+	// +kubebuilder:default=false
+	// +kubebuilder:validation:Optional
+	UsageMetricsDashboard *bool `json:"usageMetricsDashboard,omitempty"`
+}
 
 // ConfigStatus defines the observed state of Config.
-type ConfigStatus struct{}
+type ConfigStatus struct {
+	// Conditions represent the latest available observations of the MaaS platform state.
+	// The Ready condition aggregates status from the default AITenant and MaasTenantConfig
+	// so that the platform operator (DSC) can report configuration issues without watching
+	// MaaS operands directly.
+	// The TenantsHealthy condition aggregates the Ready state of all AITenant CRs into a
+	// three-state model (Healthy/Degraded/Blocked) per ADR ODH-ADR-MS-0003.
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
 
 // +kubebuilder:object:root=true
 
@@ -62,5 +154,5 @@ type ConfigList struct {
 }
 
 func init() {
-	SchemeBuilder.Register(&Config{}, &ConfigList{})
+	register(&Config{}, &ConfigList{})
 }

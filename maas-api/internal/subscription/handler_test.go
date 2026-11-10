@@ -5,11 +5,16 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
+	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/authpolicy"
+	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/constant"
 	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/logger"
 	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/models"
 	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/subscription"
@@ -76,15 +81,28 @@ func createTestSubscription(name string, groups []string, priority int32, orgID,
 	}
 }
 
+type mockMetricsRecorder struct {
+	rejections []string
+}
+
+func (m *mockMetricsRecorder) RecordRejection(reason string) {
+	m.rejections = append(m.rejections, reason)
+}
+
 func setupTestRouter(lister subscription.Lister) *gin.Engine {
+	return setupTestRouterWithMetrics(lister, nil)
+}
+
+func setupTestRouterWithMetrics(lister subscription.Lister, metrics subscription.MetricsRecorder) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 
 	log := logger.New(false)
-	selector := subscription.NewSelector(log, lister, nil)
-	handler := subscription.NewHandler(log, selector)
+	selector := subscription.NewSelector(log, lister, nil, nil)
+	handler := subscription.NewHandler(log, selector, metrics)
+	tokenHandler := token.NewHandler(log, "tenant")
 
-	router.POST("/subscriptions/select", handler.SelectSubscription)
+	router.POST("/subscriptions/select", tokenHandler.RejectTrustedIdentityHeaders(), handler.SelectSubscription)
 	return router
 }
 
@@ -1010,8 +1028,8 @@ func setupListTestRouterWithModels(lister subscription.Lister, modelLister model
 	router := gin.New()
 
 	log := logger.New(false)
-	selector := subscription.NewSelector(log, lister, modelLister)
-	handler := subscription.NewHandler(log, selector)
+	selector := subscription.NewSelector(log, lister, modelLister, nil)
+	handler := subscription.NewHandler(log, selector, nil)
 
 	setUser := func(c *gin.Context) {
 		c.Set("user", &token.UserContext{
@@ -1024,6 +1042,454 @@ func setupListTestRouterWithModels(lister subscription.Lister, modelLister model
 	router.GET("/v1/subscriptions", setUser, handler.ListSubscriptions)
 	router.GET("/v1/model/:model-id/subscriptions", setUser, handler.ListSubscriptionsForModel)
 	return router
+}
+
+type mockAuthPolicyLister struct {
+	policies []*unstructured.Unstructured
+}
+
+func (m *mockAuthPolicyLister) List() ([]*unstructured.Unstructured, error) {
+	return m.policies, nil
+}
+
+func inventoryIdentityFor(t *testing.T, organizationID string, roles []string) *token.VerifiedIdentity {
+	t.Helper()
+	return flatAdminIdentity(t, organizationID, roles)
+}
+
+func createInventorySubscription(
+	t *testing.T,
+	name string,
+	ownerGroups []string,
+	associatedOrganizationID string,
+	attributionOrganizationID string,
+	phase string,
+	modelRefs []map[string]any,
+) *unstructured.Unstructured {
+	t.Helper()
+	subscriptionObject := createSubscriptionForAdmin(t, name, "test-ns", associatedOrganizationID, attributionOrganizationID, phase, ownerGroups)
+	spec, ok := subscriptionObject.Object["spec"].(map[string]any)
+	require.True(t, ok)
+	refs := make([]any, 0, len(modelRefs))
+	for _, ref := range modelRefs {
+		refs = append(refs, ref)
+	}
+	spec["modelRefs"] = refs
+	return subscriptionObject
+}
+
+func createInventoryPolicy(name string, users []string, groups []string, modelRefs []map[string]any) *unstructured.Unstructured {
+	usersSlice := make([]any, len(users))
+	for index, user := range users {
+		usersSlice[index] = user
+	}
+	groupsSlice := make([]any, len(groups))
+	for index, group := range groups {
+		groupsSlice[index] = map[string]any{"name": group}
+	}
+	refs := make([]any, len(modelRefs))
+	for index, ref := range modelRefs {
+		refs[index] = ref
+	}
+
+	return &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "maas.opendatahub.io/v1alpha1",
+			"kind":       "MaaSAuthPolicy",
+			"metadata": map[string]any{
+				"name":      name,
+				"namespace": "test-ns",
+			},
+			"spec": map[string]any{
+				"subjects": map[string]any{
+					"users":  usersSlice,
+					"groups": groupsSlice,
+				},
+				"modelRefs": refs,
+			},
+		},
+	}
+}
+
+func setupInventoryTestRouter(
+	lister subscription.Lister,
+	policies []*unstructured.Unstructured,
+	username string,
+	groups []string,
+	identity *token.VerifiedIdentity,
+) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	log := logger.New(false)
+	selector := subscription.NewSelector(
+		log,
+		lister,
+		nil,
+		authpolicy.NewChecker(log, &mockAuthPolicyLister{policies: policies}),
+		subscription.WithSubscriptionNamespace("test-ns"),
+	)
+	handler := subscription.NewHandler(log, selector, nil)
+
+	setContext := func(c *gin.Context) {
+		if identity != nil {
+			c.Set("verified_identity", identity)
+		}
+		if username != "" || groups != nil {
+			c.Set("user", &token.UserContext{Username: username, Groups: groups})
+		}
+		c.Next()
+	}
+
+	router.GET("/v1/subscriptions", setContext, handler.ListSubscriptions)
+	router.GET("/v1/model/:model-id/subscriptions", setContext, handler.ListSubscriptionsForModel)
+	return router
+}
+
+func TestListSubscriptions_OwnerOnlyOmitsRolesAndUsesAssociation(t *testing.T) {
+	subscriptionObject := createInventorySubscription(t, "owner-sub", []string{"owner-group"}, organizationA, organizationB, "Active", []map[string]any{
+		{"name": "model-a", "namespace": "model-ns"},
+	})
+	policies := []*unstructured.Unstructured{
+		createInventoryPolicy("owner-access", nil, []string{"owner-group"}, []map[string]any{
+			{"name": "model-a", "namespace": "model-ns"},
+		}),
+	}
+	router := setupInventoryTestRouter(
+		&mockLister{subscriptions: []*unstructured.Unstructured{subscriptionObject}},
+		policies,
+		"alice",
+		[]string{"owner-group"},
+		nil,
+	)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/subscriptions", nil))
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var result []subscription.SubscriptionInfo
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &result))
+	require.Len(t, result, 1)
+	assert.Empty(t, result[0].Roles)
+	assert.Equal(t, organizationA, result[0].OrganizationID)
+	require.Len(t, result[0].ModelRefs, 1)
+
+	var rawResult []map[string]any
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &rawResult))
+	require.Len(t, rawResult, 1)
+	assert.NotContains(t, rawResult[0], "namespace")
+	assert.NotContains(t, rawResult[0], "owner")
+	rawModelRefs, ok := rawResult[0]["model_refs"].([]any)
+	require.True(t, ok)
+	require.Len(t, rawModelRefs, 1)
+	rawModelRef, ok := rawModelRefs[0].(map[string]any)
+	require.True(t, ok)
+	assert.NotContains(t, rawModelRef, "subjects")
+}
+
+func TestListSubscriptions_AdminUnionRolesAndCompleteModelRefs(t *testing.T) {
+	ownerSubscription := createInventorySubscription(t, "owner-admin-sub", []string{"owner-group"}, organizationA, organizationB, "Active", []map[string]any{
+		{"name": "model-a", "namespace": "model-ns"},
+	})
+	adminSubscription := createInventorySubscription(t, "pending-owner-admin-sub", []string{"owner-group"}, organizationA, organizationB, "Pending", []map[string]any{
+		{"name": "model-a", "namespace": "model-ns"},
+		{"name": "model-b", "namespace": "model-ns"},
+	})
+	ownerOnlySubscription := createInventorySubscription(t, "owner-only-sub", []string{"owner-group"}, organizationB, organizationA, "Active", []map[string]any{
+		{"name": "model-c", "namespace": "model-ns"},
+	})
+	unmarkedSubscription := createInventorySubscription(t, "unmarked-sub", []string{"owner-group"}, "", organizationB, "Active", []map[string]any{
+		{"name": "model-d", "namespace": "model-ns"},
+	})
+	bAdminOnlySubscription := createInventorySubscription(t, "b-admin-only-sub", nil, organizationB, organizationA, "Active", []map[string]any{
+		{"name": "model-e", "namespace": "model-ns"},
+	})
+	policies := []*unstructured.Unstructured{
+		createInventoryPolicy("owner-access", nil, []string{"owner-group"}, []map[string]any{
+			{"name": "model-a", "namespace": "model-ns"},
+			{"name": "model-b", "namespace": "model-ns"},
+			{"name": "model-c", "namespace": "model-ns"},
+			{"name": "model-d", "namespace": "model-ns"},
+		}),
+	}
+	identity := inventoryIdentityFor(t, organizationA, []string{"admins"})
+	router := setupInventoryTestRouter(
+		&mockLister{subscriptions: []*unstructured.Unstructured{
+			ownerSubscription,
+			ownerSubscription,
+			adminSubscription,
+			ownerOnlySubscription,
+			unmarkedSubscription,
+			bAdminOnlySubscription,
+		}},
+		policies,
+		"alice",
+		[]string{"owner-group"},
+		identity,
+	)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/subscriptions", nil))
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var result []subscription.SubscriptionInfo
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &result))
+	require.Len(t, result, 4)
+
+	byName := make(map[string]subscription.SubscriptionInfo, len(result))
+	for _, item := range result {
+		byName[item.SubscriptionIDHeader] = item
+	}
+	assert.Equal(t, []string{"owner", "admin"}, byName["owner-admin-sub"].Roles)
+	assert.Equal(t, []string{"owner", "admin"}, byName["pending-owner-admin-sub"].Roles)
+	assert.Nil(t, byName["owner-admin-sub"].Owner)
+	assert.Nil(t, byName["pending-owner-admin-sub"].Owner)
+	assert.Empty(t, byName["owner-only-sub"].Roles)
+	assert.Empty(t, byName["unmarked-sub"].Roles)
+	assert.NotContains(t, byName, "b-admin-only-sub")
+	assert.Len(t, byName["pending-owner-admin-sub"].ModelRefs, 2)
+	assert.Equal(t, organizationA, byName["owner-admin-sub"].OrganizationID)
+	assert.Equal(t, organizationA, byName["pending-owner-admin-sub"].OrganizationID)
+	assert.Equal(t, organizationB, byName["owner-only-sub"].OrganizationID)
+	assert.Equal(t, organizationB, byName["unmarked-sub"].OrganizationID)
+}
+
+func TestListSubscriptions_FlatOrganizationAdminScope(t *testing.T) {
+	organizationASubscription := createInventorySubscription(
+		t, "organization-a-sub", nil, organizationA, organizationB, "Active", nil,
+	)
+	organizationBSubscription := createInventorySubscription(
+		t, "organization-b-sub", nil, organizationB, organizationA, "Active", nil,
+	)
+	lister := &mockLister{subscriptions: []*unstructured.Unstructured{
+		organizationASubscription,
+		organizationBSubscription,
+	}}
+	tests := []struct {
+		name           string
+		organizationID string
+		roles          []string
+		want           []string
+	}{
+		{name: "organization A admin", organizationID: organizationA, roles: []string{"admins"}, want: []string{"organization-a-sub"}},
+		{name: "organization A user", organizationID: organizationA, roles: []string{"users"}, want: []string{}},
+		{name: "organization B admin", organizationID: organizationB, roles: []string{"admins"}, want: []string{"organization-b-sub"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			router := setupInventoryTestRouter(
+				lister,
+				nil,
+				"",
+				nil,
+				inventoryIdentityFor(t, test.organizationID, test.roles),
+			)
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/subscriptions", nil))
+
+			require.Equal(t, http.StatusOK, recorder.Code)
+			var result []subscription.SubscriptionInfo
+			require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &result))
+			got := make([]string, 0, len(result))
+			for _, item := range result {
+				got = append(got, item.SubscriptionIDHeader)
+			}
+			assert.Equal(t, test.want, got)
+		})
+	}
+}
+
+func TestListSubscriptions_AdminSubjectInventoryUsesExactModelRefJoins(t *testing.T) {
+	subscriptionObject := createInventorySubscription(t, "admin-sub", []string{
+		organizationA + "/model-b-owners",
+		organizationA + "/owner-no-access",
+		organizationA + "/owner-users",
+		organizationB + "/owner",
+	}, organizationA, organizationB, "Failed", []map[string]any{
+		{"name": "model-a", "namespace": "model-ns"},
+		{"name": "model-b", "namespace": "model-ns"},
+		{"name": "model-c", "namespace": "model-ns"},
+	})
+	spec, ok := subscriptionObject.Object["spec"].(map[string]any)
+	require.True(t, ok)
+	owner, ok := spec["owner"].(map[string]any)
+	require.True(t, ok)
+	owner["users"] = []any{
+		organizationA + "/alice",
+		organizationA + "/bob",
+		organizationA + "/owner-only-user",
+	}
+	policies := []*unstructured.Unstructured{
+		createInventoryPolicy("model-a-access", []string{
+			organizationA + "/alice",
+			organizationA + "/bob",
+			organizationA + "/policy-only-user",
+			"unqualified-alice",
+		}, []string{
+			organizationA + "/policy-only-group",
+			organizationA + "/owner-users",
+			organizationA + "/users",
+			organizationA + "/admins",
+			organizationA + "/users",
+		}, []map[string]any{{"name": "model-a", "namespace": "model-ns"}}),
+		createInventoryPolicy("wrong-namespace", []string{organizationA + "/wrong-namespace-user"}, []string{
+			organizationA + "/users",
+		}, []map[string]any{{"name": "model-a", "namespace": "other-ns"}}),
+		createInventoryPolicy("user-only", []string{organizationA + "/user-only"}, nil, []map[string]any{
+			{"name": "model-a", "namespace": "model-ns"},
+		}),
+		createInventoryPolicy("mixed-organization", []string{organizationA + "/mixed-user"}, []string{
+			organizationA + "/users",
+			organizationB + "/users",
+		}, []map[string]any{{"name": "model-a", "namespace": "model-ns"}}),
+		createInventoryPolicy("model-b-access", nil, []string{
+			organizationA + "/model-b-owners",
+			organizationA + "/viewers",
+		}, []map[string]any{{"name": "model-b", "namespace": "model-ns"}}),
+	}
+	identity := inventoryIdentityFor(t, organizationA, []string{"admins"})
+	router := setupInventoryTestRouter(
+		&mockLister{subscriptions: []*unstructured.Unstructured{subscriptionObject}},
+		policies,
+		"",
+		nil,
+		identity,
+	)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/subscriptions", nil))
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var result []subscription.SubscriptionInfo
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &result))
+	require.Len(t, result, 1)
+	assert.Equal(t, []string{"admin"}, result[0].Roles)
+	require.Len(t, result[0].ModelRefs, 3)
+	require.NotNil(t, result[0].Owner)
+	assert.Equal(t, []authpolicy.GroupReference{
+		{Name: organizationA + "/model-b-owners"},
+		{Name: organizationA + "/owner-users"},
+	}, result[0].Owner.Groups)
+	assert.Equal(t, []string{
+		organizationA + "/alice",
+		organizationA + "/bob",
+	}, result[0].Owner.Users)
+
+	assert.Equal(t, "model-a", result[0].ModelRefs[0].Name)
+	require.NotNil(t, result[0].ModelRefs[0].Subjects)
+	assert.Equal(t, []authpolicy.GroupReference{
+		{Name: organizationA + "/owner-users"},
+	}, result[0].ModelRefs[0].Subjects.Groups)
+	assert.Equal(t, []string{
+		organizationA + "/alice",
+		organizationA + "/bob",
+	}, result[0].ModelRefs[0].Subjects.Users)
+
+	assert.Equal(t, "model-b", result[0].ModelRefs[1].Name)
+	require.NotNil(t, result[0].ModelRefs[1].Subjects)
+	assert.Equal(t, []authpolicy.GroupReference{
+		{Name: organizationA + "/model-b-owners"},
+	}, result[0].ModelRefs[1].Subjects.Groups)
+	assert.Empty(t, result[0].ModelRefs[1].Subjects.Users)
+
+	assert.Equal(t, "model-c", result[0].ModelRefs[2].Name)
+	assert.Nil(t, result[0].ModelRefs[2].Subjects)
+
+	var rawResult []map[string]any
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &rawResult))
+	require.Len(t, rawResult, 1)
+	assert.NotContains(t, rawResult[0], "namespace")
+	rawModelRefs, ok := rawResult[0]["model_refs"].([]any)
+	require.True(t, ok)
+	require.Len(t, rawModelRefs, 3)
+	rawModelRef, ok := rawModelRefs[0].(map[string]any)
+	require.True(t, ok)
+	assert.NotContains(t, rawModelRef, "namespace")
+	assert.NotContains(t, rawModelRef, "model_access_subjects")
+	rawSubjects, ok := rawModelRef["subjects"].(map[string]any)
+	require.True(t, ok)
+	rawGroups, ok := rawSubjects["groups"].([]any)
+	require.True(t, ok)
+	require.Len(t, rawGroups, 1)
+	assert.Equal(t, map[string]any{"name": organizationA + "/owner-users"}, rawGroups[0])
+
+	rawOwner, ok := rawResult[0]["owner"].(map[string]any)
+	require.True(t, ok)
+	rawOwnerGroups, ok := rawOwner["groups"].([]any)
+	require.True(t, ok)
+	require.Len(t, rawOwnerGroups, 2)
+	rawOwnerGroup, ok := rawOwnerGroups[0].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, map[string]any{"name": organizationA + "/model-b-owners"}, rawOwnerGroup)
+
+	rawModelBRef, ok := rawModelRefs[1].(map[string]any)
+	require.True(t, ok)
+	assert.NotContains(t, rawModelBRef, "model_access_subjects")
+	rawModelBSubjects, ok := rawModelBRef["subjects"].(map[string]any)
+	require.True(t, ok)
+	assert.NotContains(t, rawModelBSubjects, "users")
+
+	rawModelCRef, ok := rawModelRefs[2].(map[string]any)
+	require.True(t, ok)
+	assert.NotContains(t, rawModelCRef, "model_access_subjects")
+	assert.NotContains(t, rawModelCRef, "subjects")
+}
+
+func TestListSubscriptions_AdminInventorySkipsIncompleteModelRefs(t *testing.T) {
+	subscriptionObject := createInventorySubscription(t, "admin-sub", []string{
+		organizationA + "/owners",
+	}, organizationA, organizationB, "Pending", []map[string]any{
+		{"name": "model-a", "namespace": "model-ns"},
+		{"name": "missing-namespace"},
+		{"namespace": "model-ns"},
+	})
+	policies := []*unstructured.Unstructured{
+		createInventoryPolicy("model-a-access", nil, []string{
+			organizationA + "/owners",
+		}, []map[string]any{{"name": "model-a", "namespace": "model-ns"}}),
+	}
+	identity := inventoryIdentityFor(t, organizationA, []string{"admins"})
+	router := setupInventoryTestRouter(
+		&mockLister{subscriptions: []*unstructured.Unstructured{subscriptionObject}},
+		policies,
+		"",
+		nil,
+		identity,
+	)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/subscriptions", nil))
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var result []subscription.SubscriptionInfo
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &result))
+	require.Len(t, result, 1)
+	require.Len(t, result[0].ModelRefs, 3)
+	require.NotNil(t, result[0].ModelRefs[0].Subjects)
+	assert.Nil(t, result[0].ModelRefs[1].Subjects)
+	assert.Nil(t, result[0].ModelRefs[2].Subjects)
+	require.NotNil(t, result[0].Owner)
+}
+
+func TestListSubscriptionsForModel_DoesNotUseAdminInventory(t *testing.T) {
+	subscriptionObject := createInventorySubscription(t, "admin-sub", nil, organizationA, organizationB, "Pending", []map[string]any{
+		{"name": "model-a", "namespace": "model-ns"},
+	})
+	identity := inventoryIdentityFor(t, organizationA, []string{"admins"})
+	router := setupInventoryTestRouter(
+		&mockLister{subscriptions: []*unstructured.Unstructured{subscriptionObject}},
+		nil,
+		"",
+		nil,
+		identity,
+	)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/model/model-a/subscriptions", nil))
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var result []subscription.SubscriptionInfo
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &result))
+	assert.Empty(t, result)
 }
 
 func TestListSubscriptions_MultipleAccessible(t *testing.T) {
@@ -1061,8 +1527,8 @@ func TestListSubscriptions_MultipleAccessible(t *testing.T) {
 		found[s.SubscriptionIDHeader] = s.SubscriptionDescription
 	}
 
-	if desc, ok := found["free-sub"]; !ok || desc != "Free Tier" {
-		t.Errorf("expected free-sub with description 'Free Tier' (fallback from display-name), got %q", desc)
+	if desc, ok := found["free-sub"]; !ok || desc != "" {
+		t.Errorf("expected free-sub with empty description (no fallback), got %q", desc)
 	}
 	if desc, ok := found["premium-sub"]; !ok || desc != "High limits for production" {
 		t.Errorf("expected premium-sub with description 'High limits for production', got %q", desc)
@@ -1152,7 +1618,7 @@ func TestListSubscriptionsForModel_UnknownModel(t *testing.T) {
 	}
 }
 
-func TestListSubscriptions_DescriptionFallback(t *testing.T) {
+func TestListSubscriptions_DescriptionNoFallback(t *testing.T) {
 	lister := &mockLister{subscriptions: []*unstructured.Unstructured{
 		createTestSubscriptionWithAnnotations("both-annotations", []string{"free-users"}, []string{"m"}, map[string]string{
 			"openshift.io/display-name": "My Display Name",
@@ -1201,16 +1667,16 @@ func TestListSubscriptions_DescriptionFallback(t *testing.T) {
 	if byID["with-description-only"].SubscriptionDescription != "Description Only" {
 		t.Errorf("expected description 'Description Only', got %q", byID["with-description-only"].SubscriptionDescription)
 	}
-	// Display-name falls back to subscription_description when no description
-	if byID["with-display-name-only"].SubscriptionDescription != "Display Name Only" {
-		t.Errorf("expected description fallback to display-name, got %q", byID["with-display-name-only"].SubscriptionDescription)
+	// Display-name only: description should be empty (no fallback)
+	if byID["with-display-name-only"].SubscriptionDescription != "" {
+		t.Errorf("expected empty description (no fallback), got %q", byID["with-display-name-only"].SubscriptionDescription)
 	}
 	if byID["with-display-name-only"].DisplayName != "Display Name Only" {
 		t.Errorf("expected display_name 'Display Name Only', got %q", byID["with-display-name-only"].DisplayName)
 	}
-	// No annotations: falls back to name
-	if byID["no-annotations"].SubscriptionDescription != "no-annotations" {
-		t.Errorf("expected name fallback, got %q", byID["no-annotations"].SubscriptionDescription)
+	// No annotations: description should be empty (no fallback)
+	if byID["no-annotations"].SubscriptionDescription != "" {
+		t.Errorf("expected empty description (no fallback), got %q", byID["no-annotations"].SubscriptionDescription)
 	}
 }
 
@@ -1243,6 +1709,114 @@ func createTestMaaSModelRef(name, namespace, displayName, description string) *u
 			},
 		},
 	}
+}
+
+// TestListSubscriptions_NoAuthContext verifies that /v1/subscriptions returns an
+// empty list when no user context is present (ExtractUserInfoOptional did not
+// set one). This covers the case where no LLMInferenceService is deployed.
+func TestListSubscriptions_NoAuthContext(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+
+	log := logger.New(false)
+	lister := &mockLister{subscriptions: []*unstructured.Unstructured{
+		createTestSubscription("premium-sub", []string{"premium-users"}, 10, "org-1", "cc-1"),
+	}}
+	selector := subscription.NewSelector(log, lister, nil, nil)
+	handler := subscription.NewHandler(log, selector, nil)
+
+	tokenHandler := token.NewHandler(log, "test-tenant")
+
+	// Use ExtractUserInfoOptional — same as production wiring.
+	router.GET("/v1/subscriptions", tokenHandler.ExtractUserInfoOptional(), handler.ListSubscriptions)
+	router.GET("/v1/model/:model-id/subscriptions", tokenHandler.ExtractUserInfoOptional(), handler.ListSubscriptionsForModel)
+
+	t.Run("returns empty list when no auth headers at all", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/v1/subscriptions", nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var result []subscription.SubscriptionInfo
+		if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+			t.Fatalf("failed to unmarshal: %v", err)
+		}
+		if len(result) != 0 {
+			t.Errorf("expected empty array, got %d items", len(result))
+		}
+		if cc := w.Header().Get("Cache-Control"); cc != "no-store" {
+			t.Errorf("expected Cache-Control: no-store, got %q", cc)
+		}
+	})
+
+	t.Run("returns empty list when Authorization present but no identity headers", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/v1/subscriptions", nil)
+		req.Header.Set("Authorization", "Bearer some-token")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var result []subscription.SubscriptionInfo
+		if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+			t.Fatalf("failed to unmarshal: %v", err)
+		}
+		if len(result) != 0 {
+			t.Errorf("expected empty array, got %d items", len(result))
+		}
+	})
+
+	t.Run("model subscriptions returns empty list when no auth context", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/v1/model/some-model/subscriptions", nil)
+		req.Header.Set("Authorization", "Bearer some-token")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var result []subscription.SubscriptionInfo
+		if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+			t.Fatalf("failed to unmarshal: %v", err)
+		}
+		if len(result) != 0 {
+			t.Errorf("expected empty array, got %d items", len(result))
+		}
+		if cc := w.Header().Get("Cache-Control"); cc != "no-store" {
+			t.Errorf("expected Cache-Control: no-store, got %q", cc)
+		}
+	})
+
+	t.Run("returns normal response when all auth headers present", func(t *testing.T) {
+		gin.SetMode(gin.TestMode)
+		authedRouter := gin.New()
+		authedRouter.GET("/v1/subscriptions", tokenHandler.ExtractUserInfoOptional(), handler.ListSubscriptions)
+
+		req := httptest.NewRequest(http.MethodGet, "/v1/subscriptions", nil)
+		req.Header.Set("Authorization", "Bearer valid-token")
+		req.Header.Set("X-Maas-Username", "test-user")
+		req.Header.Set("X-Maas-Group", `["premium-users"]`)
+		w := httptest.NewRecorder()
+		authedRouter.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var result []subscription.SubscriptionInfo
+		if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+			t.Fatalf("failed to unmarshal: %v", err)
+		}
+		if len(result) != 1 {
+			t.Errorf("expected 1 subscription, got %d", len(result))
+		}
+	})
 }
 
 func TestListSubscriptions_ModelRefEnrichment(t *testing.T) {
@@ -1387,4 +1961,624 @@ func TestListSubscriptionsForModel_NoAccess(t *testing.T) {
 	if len(result) != 0 {
 		t.Errorf("expected empty array when user has no access, got %d items", len(result))
 	}
+}
+
+func TestHandler_SelectSubscription_RecordsUnauthorizedRejection(t *testing.T) {
+	subscriptions := []*unstructured.Unstructured{
+		createTestSubscription("premium-sub", []string{"premium-users"}, 10, "org-1", "cc-1"),
+	}
+
+	metrics := &mockMetricsRecorder{}
+	lister := &mockLister{subscriptions: subscriptions}
+	router := setupTestRouterWithMetrics(lister, metrics)
+
+	reqBody := `{
+		"username": "alice",
+		"groups": ["basic-users"],
+		"requestedSubscription": "premium-sub"
+	}`
+
+	req := httptest.NewRequest(http.MethodPost, "/subscriptions/select", bytes.NewBufferString(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if len(metrics.rejections) != 1 {
+		t.Fatalf("expected 1 rejection recorded, got %d", len(metrics.rejections))
+	}
+	if metrics.rejections[0] != "unauthorized" {
+		t.Errorf("expected rejection reason 'unauthorized', got %s", metrics.rejections[0])
+	}
+}
+
+func TestHandler_SelectSubscription_RecordsNoCapacityRejection(t *testing.T) {
+	// Empty subscription list
+	metrics := &mockMetricsRecorder{}
+	lister := &mockLister{subscriptions: []*unstructured.Unstructured{}}
+	router := setupTestRouterWithMetrics(lister, metrics)
+
+	reqBody := `{
+		"username": "alice",
+		"groups": ["basic-users"]
+	}`
+
+	req := httptest.NewRequest(http.MethodPost, "/subscriptions/select", bytes.NewBufferString(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if len(metrics.rejections) != 1 {
+		t.Fatalf("expected 1 rejection recorded, got %d", len(metrics.rejections))
+	}
+	if metrics.rejections[0] != "no-capacity" {
+		t.Errorf("expected rejection reason 'no-capacity', got %s", metrics.rejections[0])
+	}
+}
+
+func TestHandler_SelectSubscription_RecordsNoCapacityForModelNotInSubscription(t *testing.T) {
+	subscriptions := []*unstructured.Unstructured{
+		createTestSubscription("basic-sub", []string{"basic-users"}, 10, "org-1", "cc-1"),
+	}
+
+	metrics := &mockMetricsRecorder{}
+	lister := &mockLister{subscriptions: subscriptions}
+	router := setupTestRouterWithMetrics(lister, metrics)
+
+	reqBody := `{
+		"username": "alice",
+		"groups": ["basic-users"],
+		"requestedModel": "test-ns/nonexistent-model"
+	}`
+
+	req := httptest.NewRequest(http.MethodPost, "/subscriptions/select", bytes.NewBufferString(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if len(metrics.rejections) != 1 {
+		t.Fatalf("expected 1 rejection recorded, got %d", len(metrics.rejections))
+	}
+	if metrics.rejections[0] != "no-capacity" {
+		t.Errorf("expected rejection reason 'no-capacity', got %s", metrics.rejections[0])
+	}
+}
+
+func TestHandler_SelectSubscription_RecordsQuotaExceededForFailedPhase(t *testing.T) {
+	metrics := &mockMetricsRecorder{}
+	lister := &fakeLister{subscriptions: []*unstructured.Unstructured{
+		createSubscriptionWithHealth("failed-sub", []string{"basic-users"}, nil, 10, defaultTestTokenRateLimit, phaseFailed, false, false),
+	}}
+	router := setupTestRouterWithMetrics(lister, metrics)
+
+	reqBody := `{
+		"username": "alice",
+		"groups": ["basic-users"],
+		"requestedModel": "test-model"
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/subscriptions/select", bytes.NewBufferString(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if len(metrics.rejections) != 1 {
+		t.Fatalf("expected 1 rejection recorded, got %d", len(metrics.rejections))
+	}
+	if metrics.rejections[0] != "quota-exceeded" {
+		t.Errorf("expected rejection reason 'quota-exceeded', got %s", metrics.rejections[0])
+	}
+}
+
+func TestHandler_SelectSubscription_RecordsRateLimitedForTRLPNotReady(t *testing.T) {
+	metrics := &mockMetricsRecorder{}
+	lister := &fakeLister{subscriptions: []*unstructured.Unstructured{
+		createSubscriptionWithTRLPStatus("degraded-sub", []string{"basic-users"}, phaseDegraded, []map[string]any{
+			{
+				"name":      "model-a",
+				"namespace": "ns",
+				"ready":     true,
+				"reason":    "Valid",
+			},
+		}, []map[string]any{
+			{
+				"model":     "model-a",
+				"name":      "maas-trlp-model-a",
+				"namespace": "ns",
+				"ready":     false,
+				"reason":    "NotAccepted",
+				"message":   "status not available",
+			},
+		}),
+	}}
+	router := setupTestRouterWithMetrics(lister, metrics)
+
+	reqBody := `{
+		"username": "alice",
+		"groups": ["basic-users"],
+		"requestedModel": "ns/model-a"
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/subscriptions/select", bytes.NewBufferString(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if len(metrics.rejections) != 1 {
+		t.Fatalf("expected 1 rejection recorded, got %d", len(metrics.rejections))
+	}
+	if metrics.rejections[0] != "rate-limited" {
+		t.Errorf("expected rejection reason 'rate-limited', got %s", metrics.rejections[0])
+	}
+}
+
+const validCallbackIdentity = `{
+  "source": "oidc",
+  "claims": {
+    "iss": "https://issuer.example.com",
+    "sub": "user-1",
+    "aud": "maas-api",
+    "azp": "maas-client",
+    "groups": [],
+    "org_id": "42c3e46f-2477-44d7-a85b-d3b43f6b31fa",
+    "roles": ["admins"]
+  }
+}`
+
+const (
+	organizationA = "42c3e46f-2477-44d7-a85b-d3b43f6b31fa"
+	organizationB = "53d4f57e-3588-55e8-b96c-4ec54a7c42fa"
+)
+
+func callbackIdentityFor(t *testing.T, organizationID string, roles, groups []string) string {
+	t.Helper()
+	claims := map[string]any{
+		"iss":    "https://issuer.example.com",
+		"sub":    "user-1",
+		"aud":    "maas-api",
+		"azp":    "maas-client",
+		"org_id": organizationID,
+	}
+	if roles != nil {
+		claims["roles"] = roles
+	}
+	if groups != nil {
+		claims["groups"] = groups
+	}
+	data, err := json.Marshal(map[string]any{"source": "oidc", "claims": claims})
+	require.NoError(t, err)
+	return string(data)
+}
+
+func createSubscriptionForAdmin(t *testing.T, name, namespace, associatedOrganizationID, attributionOrganizationID, phase string, ownerGroups []string) *unstructured.Unstructured {
+	t.Helper()
+	subscriptionObject := createTestSubscription(name, ownerGroups, 10, attributionOrganizationID, "cost-center")
+	metadata, ok := subscriptionObject.Object["metadata"].(map[string]any)
+	require.True(t, ok)
+	metadata["namespace"] = namespace
+	spec, ok := subscriptionObject.Object["spec"].(map[string]any)
+	require.True(t, ok)
+	if associatedOrganizationID != "" {
+		spec["organization"] = map[string]any{"id": associatedOrganizationID}
+	}
+	status, ok := subscriptionObject.Object["status"].(map[string]any)
+	require.True(t, ok)
+	status["phase"] = phase
+	if phase != "Active" {
+		conditions, ok := status["conditions"].([]any)
+		require.True(t, ok)
+		condition, ok := conditions[0].(map[string]any)
+		require.True(t, ok)
+		condition["status"] = "False"
+	}
+	return subscriptionObject
+}
+
+func setupAdminTestRouter(lister subscription.Lister, accessChecker subscription.ModelAccessChecker) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	log := logger.New(false)
+	selector := subscription.NewSelector(log, lister, nil, accessChecker, subscription.WithTenantName("grid-tenant"))
+	handler := subscription.NewHandler(log, selector, nil)
+	tokenHandler := token.NewHandler(log, "grid-tenant")
+	router.POST("/subscriptions/select", tokenHandler.RejectTrustedIdentityHeaders(), handler.SelectSubscription)
+	return router
+}
+
+func subscriptionAdminRequest(t *testing.T, requestedSubscription, identity string) string {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"purpose":               subscription.PurposeSubscriptionAdmin,
+		"requestedSubscription": requestedSubscription,
+		"identity":              json.RawMessage(identity),
+	})
+	require.NoError(t, err)
+	return string(body)
+}
+
+func adminDecision(t *testing.T, response map[string]any) map[string]any {
+	t.Helper()
+	admin, ok := response["admin"].(map[string]any)
+	require.True(t, ok, "expected admin decision")
+	return admin
+}
+
+func assertSubscriptionAdminAllowed(t *testing.T, response map[string]any, expectedSubscription string) {
+	t.Helper()
+	admin := adminDecision(t, response)
+	assert.Equal(t, true, admin["allowed"])
+	scope, ok := admin["scope"].(map[string]any)
+	require.True(t, ok, "expected positive admin scope")
+	assert.Equal(t, "grid-tenant", scope["tenant"])
+	assert.Equal(t, "test-ns", scope["namespace"])
+	assert.Equal(t, expectedSubscription, scope["subscription"])
+	assert.Equal(t, organizationA, scope["organizationId"])
+	assert.Equal(t, false, response["accessAllowed"])
+	assert.NotContains(t, response, "name")
+	assert.Empty(t, response["error"])
+}
+
+type panickingModelAccessChecker struct{}
+
+func (panickingModelAccessChecker) AuthorizedModels([]string, string) (map[authpolicy.ModelKey]bool, error) {
+	panic("inference model-access checker must not be used for subscription administration")
+}
+
+func postSelection(t *testing.T, router *gin.Engine, body string) map[string]any {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodPost, "/subscriptions/select", bytes.NewBufferString(body))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusOK, recorder.Code)
+
+	var response map[string]any
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+	return response
+}
+
+func TestHandler_SelectSubscription_ExplicitSelectPurposePreservesLegacyBehavior(t *testing.T) {
+	subscriptions := []*unstructured.Unstructured{
+		createTestSubscription("basic-sub", []string{"basic-users"}, 10, "org-basic", "cc-basic"),
+	}
+	router := setupTestRouter(&mockLister{subscriptions: subscriptions})
+
+	response := postSelection(t, router, `{
+		"purpose": "select",
+		"username": "alice",
+		"groups": ["basic-users"]
+	}`)
+
+	assert.Equal(t, "basic-sub", response["name"])
+	assert.Empty(t, response["purpose"])
+	assert.Equal(t, true, response["accessAllowed"])
+}
+
+func TestHandler_SelectSubscription_RejectsIdentityInSelectMode(t *testing.T) {
+	router := setupTestRouter(&mockLister{subscriptions: nil})
+
+	response := postSelection(t, router, `{
+		"purpose": "select",
+		"username": "alice",
+		"groups": ["basic-users"],
+		"identity": `+validCallbackIdentity+`
+	}`)
+
+	assert.Equal(t, "bad_request", response["error"])
+	assert.NotContains(t, response, "name")
+}
+
+func TestHandler_SelectSubscription_SubscriptionAdminFailsClosed(t *testing.T) {
+	router := setupTestRouter(&mockLister{subscriptions: nil})
+
+	response := postSelection(t, router, `{
+		"purpose": "subscription-admin",
+		"requestedSubscription": "basic-sub",
+		"identity": `+validCallbackIdentity+`
+	}`)
+
+	assert.Equal(t, subscription.PurposeSubscriptionAdmin, response["purpose"])
+	assert.Equal(t, "not_found", response["error"])
+	assert.Equal(t, false, response["accessAllowed"])
+	assert.Equal(t, false, adminDecision(t, response)["allowed"])
+}
+
+func TestHandler_SelectSubscription_SubscriptionAdminRejectsMalformedIdentity(t *testing.T) {
+	router := setupTestRouter(&mockLister{subscriptions: nil})
+
+	response := postSelection(t, router, `{
+		"purpose": "subscription-admin",
+		"requestedSubscription": "basic-sub",
+		"identity": {"source":"authorino","claims":{}}
+	}`)
+
+	assert.Equal(t, "invalid_identity", response["error"])
+	assert.Equal(t, false, response["accessAllowed"])
+	assert.Equal(t, false, adminDecision(t, response)["allowed"])
+}
+
+func TestHandler_SelectSubscription_SubscriptionAdminAllowsOrganizationAdmin(t *testing.T) {
+	adminIdentity := callbackIdentityFor(t, organizationA, []string{"admins"}, nil)
+
+	tests := []struct {
+		name   string
+		target string
+		phase  string
+	}{
+		{name: "qualified active subscription", target: "test-ns/grid-sub-a", phase: "Active"},
+		{name: "bare subscription alias", target: "grid-sub-a", phase: "Active"},
+		{name: "pending subscription", target: "grid-sub-a", phase: "Pending"},
+		{name: "failed subscription", target: "grid-sub-a", phase: "Failed"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			lister := &mockLister{subscriptions: []*unstructured.Unstructured{
+				createSubscriptionForAdmin(t, "grid-sub-a", "test-ns", organizationA, organizationB, test.phase, nil),
+			}}
+			router := setupAdminTestRouter(lister, nil)
+			response := postSelection(t, router, subscriptionAdminRequest(t, test.target, adminIdentity))
+			assertSubscriptionAdminAllowed(t, response, "grid-sub-a")
+		})
+	}
+}
+
+func TestHandler_SelectSubscription_SubscriptionAdminAllowsMultipleSubscriptionsPerOrganization(t *testing.T) {
+	adminIdentity := callbackIdentityFor(t, organizationA, []string{"admins"}, nil)
+	lister := &mockLister{subscriptions: []*unstructured.Unstructured{
+		createSubscriptionForAdmin(t, "grid-sub-a-1", "test-ns", organizationA, organizationB, "Active", nil),
+		createSubscriptionForAdmin(t, "grid-sub-a-2", "test-ns", organizationA, organizationB, "Pending", nil),
+	}}
+	router := setupAdminTestRouter(lister, nil)
+
+	for _, subscriptionName := range []string{"grid-sub-a-1", "grid-sub-a-2"} {
+		response := postSelection(t, router, subscriptionAdminRequest(t, subscriptionName, adminIdentity))
+		assertSubscriptionAdminAllowed(t, response, subscriptionName)
+	}
+}
+
+func TestHandler_SelectSubscription_SubscriptionAdminRequiresAdminForRequestedSubscription(t *testing.T) {
+	identity := callbackIdentityFor(t, organizationA, []string{"admins"}, nil)
+	lister := &mockLister{subscriptions: []*unstructured.Unstructured{
+		createSubscriptionForAdmin(t, "grid-sub-a", "test-ns", organizationA, organizationB, "Active", nil),
+		createSubscriptionForAdmin(t, "grid-sub-b", "test-ns", organizationB, organizationA, "Active", nil),
+	}}
+	router := setupAdminTestRouter(lister, nil)
+
+	response := postSelection(t, router, subscriptionAdminRequest(t, "grid-sub-a", identity))
+	assertSubscriptionAdminAllowed(t, response, "grid-sub-a")
+
+	response = postSelection(t, router, subscriptionAdminRequest(t, "grid-sub-b", identity))
+	admin := adminDecision(t, response)
+	assert.Equal(t, false, admin["allowed"])
+	assert.Nil(t, admin["scope"])
+	assert.Equal(t, "access_denied", admin["reason"])
+	assert.Equal(t, "access_denied", response["error"])
+}
+
+func TestHandler_SelectSubscription_SubscriptionAdminDeniesCrossOrganizationAndLegacyGrants(t *testing.T) {
+	adminGroup := organizationA + "/ai-grid-admins"
+	aAdmin := callbackIdentityFor(t, organizationA, []string{"admins"}, []string{adminGroup})
+	aUserWithAdminGroup := callbackIdentityFor(t, organizationA, []string{"users"}, []string{adminGroup})
+	bAdmin := callbackIdentityFor(t, organizationB, []string{"admins"}, nil)
+
+	tests := []struct {
+		name           string
+		identity       string
+		association    string
+		attribution    string
+		ownerGroups    []string
+		expectedReason string
+	}{
+		{
+			name:           "B admin cannot administer an A subscription",
+			identity:       bAdmin,
+			association:    organizationA,
+			attribution:    organizationA,
+			ownerGroups:    []string{adminGroup},
+			expectedReason: "access_denied",
+		},
+		{
+			name:           "owner model and attribution groups do not grant admin",
+			identity:       aUserWithAdminGroup,
+			association:    organizationA,
+			attribution:    organizationA,
+			ownerGroups:    []string{adminGroup},
+			expectedReason: "access_denied",
+		},
+		{
+			name:           "missing organization association",
+			identity:       aAdmin,
+			association:    "",
+			attribution:    organizationA,
+			ownerGroups:    []string{adminGroup},
+			expectedReason: "unresolved_association",
+		},
+		{
+			name:           "invalid organization association",
+			identity:       aAdmin,
+			association:    "not-a-uuid",
+			attribution:    organizationA,
+			ownerGroups:    []string{adminGroup},
+			expectedReason: "unresolved_association",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			lister := &mockLister{subscriptions: []*unstructured.Unstructured{
+				createSubscriptionForAdmin(t, "grid-sub", "test-ns", test.association, test.attribution, "Active", test.ownerGroups),
+			}}
+			router := setupAdminTestRouter(lister, nil)
+			response := postSelection(t, router, subscriptionAdminRequest(t, "grid-sub", test.identity))
+
+			admin, ok := response["admin"].(map[string]any)
+			require.True(t, ok)
+			assert.Equal(t, false, admin["allowed"])
+			assert.Nil(t, admin["scope"])
+			assert.Equal(t, test.expectedReason, admin["reason"])
+			assert.Equal(t, test.expectedReason, response["error"])
+			assert.Equal(t, false, response["accessAllowed"])
+		})
+	}
+}
+
+func TestHandler_SelectSubscription_SubscriptionAdminDeniesAmbiguousBareName(t *testing.T) {
+	adminIdentity := callbackIdentityFor(t, organizationA, []string{"admins"}, nil)
+	lister := &mockLister{subscriptions: []*unstructured.Unstructured{
+		createSubscriptionForAdmin(t, "grid-sub", "test-ns", organizationA, organizationB, "Active", nil),
+		createSubscriptionForAdmin(t, "grid-sub", "other-ns", organizationA, organizationB, "Active", nil),
+	}}
+	router := setupAdminTestRouter(lister, nil)
+
+	response := postSelection(t, router, subscriptionAdminRequest(t, "grid-sub", adminIdentity))
+	admin := adminDecision(t, response)
+	assert.Equal(t, false, admin["allowed"])
+	assert.Equal(t, "ambiguous_subscription", response["error"])
+
+	response = postSelection(t, router, subscriptionAdminRequest(t, "test-ns/grid-sub", adminIdentity))
+	assertSubscriptionAdminAllowed(t, response, "grid-sub")
+}
+
+func TestHandler_SelectSubscription_SubscriptionAdminMissingRolesHasNoAdmin(t *testing.T) {
+	identity := `{
+		"source": "oidc",
+		"claims": {
+			"iss": "https://issuer.example.com",
+			"sub": "user-1",
+			"aud": "maas-api",
+			"azp": "maas-client",
+			"org_id": "` + organizationA + `"
+		}
+	}`
+	lister := &mockLister{subscriptions: []*unstructured.Unstructured{
+		createSubscriptionForAdmin(t, "grid-sub", "test-ns", organizationA, organizationB, "Active", nil),
+	}}
+	router := setupAdminTestRouter(lister, nil)
+
+	response := postSelection(t, router, subscriptionAdminRequest(t, "grid-sub", identity))
+	admin := adminDecision(t, response)
+	assert.Equal(t, false, admin["allowed"])
+	assert.Nil(t, admin["scope"])
+	assert.Equal(t, "access_denied", admin["reason"])
+	assert.Equal(t, "access_denied", response["error"])
+}
+
+func TestHandler_SelectSubscription_SubscriptionAdminRejectsDuplicateOrganizationIDClaims(t *testing.T) {
+	identity := `{
+		"source": "oidc",
+		"claims": {
+			"iss": "https://issuer.example.com",
+			"sub": "user-1",
+			"aud": "maas-api",
+			"azp": "maas-client",
+			"org_id": "` + organizationA + `",
+			"org_id": "` + organizationA + `",
+			"roles": ["admins"]
+		}
+	}`
+	lister := &mockLister{subscriptions: []*unstructured.Unstructured{
+		createSubscriptionForAdmin(t, "grid-sub", "test-ns", organizationA, organizationB, "Active", nil),
+	}}
+	router := setupAdminTestRouter(lister, nil)
+
+	response := postSelection(t, router, subscriptionAdminRequest(t, "grid-sub", identity))
+	assert.Equal(t, "invalid_identity", response["error"])
+	assert.Equal(t, false, adminDecision(t, response)["allowed"])
+}
+
+func TestHandler_SelectSubscription_SubscriptionAdminDoesNotUseInferenceAccessChecker(t *testing.T) {
+	adminIdentity := callbackIdentityFor(t, organizationA, []string{"admins"}, nil)
+	lister := &mockLister{subscriptions: []*unstructured.Unstructured{
+		createSubscriptionForAdmin(t, "grid-sub", "test-ns", organizationA, organizationB, "Active", nil),
+	}}
+	router := setupAdminTestRouter(lister, panickingModelAccessChecker{})
+
+	response := postSelection(t, router, subscriptionAdminRequest(t, "grid-sub", adminIdentity))
+	assertSubscriptionAdminAllowed(t, response, "grid-sub")
+}
+
+func TestHandler_SelectSubscription_SubscriptionAdminRejectsOversizedIdentity(t *testing.T) {
+	router := setupTestRouter(&mockLister{subscriptions: nil})
+	identity := strings.Replace(
+		validCallbackIdentity,
+		"https://issuer.example.com",
+		"https://"+strings.Repeat("a", token.MaxIdentityEnvelopeBytes),
+		1,
+	)
+
+	response := postSelection(t, router, `{
+		"purpose": "subscription-admin",
+		"requestedSubscription": "basic-sub",
+		"identity": `+identity+`
+	}`)
+
+	assert.Equal(t, "invalid_identity", response["error"])
+	assert.Equal(t, "trusted identity is too large", response["message"])
+	assert.Equal(t, false, response["accessAllowed"])
+	assert.Equal(t, false, adminDecision(t, response)["allowed"])
+}
+
+func TestHandler_SelectSubscription_RejectsOversizedRequestBody(t *testing.T) {
+	router := setupTestRouter(&mockLister{subscriptions: nil})
+	body := `{"purpose":"subscription-admin","identity":"` +
+		strings.Repeat("a", 1<<20+1) + `"}`
+
+	response := postSelection(t, router, body)
+
+	assert.Equal(t, "bad_request", response["error"])
+	assert.Equal(t, "invalid request body", response["message"])
+	assert.NotContains(t, response, "admin")
+}
+
+func TestHandler_SelectSubscription_PreservesLargeLegacyGroups(t *testing.T) {
+	// Legacy selection forwards the complete provider group claim. Unlike the
+	// bounded admin identity envelope, that claim has no upstream count limit,
+	// so the callback must not impose a tighter limit than the API-wide body
+	// guard. This payload is intentionally larger than 64 KiB.
+	group := strings.Repeat("grid-users-", 6) + "0"
+	groups := make([]string, 2048)
+	for index := range groups {
+		groups[index] = group
+	}
+	subscriptions := []*unstructured.Unstructured{
+		createTestSubscription("large-groups-sub", []string{group}, 10, "org-large", "cc-large"),
+	}
+	router := setupTestRouter(&mockLister{subscriptions: subscriptions})
+
+	body, err := json.Marshal(map[string]any{
+		"username": "alice",
+		"groups":   groups,
+	})
+	require.NoError(t, err)
+	require.Greater(t, len(body), 64*1024)
+
+	response := postSelection(t, router, string(body))
+
+	assert.Equal(t, "large-groups-sub", response["name"])
+	assert.Equal(t, true, response["accessAllowed"])
+}
+
+func TestHandler_SelectSubscription_RejectsUnknownPurpose(t *testing.T) {
+	router := setupTestRouter(&mockLister{subscriptions: nil})
+
+	response := postSelection(t, router, `{
+		"purpose": "client-selected-admin",
+		"username": "alice"
+	}`)
+
+	assert.Equal(t, "bad_purpose", response["error"])
+}
+
+func TestHandler_SelectSubscription_RejectsDirectIdentityHeaderInjection(t *testing.T) {
+	router := setupTestRouter(&mockLister{subscriptions: nil})
+
+	request := httptest.NewRequest(http.MethodPost, "/subscriptions/select", bytes.NewBufferString(`{
+		"username": "alice"
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(constant.HeaderIdentity, validCallbackIdentity)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+
+	assert.Equal(t, http.StatusUnauthorized, recorder.Code)
+	assert.NotContains(t, recorder.Body.String(), "basic-sub")
 }
