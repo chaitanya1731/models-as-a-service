@@ -125,6 +125,15 @@ spec:
 EOF
 ```
 
+**Subscription-specific Gateway headers (experimental):** Add the `experimental.maas.opendatahub.io/headers` annotation to inject one or more upstream request headers when Gateway authentication resolves a request to that subscription. The value must be a JSON object mapping `x-grid-*` header names to arrays of strings; multiple values are sent as a comma-separated header.
+Client-supplied `x-grid-*` headers are rejected unless their names are configured, and configured names are replaced with the selected subscription's values.
+
+```yaml
+metadata:
+  annotations:
+    experimental.maas.opendatahub.io/headers: '{"x-grid-geo-fencing":["region1","region2"]}'
+```
+
 Verify the MaaSSubscription is active (TokenRateLimitPolicy created and enforced):
 
 ```bash
@@ -175,6 +184,25 @@ TRLP=$(kubectl get tokenratelimitpolicy -n ${MODEL_NS} -l maas.opendatahub.io/mo
     
     **Tracking:** [opendatahub-io/models-as-a-service#585](https://github.com/opendatahub-io/models-as-a-service/pull/585) proposes the controller change for coexisting token rate limit policies on a shared route.
     
+!!! warning "Token rate limiting and API format"
+    **TokenRateLimitPolicy** enforcement applies to **`/v1/chat/completions`** and **`/v1/embeddings`** endpoints (OpenAI format). Requests using **`/v1/messages`** (Anthropic Messages API) or **`/v1/responses`** (OpenAI Responses API) are **not** subject to token rate limits.
+    
+    Limitador counts tokens using the `usage.total_tokens` field in the response body. OpenAI Chat Completions and Embeddings responses both include this field. Embedding requests consume **prompt tokens only** (no completion tokens); these count toward the same subscription token budget as chat completions. Anthropic Messages and OpenAI Responses report usage differently (`input_tokens`/`output_tokens` without `total_tokens`), so the rate limiting integration cannot extract the token count.
+    
+    Authentication, subscription validation, and model access controls still apply to all endpoints — only token-based rate limiting enforcement is affected.
+
+### Model server must include usage data
+
+Token rate limiting requires the model server to return `usage.total_tokens` in every OpenAI-format response, including streaming chat completions. Without this, the gateway sees 0 tokens consumed and rate limits are never triggered. Embedding endpoints are unaffected because they always return non-streaming JSON with `usage.total_tokens`.
+
+How to enable this depends on the model server:
+
+**vLLM / llm-d** — start the server with `--enable-force-include-usage`. This can be passed as a container arg, appended to `VLLM_ADDITIONAL_ARGS`, or added to the `vllm serve` command line. See the [vLLM documentation](https://docs.vllm.ai/en/stable/cli/serve/#-enable-force-include-usage-no-enable-force-include-usage) for details.
+
+**TGI (Text Generation Inference)** — consult the TGI documentation for the equivalent server option that includes usage data in streaming responses.
+
+**Other servers** — ensure the server includes a `usage` object with `total_tokens` in every `/v1/chat/completions` response, including streamed (SSE) responses. The gateway extracts this field for rate limiting regardless of which server produced it.
+
 !!! note "Namespace requirements"
     Both **MaaSAuthPolicy** and **MaaSSubscription** must be installed in the `models-as-a-service` namespace. Each `modelRefs` entry must specify the `namespace` where the MaaSModelRef lives (e.g. `llm`).
 
@@ -208,6 +236,22 @@ spec:
     costCenter: "ai-team"
 EOF
 ```
+
+**Unlimited example** with no token budget:
+
+Some subscriptions should not be throttled at all - internal tooling, a batch pipeline, or the team that owns the model. Set `unlimited: true` on the model reference instead of `tokenRateLimits`:
+
+```yaml
+  modelRefs:
+    - name: ${MODEL_NAME}-ref
+      namespace: ${MODEL_NS}
+      unlimited: true
+```
+
+Each model reference sets exactly one of `unlimited: true` or `tokenRateLimits`. Token usage is still metered, so `authorized_hits` and the usage dashboards keep reporting it.
+
+!!! tip "Replace fake high limits with `unlimited`"
+    A rate like `limit: 99999` / `window: 1s` approximates "no limit" at a real cost. Kuadrant copies every token rate limit into every route match of the gateway's WasmPlugin, a single object that etcd caps at 1.5 MiB. All unlimited subscriptions on a model share one metering-only limit, so each one adds a short predicate clause instead of a full limit.
 
 ### 4. Validate the Configuration
 
@@ -266,6 +310,12 @@ When a user belongs to multiple groups that each have a subscription, the access
 - Verify MaaSModelRef exists in the model namespace (e.g. `llm`) and has `status.phase: Ready`
 - Check MaaSAuthPolicy in `models-as-a-service` includes the user's groups and references the MaaSModelRef with correct `name` (e.g. `${MODEL_NAME}-ref`) and `namespace`
 - Ensure MaaSSubscription in `models-as-a-service` exists for the model and user's groups
+
+### Token rate limits not enforced (no 429 errors)
+
+**Cause:** The model server is not returning `usage.total_tokens` in responses. The gateway sees 0 tokens consumed and never triggers the rate limit. This commonly affects streaming chat completion requests.
+
+**Fix:** Ensure the model server returns `usage.total_tokens` in every response. For vLLM / llm-d, start with `--enable-force-include-usage`; for other servers, use the equivalent option. See [Model server must include usage data](#model-server-must-include-usage-data) for server-specific instructions.
 
 ### Policies not enforced
 

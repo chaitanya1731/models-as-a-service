@@ -3,10 +3,12 @@ package api_keys //nolint:testpackage // Testing private helper methods requires
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -17,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/config"
+	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/constant"
 	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/logger"
 	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/subscription"
 	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/token"
@@ -56,6 +59,86 @@ func (e errSubSelector) SelectHighestPriority(_ []string, _ string) (*subscripti
 		return nil, e.highestPriorityErr
 	}
 	return &subscription.SelectResponse{Name: testSubscriptionName, Phase: "Active"}, nil
+}
+
+type failingInvalidateTenantStore struct {
+	*MockStore
+
+	err error
+}
+
+func (s failingInvalidateTenantStore) InvalidateTenant(_ context.Context, _ string) (int, error) {
+	return 0, s.err
+}
+
+type failingSearchStore struct {
+	*MockStore
+
+	err error
+}
+
+func (s failingSearchStore) Search(
+	_ context.Context,
+	_ string,
+	_ string,
+	_ *SearchFilters,
+	_ *SortParams,
+	_ *PaginationParams,
+) (*PaginatedResult, error) {
+	return nil, s.err
+}
+
+type emptySearchResultStore struct {
+	*MockStore
+}
+
+func (s emptySearchResultStore) Search(
+	context.Context,
+	string,
+	string,
+	*SearchFilters,
+	*SortParams,
+	*PaginationParams,
+) (*PaginatedResult, error) {
+	return &PaginatedResult{}, nil
+}
+
+type failingBulkRevokeStore struct {
+	*MockStore
+
+	err error
+}
+
+func (s failingBulkRevokeStore) BulkRevoke(
+	_ context.Context,
+	_ string,
+	_ string,
+	_ string,
+	_ bool,
+) (int, error) {
+	return 0, s.err
+}
+
+type failingRevokedMetadataStore struct {
+	*MockStore
+
+	err     error
+	revoked bool
+}
+
+func (s *failingRevokedMetadataStore) Get(ctx context.Context, jti string) (*ApiKey, error) {
+	if s.revoked {
+		return nil, s.err
+	}
+	return s.MockStore.Get(ctx, jti)
+}
+
+func (s *failingRevokedMetadataStore) Revoke(ctx context.Context, jti string) error {
+	if err := s.MockStore.Revoke(ctx, jti); err != nil {
+		return err
+	}
+	s.revoked = true
+	return nil
 }
 
 // Test constants.
@@ -106,32 +189,372 @@ func executeSearchRequest(t *testing.T, handler *Handler, requestBody string, us
 	return response
 }
 
-func TestIsAuthorizedForKey(t *testing.T) {
-	h := &Handler{
-		adminChecker: newMockAdminChecker(),
+type metricsCall struct {
+	tenant, result string
+}
+
+type spyMetricsRecorder struct {
+	keyValidations []metricsCall
+	tokenMints     []metricsCall
+	rejections     []string
+}
+
+func (s *spyMetricsRecorder) RecordKeyValidation(tenant, result string) {
+	s.keyValidations = append(s.keyValidations, metricsCall{tenant, result})
+}
+
+func (s *spyMetricsRecorder) RecordTokenMint(tenant, result string) {
+	s.tokenMints = append(s.tokenMints, metricsCall{tenant, result})
+}
+
+func (s *spyMetricsRecorder) RecordRejection(reason string) {
+	s.rejections = append(s.rejections, reason)
+}
+
+// TestCreateAPIKey_TokenMintMetrics verifies that the token mint counter records
+// the correct result label for successful and rejected key creation.
+func TestCreateAPIKey_TokenMintMetrics(t *testing.T) {
+	tests := []struct {
+		name           string
+		body           string
+		expectedStatus int
+		expectedResult string
+	}{
+		{"success", `{"name": "metric-test-key"}`, http.StatusCreated, "success"},
+		{"rejected", `{"name": "bad-key", "expiresIn": "-1h"}`, http.StatusBadRequest, "rejected"},
 	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			spy := &spyMetricsRecorder{}
+			store := NewMockStore()
+			svc := NewServiceWithLogger(store, &config.Config{}, fixedSubSelector{}, logger.Development())
+			h := NewHandler(logger.Development(), svc, newMockAdminChecker(), spy, noopSubscriptionAdminResolver{})
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys", nil)
+			c.Request.Header.Set("Content-Type", "application/json")
+			c.Request.Body = io.NopCloser(strings.NewReader(tt.body))
+			c.Set("user", &token.UserContext{
+				Username: "alice",
+				Groups:   []string{"system:authenticated"},
+				Tenant:   "redteam",
+			})
+
+			h.CreateAPIKey(c)
+
+			assert.Equal(t, tt.expectedStatus, w.Code)
+			require.Len(t, spy.tokenMints, 1)
+			assert.Equal(t, "redteam", spy.tokenMints[0].tenant)
+			assert.Equal(t, tt.expectedResult, spy.tokenMints[0].result)
+		})
+	}
+}
+
+func TestCreateAPIKey_RejectsAPIKeyAuthentication(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	cfg := &config.Config{TenantName: "redteam"}
+	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
+	spy := &spyMetricsRecorder{}
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), spy, noopSubscriptionAdminResolver{})
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys", strings.NewReader(`{"name":"escalation-attempt","subscription":"other-sub"}`))
+	c.Request.Header.Set("Authorization", "Bearer "+KeyPrefix+"caller_secret")
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("user", &token.UserContext{
+		Username: "alice",
+		Groups:   []string{"system:authenticated"},
+		Tenant:   "redteam",
+	})
+
+	handler.CreateAPIKey(c)
+
+	require.Equal(t, http.StatusForbidden, w.Code)
+	assert.JSONEq(t, `{"error":"API keys cannot create API keys"}`, w.Body.String())
+	assert.Empty(t, store.keys, "rejected requests must not persist a child key")
+	require.Len(t, spy.tokenMints, 1)
+	assert.Equal(t, metricsCall{tenant: "redteam", result: "rejected"}, spy.tokenMints[0])
+}
+
+func TestAPIKeyManagementRejectsAPIKeyCredentials(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	addSubscriptionAdminTestKey(t, store, "bob-a", "bob", "subscription-a")
+	resolver := &subscriptionAdminResolverStub{scope: &subscription.AdminScope{
+		Tenant:       "test-tenant",
+		Namespace:    "test-ns",
+		Subscription: "subscription-a",
+	}}
+	handler := NewHandler(
+		logger.Development(),
+		NewService(store, &config.Config{}, fixedSubSelector{}),
+		newMockAdminChecker(),
+		nil,
+		resolver,
+	)
+
+	tests := []struct {
+		name      string
+		method    string
+		path      string
+		body      string
+		message   string
+		invoke    func(*Handler, *gin.Context)
+		withKeyID bool
+	}{
+		{
+			name:    "get configuration",
+			method:  http.MethodGet,
+			path:    "/v1/api-keys/config",
+			message: "API keys cannot manage API keys",
+			invoke:  func(handler *Handler, c *gin.Context) { handler.GetAPIKeyConfig(c) },
+		},
+		{
+			name:    "create",
+			method:  http.MethodPost,
+			path:    "/v1/api-keys",
+			body:    `{"name":"escalation-attempt"}`,
+			message: "API keys cannot create API keys",
+			invoke:  func(handler *Handler, c *gin.Context) { handler.CreateAPIKey(c) },
+		},
+		{
+			name:    "search",
+			method:  http.MethodPost,
+			path:    "/v1/api-keys/search",
+			body:    `{"filters":{"subscription":"test-ns/subscription-a"}}`,
+			message: "API keys cannot manage API keys",
+			invoke:  func(handler *Handler, c *gin.Context) { handler.SearchAPIKeys(c) },
+		},
+		{
+			name:      "inspect",
+			method:    http.MethodGet,
+			path:      "/v1/api-keys/bob-a",
+			message:   "API keys cannot manage API keys",
+			invoke:    func(handler *Handler, c *gin.Context) { handler.GetAPIKey(c) },
+			withKeyID: true,
+		},
+		{
+			name:      "revoke",
+			method:    http.MethodDelete,
+			path:      "/v1/api-keys/bob-a",
+			message:   "API keys cannot manage API keys",
+			invoke:    func(handler *Handler, c *gin.Context) { handler.RevokeAPIKey(c) },
+			withKeyID: true,
+		},
+		{
+			name:    "bulk revoke",
+			method:  http.MethodPost,
+			path:    "/v1/api-keys/bulk-revoke",
+			body:    `{"subscription":"test-ns/subscription-a"}`,
+			message: "API keys cannot manage API keys",
+			invoke:  func(handler *Handler, c *gin.Context) { handler.BulkRevokeAPIKeys(c) },
+		},
+	}
+
+	credentials := []struct {
+		name string
+		set  func(header http.Header)
+	}{
+		{
+			name: "authorization bearer",
+			set:  func(header http.Header) { header.Set("Authorization", "Bearer "+KeyPrefix+"caller") },
+		},
+		{
+			name: "x-api-key",
+			set:  func(header http.Header) { header.Set("X-Api-Key", KeyPrefix+"caller") },
+		},
+	}
+
+	for _, credential := range credentials {
+		for _, test := range tests {
+			t.Run(credential.name+" "+test.name, func(t *testing.T) {
+				w := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(w)
+				c.Request = httptest.NewRequest(test.method, test.path, strings.NewReader(test.body))
+				credential.set(c.Request.Header)
+				if test.body != "" {
+					c.Request.Header.Set("Content-Type", "application/json")
+				}
+				if test.withKeyID {
+					c.Params = gin.Params{{Key: "id", Value: "bob-a"}}
+				}
+				c.Set("user", &token.UserContext{Username: "alice", Tenant: "test-tenant"})
+				c.Set("verified_identity", verifiedIdentityForSubscriptionAdmin())
+
+				test.invoke(handler, c)
+
+				require.Equal(t, http.StatusForbidden, w.Code)
+				assert.JSONEq(t, fmt.Sprintf(`{"error":%q}`, test.message), w.Body.String())
+			})
+		}
+	}
+
+	assert.Equal(t, 0, resolver.calls, "API-key credentials must not reach delegated-admin resolution")
+	key, err := store.Get(context.Background(), "bob-a")
+	require.NoError(t, err)
+	assert.Equal(t, StatusActive, key.Status)
+}
+
+// TestCreateAPIKey_InvalidGroupNameIs400 verifies that group-name validation
+// failures surface as 400 with a helpful message, not as a generic 500.
+// Group names come from identity headers minted by the gateway, so this is
+// a validation outcome, not a server error.
+func TestCreateAPIKey_InvalidGroupNameIs400(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	svc := NewServiceWithLogger(store, &config.Config{}, fixedSubSelector{}, logger.Development())
+	spy := &spyMetricsRecorder{}
+	h := NewHandler(logger.Development(), svc, newMockAdminChecker(), spy, noopSubscriptionAdminResolver{})
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys", strings.NewReader(`{"name":"slash-key"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("user", &token.UserContext{
+		Username: "alice",
+		Groups:   []string{"/Engineering", "unsafe;group"},
+		Tenant:   "redteam",
+	})
+
+	h.CreateAPIKey(c)
+
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	// Assert the functional contract only: the offending group is echoed in
+	// the response. The exact wording of the message is free to change.
+	assert.Contains(t, w.Body.String(), "unsafe;group", "response should identify the offending group")
+	assert.Empty(t, store.keys, "rejected requests must not persist a key")
+	require.Len(t, spy.tokenMints, 1)
+	assert.Equal(t, metricsCall{tenant: "redteam", result: "rejected"}, spy.tokenMints[0])
+}
+
+func TestValidateAPIKey_RecordsValidationMetric(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	cfg := &config.Config{}
+	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
+	spy := &spyMetricsRecorder{}
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), spy, noopSubscriptionAdminResolver{})
+
+	// Create a key via service so hash and subscription are correct
+	resp, err := service.CreateAPIKey(
+		context.Background(), "alice", []string{"system:authenticated"},
+		"Val Key", "", nil, false, "", "redteam", nil,
+	)
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/internal/v1/api-keys/validate", nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Body = io.NopCloser(strings.NewReader(
+		fmt.Sprintf(`{"key": "%s"}`, resp.Key)))
+
+	handler.ValidateAPIKeyHandler(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	require.Len(t, spy.keyValidations, 1)
+	assert.Equal(t, "redteam", spy.keyValidations[0].tenant)
+	assert.Equal(t, "valid", spy.keyValidations[0].result)
+}
+
+func TestValidateAPIKey_RecordsUnauthorizedRejection(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	cfg := &config.Config{}
+	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
+	spy := &spyMetricsRecorder{}
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), spy, noopSubscriptionAdminResolver{})
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/internal/v1/api-keys/validate", nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Body = io.NopCloser(strings.NewReader(`{"key": "invalid-key"}`))
+
+	handler.ValidateAPIKeyHandler(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	require.Len(t, spy.rejections, 1)
+	assert.Equal(t, "unauthorized", spy.rejections[0])
+}
+
+func TestIsAuthorizedForKey(t *testing.T) {
+	store := NewMockStore()
+	handler := NewHandler(
+		logger.Development(),
+		NewService(store, &config.Config{}, fixedSubSelector{}),
+		newMockAdminChecker(),
+		nil,
+		noopSubscriptionAdminResolver{},
+	)
 	ctx := context.Background()
+	authorize := func(t *testing.T, user *token.UserContext, key ApiKey) bool {
+		t.Helper()
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/v1/api-keys/"+key.ID, nil)
+
+		authorized, _, err := handler.isAuthorizedForKey(ctx, user, nil, &key, "api-key-get")
+		require.NoError(t, err)
+		return authorized
+	}
 
 	t.Run("OwnerCanAccess", func(t *testing.T) {
-		user := &token.UserContext{Username: "alice", Groups: []string{"users"}}
-		result, err := h.isAuthorizedForKey(ctx, user, "alice")
-		require.NoError(t, err)
-		assert.True(t, result)
+		user := &token.UserContext{Username: "alice", Groups: []string{"users"}, Tenant: "test-tenant"}
+		key := ApiKey{ID: "key-1", Username: "alice", Tenant: "test-tenant"}
+		assert.True(t, authorize(t, user, key))
 	})
 
 	t.Run("NonOwnerCannotAccess", func(t *testing.T) {
-		user := &token.UserContext{Username: "bob", Groups: []string{"users"}}
-		result, err := h.isAuthorizedForKey(ctx, user, "alice")
-		require.NoError(t, err)
-		assert.False(t, result)
+		user := &token.UserContext{Username: "bob", Groups: []string{"users"}, Tenant: "test-tenant"}
+		key := ApiKey{ID: "key-1", Username: "alice", Tenant: "test-tenant"}
+		assert.False(t, authorize(t, user, key))
 	})
 
 	t.Run("AdminCanAccessAnyKey", func(t *testing.T) {
-		admin := &token.UserContext{Username: "admin", Groups: []string{"admin-users"}}
-		result, err := h.isAuthorizedForKey(ctx, admin, "alice")
-		require.NoError(t, err)
-		assert.True(t, result)
+		admin := &token.UserContext{Username: "admin", Groups: []string{"admin-users"}, Tenant: "test-tenant"}
+		key := ApiKey{ID: "key-1", Username: "alice", Tenant: "test-tenant"}
+		assert.True(t, authorize(t, admin, key))
 	})
+
+	t.Run("CrossTenantOwnerDenied", func(t *testing.T) {
+		user := &token.UserContext{Username: "alice", Groups: []string{"users"}, Tenant: "tenant-b"}
+		key := ApiKey{ID: "key-1", Username: "alice", Tenant: "tenant-a"}
+		assert.False(t, authorize(t, user, key), "same username but different tenant should be denied")
+	})
+
+	t.Run("CrossTenantAdminDenied", func(t *testing.T) {
+		admin := &token.UserContext{Username: "admin", Groups: []string{"admin-users"}, Tenant: "tenant-b"}
+		key := ApiKey{ID: "key-1", Username: "alice", Tenant: "tenant-a"}
+		assert.False(t, authorize(t, admin, key), "admin from different tenant should be denied")
+	})
+}
+
+func TestNewHandlerRequiresSubscriptionAdminResolver(t *testing.T) {
+	assert.PanicsWithValue(t, "adminResolver cannot be nil", func() {
+		NewHandler(logger.Development(), nil, newMockAdminChecker(), nil, nil)
+	})
+}
+
+func TestResolveSubscriptionAdminFailsClosedWithoutResolver(t *testing.T) {
+	handler := &Handler{}
+	user := &token.UserContext{Username: "alice", Tenant: "test-tenant"}
+
+	scope, adminErr, err := handler.resolveSubscriptionAdmin(
+		verifiedIdentityForSubscriptionAdmin(),
+		"test-ns/subscription-a",
+		user,
+	)
+
+	require.Error(t, err)
+	require.ErrorContains(t, err, "subscription admin resolver is not configured")
+	assert.Nil(t, scope)
+	assert.Nil(t, adminErr)
 }
 
 // ============================================================
@@ -143,21 +566,22 @@ func TestSearchAPIKeys_EmptyRequest(t *testing.T) {
 	store := NewMockStore()
 	cfg := &config.Config{}
 	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
-	handler := NewHandler(logger.Development(), service, newMockAdminChecker())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
 
 	testUser := &token.UserContext{
 		Username: "test-user",
 		Groups:   []string{"system:authenticated"},
+		Tenant:   "test-tenant",
 	}
 
 	// Create test keys
 	ctx := context.Background()
-	err := store.AddKey(ctx, testUser.Username, "key-1", "hash-1", "Key 1", "", []string{"system:authenticated"}, testSubscriptionName, nil, false)
+	err := store.AddKey(ctx, testUser.Username, "key-1", "hash-1", "Key 1", "", []string{"system:authenticated"}, testSubscriptionName, "test-tenant", nil, false, nil)
 	require.NoError(t, err)
-	err = store.AddKey(ctx, testUser.Username, "key-2", "hash-2", "Key 2", "", []string{"system:authenticated"}, testSubscriptionName, nil, false)
+	err = store.AddKey(ctx, testUser.Username, "key-2", "hash-2", "Key 2", "", []string{"system:authenticated"}, testSubscriptionName, "test-tenant", nil, false, nil)
 	require.NoError(t, err)
 	// Create a revoked key
-	err = store.AddKey(ctx, testUser.Username, "key-3", "hash-3", "Key 3", "", []string{"system:authenticated"}, testSubscriptionName, nil, false)
+	err = store.AddKey(ctx, testUser.Username, "key-3", "hash-3", "Key 3", "", []string{"system:authenticated"}, testSubscriptionName, "test-tenant", nil, false, nil)
 	require.NoError(t, err)
 	err = store.Revoke(ctx, "key-3")
 	require.NoError(t, err)
@@ -189,11 +613,12 @@ func TestSearchAPIKeys_Pagination(t *testing.T) {
 	store := NewMockStore()
 	cfg := &config.Config{}
 	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
-	handler := NewHandler(logger.Development(), service, newMockAdminChecker())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
 
 	testUser := &token.UserContext{
 		Username: "test-user",
 		Groups:   []string{"system:authenticated"},
+		Tenant:   "test-tenant",
 	}
 
 	// Add 75 keys to test pagination
@@ -202,7 +627,7 @@ func TestSearchAPIKeys_Pagination(t *testing.T) {
 		keyID := fmt.Sprintf("key-%d", i)
 		keyHash := fmt.Sprintf("hash-%d", i)
 		name := fmt.Sprintf("Key %d", i)
-		err := store.AddKey(ctx, testUser.Username, keyID, keyHash, name, "", []string{"system:authenticated"}, testSubscriptionName, nil, false)
+		err := store.AddKey(ctx, testUser.Username, keyID, keyHash, name, "", []string{"system:authenticated"}, testSubscriptionName, "test-tenant", nil, false, nil)
 		require.NoError(t, err)
 	}
 
@@ -293,18 +718,20 @@ func TestSearchAPIKeys_StatusFilter(t *testing.T) {
 	store := NewMockStore()
 	cfg := &config.Config{}
 	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
-	handler := NewHandler(logger.Development(), service, newMockAdminChecker())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
 
 	ctx := context.Background()
 	testUser := &token.UserContext{
 		Username: "test-user",
 		Groups:   []string{"system:authenticated"},
+		Tenant:   "test-tenant",
 	}
 
 	// Create active and revoked keys
-	err := store.AddKey(ctx, testUser.Username, "active-key", "active-hash", "Active Key", "", []string{"system:authenticated"}, testSubscriptionName, nil, false)
+	err := store.AddKey(ctx, testUser.Username, "active-key", "active-hash", "Active Key", "", []string{"system:authenticated"}, testSubscriptionName, "test-tenant", nil, false, nil)
 	require.NoError(t, err)
-	err = store.AddKey(ctx, testUser.Username, "revoked-key", "revoked-hash", "Revoked Key", "", []string{"system:authenticated"}, testSubscriptionName, nil, false)
+	err = store.AddKey(ctx, testUser.Username, "revoked-key", "revoked-hash", "Revoked Key", "", []string{"system:authenticated"}, testSubscriptionName,
+		"test-tenant", nil, false, nil)
 	require.NoError(t, err)
 	err = store.Revoke(ctx, "revoked-key")
 	require.NoError(t, err)
@@ -419,17 +846,18 @@ func TestSearchAPIKeys_SubscriptionFilter(t *testing.T) {
 	store := NewMockStore()
 	cfg := &config.Config{}
 	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
-	handler := NewHandler(logger.Development(), service, newMockAdminChecker())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
 
 	ctx := context.Background()
 	testUser := &token.UserContext{
 		Username: "test-user",
 		Groups:   []string{"system:authenticated"},
+		Tenant:   "test-tenant",
 	}
 
-	err := store.AddKey(ctx, testUser.Username, "key-sub-a", "hash-a", "Key A", "", []string{"system:authenticated"}, "subscription-a", nil, false)
+	err := store.AddKey(ctx, testUser.Username, "key-sub-a", "hash-a", "Key A", "", []string{"system:authenticated"}, "subscription-a", "test-tenant", nil, false, nil)
 	require.NoError(t, err)
-	err = store.AddKey(ctx, testUser.Username, "key-sub-b", "hash-b", "Key B", "", []string{"system:authenticated"}, "subscription-b", nil, false)
+	err = store.AddKey(ctx, testUser.Username, "key-sub-b", "hash-b", "Key B", "", []string{"system:authenticated"}, "subscription-b", "test-tenant", nil, false, nil)
 	require.NoError(t, err)
 
 	t.Run("FilterBySubscription", func(t *testing.T) {
@@ -477,20 +905,21 @@ func TestSearchAPIKeys_Sorting(t *testing.T) {
 	store := NewMockStore()
 	cfg := &config.Config{}
 	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
-	handler := NewHandler(logger.Development(), service, newMockAdminChecker())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
 
 	ctx := context.Background()
 	testUser := &token.UserContext{
 		Username: "test-user",
 		Groups:   []string{"system:authenticated"},
+		Tenant:   "test-tenant",
 	}
 
 	// Create keys with different names
-	err := store.AddKey(ctx, testUser.Username, "key-1", "hash-1", "Charlie", "", []string{"system:authenticated"}, testSubscriptionName, nil, false)
+	err := store.AddKey(ctx, testUser.Username, "key-1", "hash-1", "Charlie", "", []string{"system:authenticated"}, testSubscriptionName, "test-tenant", nil, false, nil)
 	require.NoError(t, err)
-	err = store.AddKey(ctx, testUser.Username, "key-2", "hash-2", "Alice", "", []string{"system:authenticated"}, testSubscriptionName, nil, false)
+	err = store.AddKey(ctx, testUser.Username, "key-2", "hash-2", "Alice", "", []string{"system:authenticated"}, testSubscriptionName, "test-tenant", nil, false, nil)
 	require.NoError(t, err)
-	err = store.AddKey(ctx, testUser.Username, "key-3", "hash-3", "Bob", "", []string{"system:authenticated"}, testSubscriptionName, nil, false)
+	err = store.AddKey(ctx, testUser.Username, "key-3", "hash-3", "Bob", "", []string{"system:authenticated"}, testSubscriptionName, "test-tenant", nil, false, nil)
 	require.NoError(t, err)
 
 	t.Run("DefaultSort_CreatedAtDesc", func(t *testing.T) {
@@ -602,7 +1031,7 @@ func TestSearchAPIKeys_AdminVsRegularUser(t *testing.T) {
 	store := NewMockStore()
 	cfg := &config.Config{}
 	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
-	handler := NewHandler(logger.Development(), service, newMockAdminChecker())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
 
 	ctx := context.Background()
 
@@ -613,7 +1042,7 @@ func TestSearchAPIKeys_AdminVsRegularUser(t *testing.T) {
 			keyID := fmt.Sprintf("%s-key-%d", username, i)
 			keyHash := fmt.Sprintf("%s-hash-%d", username, i)
 			name := fmt.Sprintf("%s Key %d", username, i)
-			err := store.AddKey(ctx, username, keyID, keyHash, name, "", []string{"system:authenticated"}, testSubscriptionName, nil, false)
+			err := store.AddKey(ctx, username, keyID, keyHash, name, "", []string{"system:authenticated"}, testSubscriptionName, "test-tenant", nil, false, nil)
 			require.NoError(t, err)
 		}
 	}
@@ -622,6 +1051,7 @@ func TestSearchAPIKeys_AdminVsRegularUser(t *testing.T) {
 		adminUser := &token.UserContext{
 			Username: "admin",
 			Groups:   []string{"admin-users"},
+			Tenant:   "test-tenant",
 		}
 
 		requestBody := `{}`
@@ -646,6 +1076,7 @@ func TestSearchAPIKeys_AdminVsRegularUser(t *testing.T) {
 		regularUser := &token.UserContext{
 			Username: "alice",
 			Groups:   []string{"system:authenticated"},
+			Tenant:   "test-tenant",
 		}
 
 		requestBody := `{}`
@@ -673,6 +1104,7 @@ func TestSearchAPIKeys_AdminVsRegularUser(t *testing.T) {
 		regularUser := &token.UserContext{
 			Username: "alice",
 			Groups:   []string{"system:authenticated"},
+			Tenant:   "test-tenant",
 		}
 
 		requestBody := `{"filters": {"username": "bob"}}`
@@ -693,6 +1125,7 @@ func TestSearchAPIKeys_AdminVsRegularUser(t *testing.T) {
 		adminUser := &token.UserContext{
 			Username: "admin",
 			Groups:   []string{"admin-users"},
+			Tenant:   "test-tenant",
 		}
 
 		requestBody := `{"filters": {"username": "alice"}}`
@@ -722,7 +1155,7 @@ func TestSearchAPIKeys_AdminFiltersByUsernameAndStatus(t *testing.T) {
 	store := NewMockStore()
 	cfg := &config.Config{}
 	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
-	handler := NewHandler(logger.Development(), service, newMockAdminChecker())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
 
 	ctx := context.Background()
 
@@ -734,14 +1167,14 @@ func TestSearchAPIKeys_AdminFiltersByUsernameAndStatus(t *testing.T) {
 			keyID := fmt.Sprintf("%s-active-%d", username, i)
 			keyHash := fmt.Sprintf("%s-hash-active-%d", username, i)
 			name := fmt.Sprintf("%s Active Key %d", username, i)
-			err := store.AddKey(ctx, username, keyID, keyHash, name, "", []string{"system:authenticated"}, testSubscriptionName, nil, false)
+			err := store.AddKey(ctx, username, keyID, keyHash, name, "", []string{"system:authenticated"}, testSubscriptionName, "test-tenant", nil, false, nil)
 			require.NoError(t, err)
 		}
 		// Create 1 revoked key
 		keyID := fmt.Sprintf("%s-revoked", username)
 		keyHash := fmt.Sprintf("%s-hash-revoked", username)
 		name := fmt.Sprintf("%s Revoked Key", username)
-		err := store.AddKey(ctx, username, keyID, keyHash, name, "", []string{"system:authenticated"}, testSubscriptionName, nil, false)
+		err := store.AddKey(ctx, username, keyID, keyHash, name, "", []string{"system:authenticated"}, testSubscriptionName, "test-tenant", nil, false, nil)
 		require.NoError(t, err)
 		err = store.Revoke(ctx, keyID)
 		require.NoError(t, err)
@@ -750,6 +1183,7 @@ func TestSearchAPIKeys_AdminFiltersByUsernameAndStatus(t *testing.T) {
 	adminUser := &token.UserContext{
 		Username: "admin",
 		Groups:   []string{"admin-users"},
+		Tenant:   "test-tenant",
 	}
 
 	t.Run("AliceActiveKeys", func(t *testing.T) {
@@ -805,7 +1239,7 @@ func TestBulkRevokeAPIKeys(t *testing.T) {
 	store := NewMockStore()
 	cfg := &config.Config{}
 	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
-	handler := NewHandler(logger.Development(), service, newMockAdminChecker())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
 
 	ctx := context.Background()
 
@@ -814,7 +1248,7 @@ func TestBulkRevokeAPIKeys(t *testing.T) {
 		keyID := fmt.Sprintf("alice-key-%d", i)
 		keyHash := fmt.Sprintf("alice-hash-%d", i)
 		name := fmt.Sprintf("Alice Key %d", i)
-		err := store.AddKey(ctx, "alice", keyID, keyHash, name, "", []string{"system:authenticated"}, testSubscriptionName, nil, false)
+		err := store.AddKey(ctx, "alice", keyID, keyHash, name, "", []string{"system:authenticated"}, testSubscriptionName, "test-tenant", nil, false, nil)
 		require.NoError(t, err)
 	}
 
@@ -822,7 +1256,7 @@ func TestBulkRevokeAPIKeys(t *testing.T) {
 		keyID := fmt.Sprintf("bob-key-%d", i)
 		keyHash := fmt.Sprintf("bob-hash-%d", i)
 		name := fmt.Sprintf("Bob Key %d", i)
-		err := store.AddKey(ctx, "bob", keyID, keyHash, name, "", []string{"system:authenticated"}, testSubscriptionName, nil, false)
+		err := store.AddKey(ctx, "bob", keyID, keyHash, name, "", []string{"system:authenticated"}, testSubscriptionName, "test-tenant", nil, false, nil)
 		require.NoError(t, err)
 	}
 
@@ -830,6 +1264,7 @@ func TestBulkRevokeAPIKeys(t *testing.T) {
 		aliceUser := &token.UserContext{
 			Username: "alice",
 			Groups:   []string{"system:authenticated"},
+			Tenant:   "test-tenant",
 		}
 
 		requestBody := testBulkRevokeAliceJSON
@@ -855,6 +1290,7 @@ func TestBulkRevokeAPIKeys(t *testing.T) {
 		bobUser := &token.UserContext{
 			Username: "bob",
 			Groups:   []string{"system:authenticated"},
+			Tenant:   "test-tenant",
 		}
 
 		requestBody := testBulkRevokeAliceJSON
@@ -877,13 +1313,14 @@ func TestBulkRevokeAPIKeys(t *testing.T) {
 			keyID := fmt.Sprintf("alice-key-%d", i)
 			keyHash := fmt.Sprintf("alice-hash-%d", i)
 			name := fmt.Sprintf("Alice Key %d", i)
-			err := store.AddKey(ctx, "alice", keyID, keyHash, name, "", []string{"system:authenticated"}, testSubscriptionName, nil, false)
+			err := store.AddKey(ctx, "alice", keyID, keyHash, name, "", []string{"system:authenticated"}, testSubscriptionName, "test-tenant", nil, false, nil)
 			require.NoError(t, err)
 		}
 
 		adminUser := &token.UserContext{
 			Username: "admin",
 			Groups:   []string{"admin-users"},
+			Tenant:   "test-tenant",
 		}
 
 		requestBody := testBulkRevokeAliceJSON
@@ -909,6 +1346,7 @@ func TestBulkRevokeAPIKeys(t *testing.T) {
 		aliceUser := &token.UserContext{
 			Username: "alice",
 			Groups:   []string{"system:authenticated"},
+			Tenant:   "test-tenant",
 		}
 
 		requestBody := testBulkRevokeAliceJSON
@@ -933,6 +1371,7 @@ func TestBulkRevokeAPIKeys(t *testing.T) {
 		aliceUser := &token.UserContext{
 			Username: "alice",
 			Groups:   []string{"system:authenticated"},
+			Tenant:   "test-tenant",
 		}
 
 		requestBody := `{}`
@@ -959,11 +1398,12 @@ func TestUserCanCreateOwnKey(t *testing.T) {
 	store := NewMockStore()
 	cfg := &config.Config{}
 	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
-	handler := NewHandler(logger.Development(), service, newMockAdminChecker())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
 
 	regularUser := &token.UserContext{
 		Username: "alice",
 		Groups:   []string{"tier-free", "system:authenticated"},
+		Tenant:   "test-tenant",
 	}
 
 	requestBody := `{"name": "my-key"}`
@@ -997,9 +1437,9 @@ func TestCreateAPIKey_WithExplicitSubscription(t *testing.T) {
 	store := NewMockStore()
 	cfg := &config.Config{}
 	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
-	handler := NewHandler(logger.Development(), service, newMockAdminChecker())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
 
-	user := &token.UserContext{Username: "alice", Groups: []string{"system:authenticated"}}
+	user := &token.UserContext{Username: "alice", Groups: []string{"system:authenticated"}, Tenant: "test-tenant"}
 	body := `{"name": "k1", "subscription": "custom-sub"}`
 
 	w := httptest.NewRecorder()
@@ -1023,7 +1463,7 @@ func TestCreateAPIKey_WithExplicitSubscription(t *testing.T) {
 
 func TestCreateAPIKey_SubscriptionSelectErrors(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	user := &token.UserContext{Username: "alice", Groups: []string{"system:authenticated"}}
+	user := &token.UserContext{Username: "alice", Groups: []string{"system:authenticated"}, Tenant: "test-tenant"}
 
 	tests := []struct {
 		name string
@@ -1051,6 +1491,25 @@ func TestCreateAPIKey_SubscriptionSelectErrors(t *testing.T) {
 			},
 			body: `{"name": "k1"}`,
 		},
+		{
+			name: "multiple accessible subscriptions when omitting field",
+			sel: errSubSelector{
+				highestPriorityErr: &subscription.MultipleSubscriptionsError{
+					Subscriptions: []string{"sub-a", "sub-b"},
+				},
+			},
+			body: `{"name": "k1"}`,
+		},
+		{
+			name: "requested model not in explicit subscription",
+			sel: errSubSelector{
+				selectErr: &subscription.ModelNotInSubscriptionError{
+					Subscription: "custom-sub",
+					Model:        "llm/missing-model",
+				},
+			},
+			body: `{"name": "k1", "subscription": "custom-sub"}`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -1058,7 +1517,7 @@ func TestCreateAPIKey_SubscriptionSelectErrors(t *testing.T) {
 			store := NewMockStore()
 			cfg := &config.Config{}
 			service := NewServiceWithLogger(store, cfg, tt.sel, logger.Development())
-			h := NewHandler(logger.Development(), service, newMockAdminChecker())
+			h := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
 
 			w := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(w)
@@ -1075,11 +1534,19 @@ func TestCreateAPIKey_SubscriptionSelectErrors(t *testing.T) {
 			assert.Equal(t, apiKeySubscriptionResolutionErrCode, resp["code"])
 			assert.Equal(t, apiKeySubscriptionResolutionErrMsg, resp["error"])
 
-			res, err := store.Search(context.Background(), user.Username, &SearchFilters{}, &SortParams{By: DefaultSortBy, Order: DefaultSortOrder}, &PaginationParams{Limit: 10, Offset: 0})
+			res, err := store.Search(context.Background(), user.Username, user.Tenant,
+				&SearchFilters{}, &SortParams{By: DefaultSortBy, Order: DefaultSortOrder},
+				&PaginationParams{Limit: 10, Offset: 0})
 			require.NoError(t, err)
 			assert.Empty(t, res.Keys, "no key should be persisted on subscription resolution failure")
 		})
 	}
+}
+
+func TestIsAPIKeyBearerTrimsCredentialWhitespace(t *testing.T) {
+	assert.True(t, isAPIKeyBearer("Bearer   "+KeyPrefix+"caller"))
+	assert.True(t, isAPIKeyBearer("Bearer\t"+KeyPrefix+"caller"))
+	assert.False(t, isAPIKeyBearer("Bearer  "+KeyPrefix[:len(KeyPrefix)-1]+"caller"))
 }
 
 // ============================================================
@@ -1091,7 +1558,7 @@ func TestGetAPIKeyHandler(t *testing.T) {
 	store := NewMockStore()
 	cfg := &config.Config{}
 	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
-	handler := NewHandler(logger.Development(), service, newMockAdminChecker())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
 
 	// Create test keys for alice and bob
 	aliceKey := &ApiKey{
@@ -1112,9 +1579,9 @@ func TestGetAPIKeyHandler(t *testing.T) {
 	}
 
 	// Add keys to store
-	err := store.AddKey(context.Background(), aliceKey.Username, aliceKey.ID, "hash1", aliceKey.Name, "", aliceKey.Groups, testSubscriptionName, nil, false)
+	err := store.AddKey(context.Background(), aliceKey.Username, aliceKey.ID, "hash1", aliceKey.Name, "", aliceKey.Groups, testSubscriptionName, "test-tenant", nil, false, nil)
 	require.NoError(t, err)
-	err = store.AddKey(context.Background(), bobKey.Username, bobKey.ID, "hash2", bobKey.Name, "", bobKey.Groups, testSubscriptionName, nil, false)
+	err = store.AddKey(context.Background(), bobKey.Username, bobKey.ID, "hash2", bobKey.Name, "", bobKey.Groups, testSubscriptionName, "test-tenant", nil, false, nil)
 	require.NoError(t, err)
 
 	// Helper function to test successful key retrieval
@@ -1141,6 +1608,7 @@ func TestGetAPIKeyHandler(t *testing.T) {
 		aliceUser := &token.UserContext{
 			Username: "alice",
 			Groups:   []string{"tier-free"},
+			Tenant:   "test-tenant",
 		}
 		testSuccessfulGetKey(t, aliceUser, "alice-key-1")
 	})
@@ -1150,6 +1618,7 @@ func TestGetAPIKeyHandler(t *testing.T) {
 		bobUser := &token.UserContext{
 			Username: "bob",
 			Groups:   []string{"tier-premium"},
+			Tenant:   "test-tenant",
 		}
 
 		w := httptest.NewRecorder()
@@ -1172,6 +1641,7 @@ func TestGetAPIKeyHandler(t *testing.T) {
 		adminUser := &token.UserContext{
 			Username: "admin",
 			Groups:   []string{"admin-users"},
+			Tenant:   "test-tenant",
 		}
 		testSuccessfulGetKey(t, adminUser, "alice-key-1")
 	})
@@ -1180,6 +1650,7 @@ func TestGetAPIKeyHandler(t *testing.T) {
 		aliceUser := &token.UserContext{
 			Username: "alice",
 			Groups:   []string{"tier-free"},
+			Tenant:   "test-tenant",
 		}
 
 		w := httptest.NewRecorder()
@@ -1204,10 +1675,10 @@ func testRevokeKeySuccess(t *testing.T, user *token.UserContext) {
 	store := NewMockStore()
 	cfg := &config.Config{}
 	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
-	handler := NewHandler(logger.Development(), service, newMockAdminChecker())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
 
 	// Create alice's key
-	err := store.AddKey(context.Background(), "alice", "alice-key-1", "hash1", "Alice's Key", "", []string{"tier-free"}, testSubscriptionName, nil, false)
+	err := store.AddKey(context.Background(), "alice", "alice-key-1", "hash1", "Alice's Key", "", []string{"tier-free"}, testSubscriptionName, "test-tenant", nil, false, nil)
 	require.NoError(t, err)
 
 	w := httptest.NewRecorder()
@@ -1239,6 +1710,7 @@ func TestRevokeAPIKeyHandler(t *testing.T) {
 		aliceUser := &token.UserContext{
 			Username: "alice",
 			Groups:   []string{"tier-free"},
+			Tenant:   "test-tenant",
 		}
 		testRevokeKeySuccess(t, aliceUser)
 	})
@@ -1247,16 +1719,17 @@ func TestRevokeAPIKeyHandler(t *testing.T) {
 		store := NewMockStore()
 		cfg := &config.Config{}
 		service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
-		handler := NewHandler(logger.Development(), service, newMockAdminChecker())
+		handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
 
 		// Create alice's key
-		err := store.AddKey(context.Background(), "alice", "alice-key-1", "hash1", "Alice's Key", "", []string{"tier-free"}, testSubscriptionName, nil, false)
+		err := store.AddKey(context.Background(), "alice", "alice-key-1", "hash1", "Alice's Key", "", []string{"tier-free"}, testSubscriptionName, "test-tenant", nil, false, nil)
 		require.NoError(t, err)
 
 		// Bob trying to revoke Alice's key
 		bobUser := &token.UserContext{
 			Username: "bob",
 			Groups:   []string{"tier-premium"},
+			Tenant:   "test-tenant",
 		}
 
 		w := httptest.NewRecorder()
@@ -1284,6 +1757,7 @@ func TestRevokeAPIKeyHandler(t *testing.T) {
 		adminUser := &token.UserContext{
 			Username: "admin",
 			Groups:   []string{"admin-users"},
+			Tenant:   "test-tenant",
 		}
 		testRevokeKeySuccess(t, adminUser)
 	})
@@ -1292,11 +1766,12 @@ func TestRevokeAPIKeyHandler(t *testing.T) {
 		store := NewMockStore()
 		cfg := &config.Config{}
 		service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
-		handler := NewHandler(logger.Development(), service, newMockAdminChecker())
+		handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
 
 		aliceUser := &token.UserContext{
 			Username: "alice",
 			Groups:   []string{"tier-free"},
+			Tenant:   "test-tenant",
 		}
 
 		w := httptest.NewRecorder()
@@ -1314,10 +1789,10 @@ func TestRevokeAPIKeyHandler(t *testing.T) {
 		store := NewMockStore()
 		cfg := &config.Config{}
 		service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
-		handler := NewHandler(logger.Development(), service, newMockAdminChecker())
+		handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
 
 		// Create and immediately revoke alice's key
-		err := store.AddKey(context.Background(), "alice", "alice-key-1", "hash1", "Alice's Key", "", []string{"tier-free"}, testSubscriptionName, nil, false)
+		err := store.AddKey(context.Background(), "alice", "alice-key-1", "hash1", "Alice's Key", "", []string{"tier-free"}, testSubscriptionName, "test-tenant", nil, false, nil)
 		require.NoError(t, err)
 		err = store.Revoke(context.Background(), "alice-key-1")
 		require.NoError(t, err)
@@ -1325,6 +1800,7 @@ func TestRevokeAPIKeyHandler(t *testing.T) {
 		aliceUser := &token.UserContext{
 			Username: "alice",
 			Groups:   []string{"tier-free"},
+			Tenant:   "test-tenant",
 		}
 
 		w := httptest.NewRecorder()
@@ -1349,11 +1825,12 @@ func TestCreateEphemeralAPIKey(t *testing.T) {
 	store := NewMockStore()
 	cfg := &config.Config{}
 	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
-	handler := NewHandler(logger.Development(), service, newMockAdminChecker())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
 
 	testUser := &token.UserContext{
 		Username: "playground-user",
 		Groups:   []string{"system:authenticated"},
+		Tenant:   "test-tenant",
 	}
 
 	t.Run("EphemeralKeyBindsSubscriptionAtMint", func(t *testing.T) {
@@ -1470,7 +1947,7 @@ func TestCreateEphemeralAPIKey(t *testing.T) {
 		var response map[string]string
 		err := json.Unmarshal(w.Body.Bytes(), &response)
 		require.NoError(t, err)
-		assert.Contains(t, response["error"], "cannot exceed 1 hour")
+		assert.Contains(t, response["error"], "cannot exceed 1h0m0s")
 	})
 }
 
@@ -1483,32 +1960,33 @@ func TestCleanupExpiredEphemeralKeys(t *testing.T) {
 	store := NewMockStore()
 	cfg := &config.Config{}
 	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
-	handler := NewHandler(logger.Development(), service, newMockAdminChecker())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
 
 	ctx := context.Background()
 
 	// Create regular active key (should NOT be deleted)
-	err := store.AddKey(ctx, "alice", "regular-key", "hash-1", "Regular Key", "", []string{"users"}, testSubscriptionName, nil, false)
+	err := store.AddKey(ctx, "alice", "regular-key", "hash-1", "Regular Key", "", []string{"users"}, testSubscriptionName, "test-tenant", nil, false, nil)
 	require.NoError(t, err)
 
 	// Create active ephemeral key with future expiration (should NOT be deleted)
 	futureExpiry := time.Now().Add(30 * time.Minute)
-	err = store.AddKey(ctx, "alice", "active-ephemeral", "hash-2", "Active Ephemeral", "", []string{"users"}, testSubscriptionName, &futureExpiry, true)
+	err = store.AddKey(ctx, "alice", "active-ephemeral", "hash-2", "Active Ephemeral", "", []string{"users"}, testSubscriptionName, "test-tenant", &futureExpiry, true, nil)
 	require.NoError(t, err)
 
 	// Create expired ephemeral key (should be deleted)
 	pastExpiry := time.Now().Add(-1 * time.Hour)
-	err = store.AddKey(ctx, "alice", "expired-ephemeral", "hash-3", "Expired Ephemeral", "", []string{"users"}, testSubscriptionName, &pastExpiry, true)
+	err = store.AddKey(ctx, "alice", "expired-ephemeral", "hash-3", "Expired Ephemeral", "", []string{"users"}, testSubscriptionName, "test-tenant", &pastExpiry, true, nil)
 	require.NoError(t, err)
 
 	// Create another expired ephemeral key (should be deleted)
 	pastExpiry2 := time.Now().Add(-2 * time.Hour)
-	err = store.AddKey(ctx, "bob", "expired-ephemeral-2", "hash-4", "Expired Ephemeral 2", "", []string{"users"}, testSubscriptionName, &pastExpiry2, true)
+	err = store.AddKey(ctx, "bob", "expired-ephemeral-2", "hash-4", "Expired Ephemeral 2", "", []string{"users"}, testSubscriptionName, "test-tenant", &pastExpiry2, true, nil)
 	require.NoError(t, err)
 
 	// Create expired ephemeral key within 30-minute grace period (should NOT be deleted)
 	recentExpiry := time.Now().Add(-10 * time.Minute)
-	err = store.AddKey(ctx, "alice", "recently-expired-ephemeral", "hash-5", "Recently Expired Ephemeral", "", []string{"users"}, testSubscriptionName, &recentExpiry, true)
+	err = store.AddKey(ctx, "alice", "recently-expired-ephemeral", "hash-5", "Recently Expired Ephemeral", "", []string{"users"}, testSubscriptionName,
+		"test-tenant", &recentExpiry, true, nil)
 	require.NoError(t, err)
 
 	t.Run("DeletesExpiredEphemeralKeys", func(t *testing.T) {
@@ -1556,30 +2034,164 @@ func TestCleanupExpiredEphemeralKeys(t *testing.T) {
 	})
 }
 
+func TestRevokeTenantAPIKeys(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := context.Background()
+
+	t.Run("RevokesTenantKeys", func(t *testing.T) {
+		store := NewMockStore()
+		cfg := &config.Config{TenantName: "test-tenant"}
+		service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
+		handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
+
+		require.NoError(t, store.AddKey(ctx, "alice", "tenant-delete-1", "tenant-delete-hash-1", "Key 1", "", []string{"users"}, testSubscriptionName, "test-tenant", nil, false, nil))
+		require.NoError(t, store.AddKey(ctx, "bob", "tenant-delete-2", "tenant-delete-hash-2", "Key 2", "", []string{"users"}, testSubscriptionName, "test-tenant", nil, false, nil))
+		require.NoError(t, store.AddKey(ctx, "carol", "other-tenant-key", "other-tenant-hash", "Other", "", []string{"users"}, testSubscriptionName, "other-tenant", nil, false, nil))
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodDelete, "/internal/v1/tenants/test-tenant/api-keys", nil)
+		c.Params = gin.Params{{Key: "tenant", Value: "test-tenant"}}
+
+		//nolint:contextcheck // Gin handlers receive *gin.Context which contains the context.
+		handler.RevokeTenantAPIKeys(c)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		var response TenantRevokeResponse
+		err := json.Unmarshal(w.Body.Bytes(), &response)
+		require.NoError(t, err)
+		assert.Equal(t, 2, response.RevokedCount)
+		assert.Equal(t, 2, response.DeletedCount)
+
+		key, err := store.Get(ctx, "tenant-delete-1")
+		require.NoError(t, err)
+		assert.Equal(t, StatusRevoked, key.Status)
+		key, err = store.Get(ctx, "tenant-delete-2")
+		require.NoError(t, err)
+		assert.Equal(t, StatusRevoked, key.Status)
+		key, err = store.Get(ctx, "other-tenant-key")
+		require.NoError(t, err)
+		assert.Equal(t, StatusActive, key.Status)
+	})
+
+	t.Run("TenantMismatchReturnsBadRequest", func(t *testing.T) {
+		store := NewMockStore()
+		cfg := &config.Config{TenantName: "test-tenant"}
+		service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
+		handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodDelete, "/internal/v1/tenants/other-tenant/api-keys", nil)
+		c.Params = gin.Params{{Key: "tenant", Value: "other-tenant"}}
+
+		handler.RevokeTenantAPIKeys(c)
+
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		assert.Contains(t, w.Body.String(), "tenant mismatch")
+		assert.NotContains(t, w.Body.String(), "other-tenant")
+	})
+
+	t.Run("StoreFailureReturnsInternalServerError", func(t *testing.T) {
+		store := failingInvalidateTenantStore{
+			MockStore: NewMockStore(),
+			err:       errors.New("database unavailable: internal dsn details"),
+		}
+		cfg := &config.Config{TenantName: "test-tenant"}
+		service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
+		handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodDelete, "/internal/v1/tenants/test-tenant/api-keys", nil)
+		c.Params = gin.Params{{Key: "tenant", Value: "test-tenant"}}
+
+		handler.RevokeTenantAPIKeys(c)
+
+		assert.Equal(t, http.StatusInternalServerError, w.Code)
+		assert.Contains(t, w.Body.String(), "Failed to revoke tenant API keys")
+		assert.NotContains(t, w.Body.String(), "database unavailable")
+		assert.NotContains(t, w.Body.String(), "internal dsn details")
+	})
+}
+
+func TestRevokeSubscriptionAPIKeys(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := context.Background()
+	store := NewMockStore()
+	cfg := &config.Config{TenantName: "test-tenant"}
+	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
+
+	for _, key := range []struct {
+		id           string
+		subscription string
+		tenant       string
+	}{
+		{id: "subscription-delete-1", subscription: "sub-delete", tenant: "test-tenant"},
+		{id: "subscription-delete-2", subscription: "sub-delete", tenant: "test-tenant"},
+		{id: "other-subscription", subscription: "sub-keep", tenant: "test-tenant"},
+		{id: "other-tenant", subscription: "sub-delete", tenant: "other-tenant"},
+	} {
+		require.NoError(t, store.AddKey(ctx, "alice", key.id, key.id+"-hash", key.id, "", []string{"users"}, key.subscription, key.tenant, nil, false, nil))
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodDelete, "/internal/v1/tenants/test-tenant/subscriptions/sub-delete/api-keys", nil)
+	c.Params = gin.Params{{Key: "tenant", Value: "test-tenant"}, {Key: "subscription", Value: "sub-delete"}}
+	handler.RevokeSubscriptionAPIKeys(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var response SubscriptionRevokeResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.Equal(t, 2, response.RevokedCount)
+	assert.Equal(t, 2, response.DeletedCount)
+	assert.False(t, response.DeletedAt.IsZero())
+
+	for _, id := range []string{"subscription-delete-1", "subscription-delete-2"} {
+		key, err := store.Get(ctx, id)
+		require.NoError(t, err)
+		assert.Equal(t, StatusRevoked, key.Status)
+	}
+	key, err := store.Get(ctx, "other-subscription")
+	require.NoError(t, err)
+	assert.Equal(t, StatusActive, key.Status)
+	key, err = store.Get(ctx, "other-tenant")
+	require.NoError(t, err)
+	assert.Equal(t, StatusActive, key.Status)
+
+	_, err = store.GetByHash(ctx, "subscription-delete-1-hash")
+	assert.ErrorIs(t, err, ErrKeyNotFound, "soft-deleted keys must not validate")
+}
+
 func TestSearchExcludesEphemeralByDefault(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := NewMockStore()
 	cfg := &config.Config{}
 	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
-	handler := NewHandler(logger.Development(), service, newMockAdminChecker())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
 
 	ctx := context.Background()
 	testUser := &token.UserContext{
 		Username: "test-user",
 		Groups:   []string{"system:authenticated"},
+		Tenant:   "test-tenant",
 	}
 
 	// Create regular keys
-	err := store.AddKey(ctx, testUser.Username, "regular-key-1", "hash-1", "Regular Key 1", "", []string{"system:authenticated"}, testSubscriptionName, nil, false)
+	err := store.AddKey(ctx, testUser.Username, "regular-key-1", "hash-1", "Regular Key 1", "", []string{"system:authenticated"}, testSubscriptionName, "test-tenant", nil, false, nil)
 	require.NoError(t, err)
-	err = store.AddKey(ctx, testUser.Username, "regular-key-2", "hash-2", "Regular Key 2", "", []string{"system:authenticated"}, testSubscriptionName, nil, false)
+	err = store.AddKey(ctx, testUser.Username, "regular-key-2", "hash-2", "Regular Key 2", "", []string{"system:authenticated"}, testSubscriptionName, "test-tenant", nil, false, nil)
 	require.NoError(t, err)
 
 	// Create ephemeral keys
 	futureExpiry := time.Now().Add(1 * time.Hour)
-	err = store.AddKey(ctx, testUser.Username, "ephemeral-key-1", "hash-3", "Ephemeral Key 1", "", []string{"system:authenticated"}, testSubscriptionName, &futureExpiry, true)
+	err = store.AddKey(ctx, testUser.Username, "ephemeral-key-1", "hash-3", "Ephemeral Key 1", "", []string{"system:authenticated"}, testSubscriptionName,
+		"test-tenant", &futureExpiry, true, nil)
 	require.NoError(t, err)
-	err = store.AddKey(ctx, testUser.Username, "ephemeral-key-2", "hash-4", "Ephemeral Key 2", "", []string{"system:authenticated"}, testSubscriptionName, &futureExpiry, true)
+	err = store.AddKey(ctx, testUser.Username, "ephemeral-key-2", "hash-4", "Ephemeral Key 2", "", []string{"system:authenticated"}, testSubscriptionName,
+		"test-tenant", &futureExpiry, true, nil)
 	require.NoError(t, err)
 
 	t.Run("DefaultSearchExcludesEphemeral", func(t *testing.T) {
@@ -1615,26 +2227,30 @@ func TestSearchAPIKeys_ExpiredStatusComputation(t *testing.T) {
 	store := NewMockStore()
 	cfg := &config.Config{}
 	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
-	handler := NewHandler(logger.Development(), service, newMockAdminChecker())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
 
 	ctx := context.Background()
 	testUser := &token.UserContext{
 		Username: "test-user",
 		Groups:   []string{"system:authenticated"},
+		Tenant:   "test-tenant",
 	}
 
 	// Create a key that expired yesterday (stored as active, but past expiration)
 	pastExpiry := time.Now().Add(-24 * time.Hour)
-	err := store.AddKey(ctx, testUser.Username, "expired-key", "expired-hash", "Expired Key", "", []string{"system:authenticated"}, testSubscriptionName, &pastExpiry, false)
+	err := store.AddKey(ctx, testUser.Username, "expired-key", "expired-hash", "Expired Key", "", []string{"system:authenticated"}, testSubscriptionName,
+		"test-tenant", &pastExpiry, false, nil)
 	require.NoError(t, err)
 
 	// Create an active key with future expiration
 	futureExpiry := time.Now().Add(24 * time.Hour)
-	err = store.AddKey(ctx, testUser.Username, "active-key", "active-hash", "Active Key", "", []string{"system:authenticated"}, testSubscriptionName, &futureExpiry, false)
+	err = store.AddKey(ctx, testUser.Username, "active-key", "active-hash", "Active Key", "", []string{"system:authenticated"}, testSubscriptionName,
+		"test-tenant", &futureExpiry, false, nil)
 	require.NoError(t, err)
 
 	// Create an active key with no expiration
-	err = store.AddKey(ctx, testUser.Username, "permanent-key", "permanent-hash", "Permanent Key", "", []string{"system:authenticated"}, testSubscriptionName, nil, false)
+	err = store.AddKey(ctx, testUser.Username, "permanent-key", "permanent-hash", "Permanent Key", "", []string{"system:authenticated"}, testSubscriptionName,
+		"test-tenant", nil, false, nil)
 	require.NoError(t, err)
 
 	t.Run("SearchReturnsExpiredStatusForPastExpirationKeys", func(t *testing.T) {
@@ -1676,22 +2292,25 @@ func TestGetAPIKey_ExpiredStatusComputation(t *testing.T) {
 	store := NewMockStore()
 	cfg := &config.Config{}
 	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
-	handler := NewHandler(logger.Development(), service, newMockAdminChecker())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
 
 	ctx := context.Background()
 	testUser := &token.UserContext{
 		Username: "test-user",
 		Groups:   []string{"system:authenticated"},
+		Tenant:   "test-tenant",
 	}
 
 	// Create a key that expired yesterday
 	pastExpiry := time.Now().Add(-24 * time.Hour)
-	err := store.AddKey(ctx, testUser.Username, "expired-key", "expired-hash", "Expired Key", "", []string{"system:authenticated"}, testSubscriptionName, &pastExpiry, false)
+	err := store.AddKey(ctx, testUser.Username, "expired-key", "expired-hash", "Expired Key", "", []string{"system:authenticated"}, testSubscriptionName,
+		"test-tenant", &pastExpiry, false, nil)
 	require.NoError(t, err)
 
 	// Create an active key with future expiration
 	futureExpiry := time.Now().Add(24 * time.Hour)
-	err = store.AddKey(ctx, testUser.Username, "active-key", "active-hash", "Active Key", "", []string{"system:authenticated"}, testSubscriptionName, &futureExpiry, false)
+	err = store.AddKey(ctx, testUser.Username, "active-key", "active-hash", "Active Key", "", []string{"system:authenticated"}, testSubscriptionName,
+		"test-tenant", &futureExpiry, false, nil)
 	require.NoError(t, err)
 
 	t.Run("GetExpiredKeyReturnsExpiredStatus", func(t *testing.T) {
@@ -1727,4 +2346,2502 @@ func TestGetAPIKey_ExpiredStatusComputation(t *testing.T) {
 		assert.Equal(t, "active-key", response.ID)
 		assert.Equal(t, StatusActive, response.Status, "key with future expiration should return active status")
 	})
+}
+
+// TestCrossTenantAccessRejected verifies tenant isolation across get and revoke
+// operations for both regular users and admins.
+func TestCrossTenantAccessRejected(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name   string
+		method string
+		user   *token.UserContext
+		action func(*Handler, *gin.Context)
+	}{
+		{
+			name:   "GetByRegularUser",
+			method: http.MethodGet,
+			user: &token.UserContext{
+				Username: "alice",
+				Groups:   []string{"system:authenticated"},
+				Tenant:   "tenant-b",
+			},
+			action: func(h *Handler, c *gin.Context) { h.GetAPIKey(c) },
+		},
+		{
+			name:   "GetByAdmin",
+			method: http.MethodGet,
+			user: &token.UserContext{
+				Username: "admin",
+				Groups:   []string{"admin-users"},
+				Tenant:   "tenant-b",
+			},
+			action: func(h *Handler, c *gin.Context) { h.GetAPIKey(c) },
+		},
+		{
+			name:   "RevokeByRegularUser",
+			method: http.MethodDelete,
+			user: &token.UserContext{
+				Username: "alice",
+				Groups:   []string{"system:authenticated"},
+				Tenant:   "tenant-b",
+			},
+			action: func(h *Handler, c *gin.Context) { h.RevokeAPIKey(c) },
+		},
+		{
+			name:   "RevokeByAdmin",
+			method: http.MethodDelete,
+			user: &token.UserContext{
+				Username: "admin",
+				Groups:   []string{"admin-users"},
+				Tenant:   "tenant-b",
+			},
+			action: func(h *Handler, c *gin.Context) { h.RevokeAPIKey(c) },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewMockStore()
+			cfg := &config.Config{}
+			svc := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
+			h := NewHandler(logger.Development(), svc, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
+
+			ctx := context.Background()
+			err := store.AddKey(ctx, "alice", "ta-key-1", "hash-ta1", "TA Key", "", []string{"system:authenticated"}, testSubscriptionName, "tenant-a", nil, false, nil)
+			require.NoError(t, err)
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(tt.method, "/v1/api-keys/ta-key-1", nil)
+			c.Set("user", tt.user)
+			c.Params = gin.Params{{Key: "id", Value: "ta-key-1"}}
+
+			tt.action(h, c)
+
+			assert.Equal(t, http.StatusNotFound, w.Code,
+				"cross-tenant %s should return 404", tt.name)
+
+			key, err := store.Get(ctx, "ta-key-1")
+			require.NoError(t, err)
+			assert.Equal(t, StatusActive, key.Status,
+				"key should remain active after cross-tenant attempt")
+		})
+	}
+}
+
+// TestSearchAPIKeys_TenantIsolation verifies that search only returns keys
+// from the caller's tenant.
+func TestSearchAPIKeys_TenantIsolation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	cfg := &config.Config{}
+	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
+
+	ctx := context.Background()
+
+	// Create keys for two tenants under same username
+	err := store.AddKey(ctx, "alice", "key-ta-1", "hash-ta1", "TA Key 1", "", []string{"system:authenticated"}, testSubscriptionName, "tenant-a", nil, false, nil)
+	require.NoError(t, err)
+	err = store.AddKey(ctx, "alice", "key-ta-2", "hash-ta2", "TA Key 2", "", []string{"system:authenticated"}, testSubscriptionName, "tenant-a", nil, false, nil)
+	require.NoError(t, err)
+	err = store.AddKey(ctx, "alice", "key-tb-1", "hash-tb1", "TB Key 1", "", []string{"system:authenticated"}, testSubscriptionName, "tenant-b", nil, false, nil)
+	require.NoError(t, err)
+
+	// Tenant-A user should only see tenant-A keys
+	tenantAUser := &token.UserContext{
+		Username: "alice",
+		Groups:   []string{"system:authenticated"},
+		Tenant:   "tenant-a",
+	}
+
+	response := executeSearchRequest(t, handler, `{}`, tenantAUser)
+	assert.Len(t, response.Data, 2, "tenant-A user should only see 2 tenant-A keys")
+	for _, key := range response.Data {
+		assert.Equal(t, "tenant-a", key.Tenant)
+	}
+
+	// Tenant-B user should only see tenant-B keys
+	tenantBUser := &token.UserContext{
+		Username: "alice",
+		Groups:   []string{"system:authenticated"},
+		Tenant:   "tenant-b",
+	}
+
+	response = executeSearchRequest(t, handler, `{}`, tenantBUser)
+	assert.Len(t, response.Data, 1, "tenant-B user should only see 1 tenant-B key")
+	assert.Equal(t, "tenant-b", response.Data[0].Tenant)
+}
+
+// TestCreateAPIKey_StoresTenant verifies that creating a key stores the caller's tenant.
+func TestCreateAPIKey_StoresTenant(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	cfg := &config.Config{}
+	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
+
+	user := &token.UserContext{
+		Username: "alice",
+		Groups:   []string{"system:authenticated"},
+		Tenant:   "my-tenant",
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys", nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Body = io.NopCloser(strings.NewReader(`{"name": "tenant-key"}`))
+	c.Set("user", user)
+
+	handler.CreateAPIKey(c)
+
+	require.Equal(t, http.StatusCreated, w.Code)
+	var response CreateAPIKeyResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+
+	meta, err := store.Get(context.Background(), response.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "my-tenant", meta.Tenant, "key should be stored with caller's tenant")
+}
+
+// ============================================================
+// TENANT SCOPING EDGE CASE TESTS
+// ============================================================
+
+// TestBulkRevokeAPIKeys_TenantIsolation verifies that bulk revoke only affects
+// keys within the caller's tenant, leaving keys in other tenants untouched.
+func TestBulkRevokeAPIKeys_TenantIsolation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	cfg := &config.Config{}
+	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
+
+	ctx := context.Background()
+
+	// Create 2 keys for "alice" in tenant-a
+	err := store.AddKey(ctx, "alice", "ta-key-1", "hash-ta1", "TA Key 1", "", []string{"system:authenticated"}, testSubscriptionName, "tenant-a", nil, false, nil)
+	require.NoError(t, err)
+	err = store.AddKey(ctx, "alice", "ta-key-2", "hash-ta2", "TA Key 2", "", []string{"system:authenticated"}, testSubscriptionName, "tenant-a", nil, false, nil)
+	require.NoError(t, err)
+
+	// Create 2 keys for "alice" in tenant-b
+	err = store.AddKey(ctx, "alice", "tb-key-1", "hash-tb1", "TB Key 1", "", []string{"system:authenticated"}, testSubscriptionName, "tenant-b", nil, false, nil)
+	require.NoError(t, err)
+	err = store.AddKey(ctx, "alice", "tb-key-2", "hash-tb2", "TB Key 2", "", []string{"system:authenticated"}, testSubscriptionName, "tenant-b", nil, false, nil)
+	require.NoError(t, err)
+
+	// Admin from tenant-a bulk revokes "alice"
+	tenantAAdmin := &token.UserContext{
+		Username: "admin",
+		Groups:   []string{"admin-users"},
+		Tenant:   "tenant-a",
+	}
+
+	requestBody := testBulkRevokeAliceJSON
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys/bulk-revoke", nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Body = io.NopCloser(strings.NewReader(requestBody))
+	c.Set("user", tenantAAdmin)
+
+	handler.BulkRevokeAPIKeys(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var response BulkRevokeResponse
+	err = json.Unmarshal(w.Body.Bytes(), &response)
+	require.NoError(t, err)
+	assert.Equal(t, 2, response.RevokedCount, "should only revoke tenant-a keys")
+
+	// Verify tenant-a keys are revoked
+	key, err := store.Get(ctx, "ta-key-1")
+	require.NoError(t, err)
+	assert.Equal(t, StatusRevoked, key.Status, "tenant-a key 1 should be revoked")
+	key, err = store.Get(ctx, "ta-key-2")
+	require.NoError(t, err)
+	assert.Equal(t, StatusRevoked, key.Status, "tenant-a key 2 should be revoked")
+
+	// Verify tenant-b keys remain active
+	key, err = store.Get(ctx, "tb-key-1")
+	require.NoError(t, err)
+	assert.Equal(t, StatusActive, key.Status, "tenant-b key 1 should remain active")
+	key, err = store.Get(ctx, "tb-key-2")
+	require.NoError(t, err)
+	assert.Equal(t, StatusActive, key.Status, "tenant-b key 2 should remain active")
+}
+
+func TestBulkRevokeAPIKeys_BySubscription(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	cfg := &config.Config{}
+	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
+
+	ctx := context.Background()
+
+	require.NoError(t, store.AddKey(ctx, "alice", "sub-a-key-1", "h1", "Key 1", "", nil, "sub-alpha", "test-tenant", nil, false, nil))
+	require.NoError(t, store.AddKey(ctx, "bob", "sub-a-key-2", "h2", "Key 2", "", nil, "sub-alpha", "test-tenant", nil, false, nil))
+	require.NoError(t, store.AddKey(ctx, "alice", "sub-b-key-1", "h3", "Key 3", "", nil, "sub-beta", "test-tenant", nil, false, nil))
+
+	t.Run("AdminCanRevokeBySubscription", func(t *testing.T) {
+		adminUser := &token.UserContext{
+			Username: "admin",
+			Groups:   []string{"admin-users", "system:authenticated"},
+			Tenant:   "test-tenant",
+		}
+
+		body := `{"subscription": "sub-alpha"}`
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys/bulk-revoke", nil)
+		c.Request.Header.Set("Content-Type", "application/json")
+		c.Request.Body = io.NopCloser(strings.NewReader(body))
+		c.Set("user", adminUser)
+
+		//nolint:contextcheck // gin handler receives context via *gin.Context
+		handler.BulkRevokeAPIKeys(c)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		var response BulkRevokeResponse
+		err := json.Unmarshal(w.Body.Bytes(), &response)
+		require.NoError(t, err)
+		assert.Equal(t, 2, response.RevokedCount, "should revoke both sub-alpha keys")
+
+		key, err := store.Get(ctx, "sub-b-key-1")
+		require.NoError(t, err)
+		assert.Equal(t, StatusActive, key.Status, "sub-beta key should remain active")
+	})
+
+	t.Run("NonAdminCannotRevokeBySubscription", func(t *testing.T) {
+		regularUser := &token.UserContext{
+			Username: "alice",
+			Groups:   []string{"system:authenticated"},
+			Tenant:   "test-tenant",
+		}
+
+		body := `{"subscription": "sub-beta"}`
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys/bulk-revoke", nil)
+		c.Request.Header.Set("Content-Type", "application/json")
+		c.Request.Body = io.NopCloser(strings.NewReader(body))
+		c.Set("user", regularUser)
+
+		handler.BulkRevokeAPIKeys(c)
+
+		assert.Equal(t, http.StatusForbidden, w.Code)
+	})
+
+	t.Run("AdminCanRevokeByUserAndSubscription", func(t *testing.T) {
+		store2 := NewMockStore()
+		service2 := NewServiceWithLogger(store2, cfg, fixedSubSelector{}, logger.Development())
+		handler2 := NewHandler(logger.Development(), service2, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
+
+		require.NoError(t, store2.AddKey(ctx, "alice", "combo-1", "ch1", "K1", "", nil, "sub-x", "test-tenant", nil, false, nil))
+		require.NoError(t, store2.AddKey(ctx, "alice", "combo-2", "ch2", "K2", "", nil, "sub-y", "test-tenant", nil, false, nil))
+		require.NoError(t, store2.AddKey(ctx, "bob", "combo-3", "ch3", "K3", "", nil, "sub-x", "test-tenant", nil, false, nil))
+
+		adminUser := &token.UserContext{
+			Username: "admin",
+			Groups:   []string{"admin-users", "system:authenticated"},
+			Tenant:   "test-tenant",
+		}
+
+		body := `{"username": "alice", "subscription": "sub-x"}`
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys/bulk-revoke", nil)
+		c.Request.Header.Set("Content-Type", "application/json")
+		c.Request.Body = io.NopCloser(strings.NewReader(body))
+		c.Set("user", adminUser)
+
+		//nolint:contextcheck // gin handler receives context via *gin.Context
+		handler2.BulkRevokeAPIKeys(c)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		var response BulkRevokeResponse
+		err := json.Unmarshal(w.Body.Bytes(), &response)
+		require.NoError(t, err)
+		assert.Equal(t, 1, response.RevokedCount, "should only revoke alice's sub-x key")
+
+		key, _ := store2.Get(ctx, "combo-2")
+		assert.Equal(t, StatusActive, key.Status, "alice sub-y key should remain active")
+		key, _ = store2.Get(ctx, "combo-3")
+		assert.Equal(t, StatusActive, key.Status, "bob sub-x key should remain active")
+	})
+}
+
+func TestBulkRevokeAPIKeys_DryRun(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	cfg := &config.Config{}
+	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
+
+	ctx := context.Background()
+
+	require.NoError(t, store.AddKey(ctx, "alice", "dr-key-1", "dh1", "DK1", "", nil, "sub-a", "test-tenant", nil, false, nil))
+	require.NoError(t, store.AddKey(ctx, "alice", "dr-key-2", "dh2", "DK2", "", nil, "sub-a", "test-tenant", nil, false, nil))
+	require.NoError(t, store.AddKey(ctx, "alice", "dr-key-3", "dh3", "DK3", "", nil, "sub-b", "test-tenant", nil, false, nil))
+
+	t.Run("DryRunDoesNotMutate", func(t *testing.T) {
+		adminUser := &token.UserContext{
+			Username: "admin",
+			Groups:   []string{"admin-users", "system:authenticated"},
+			Tenant:   "test-tenant",
+		}
+
+		body := `{"username": "alice", "dryRun": true}`
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys/bulk-revoke", nil)
+		c.Request.Header.Set("Content-Type", "application/json")
+		c.Request.Body = io.NopCloser(strings.NewReader(body))
+		c.Set("user", adminUser)
+
+		//nolint:contextcheck // gin handler receives context via *gin.Context
+		handler.BulkRevokeAPIKeys(c)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		var response BulkRevokeResponse
+		err := json.Unmarshal(w.Body.Bytes(), &response)
+		require.NoError(t, err)
+		assert.Equal(t, 3, response.RevokedCount, "dry run should report 3 keys")
+		assert.True(t, response.DryRun, "should indicate dry run")
+
+		// Verify keys are still active
+		for _, id := range []string{"dr-key-1", "dr-key-2", "dr-key-3"} {
+			key, err := store.Get(ctx, id)
+			require.NoError(t, err)
+			assert.Equal(t, StatusActive, key.Status, "key %s should remain active after dry run", id)
+		}
+	})
+
+	t.Run("DryRunBySubscription", func(t *testing.T) {
+		adminUser := &token.UserContext{
+			Username: "admin",
+			Groups:   []string{"admin-users", "system:authenticated"},
+			Tenant:   "test-tenant",
+		}
+
+		body := `{"subscription": "sub-a", "dryRun": true}`
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys/bulk-revoke", nil)
+		c.Request.Header.Set("Content-Type", "application/json")
+		c.Request.Body = io.NopCloser(strings.NewReader(body))
+		c.Set("user", adminUser)
+
+		handler.BulkRevokeAPIKeys(c)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		var response BulkRevokeResponse
+		err := json.Unmarshal(w.Body.Bytes(), &response)
+		require.NoError(t, err)
+		assert.Equal(t, 2, response.RevokedCount, "dry run should find 2 sub-a keys")
+		assert.True(t, response.DryRun)
+	})
+}
+
+// TestSearchAPIKeys_AdminCrossTenantIsolation verifies that admin privileges
+// do not bypass tenant isolation — an admin from tenant-B cannot see keys in tenant-A.
+func TestSearchAPIKeys_AdminCrossTenantIsolation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	cfg := &config.Config{}
+	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
+
+	ctx := context.Background()
+
+	// Create keys for "alice" in tenant-a
+	err := store.AddKey(ctx, "alice", "ta-key-1", "hash-ta1", "TA Key 1", "", []string{"system:authenticated"}, testSubscriptionName, "tenant-a", nil, false, nil)
+	require.NoError(t, err)
+	err = store.AddKey(ctx, "alice", "ta-key-2", "hash-ta2", "TA Key 2", "", []string{"system:authenticated"}, testSubscriptionName, "tenant-a", nil, false, nil)
+	require.NoError(t, err)
+
+	t.Run("AdminFromTenantBSeesNoKeys", func(t *testing.T) {
+		tenantBAdmin := &token.UserContext{
+			Username: "admin",
+			Groups:   []string{"admin-users"},
+			Tenant:   "tenant-b",
+		}
+
+		response := executeSearchRequest(t, handler, `{}`, tenantBAdmin)
+		assert.Empty(t, response.Data, "admin from tenant-b should see no tenant-a keys")
+	})
+
+	t.Run("AdminFromTenantASeesAllKeys", func(t *testing.T) {
+		tenantAAdmin := &token.UserContext{
+			Username: "admin",
+			Groups:   []string{"admin-users"},
+			Tenant:   "tenant-a",
+		}
+
+		response := executeSearchRequest(t, handler, `{}`, tenantAAdmin)
+		assert.Len(t, response.Data, 2, "admin from tenant-a should see all tenant-a keys")
+		for _, key := range response.Data {
+			assert.Equal(t, "tenant-a", key.Tenant)
+		}
+	})
+}
+
+// TestSearchAPIKeys_EmptyTenantNoResults verifies that a user whose tenant has
+// no keys gets an empty list (200 OK), not an error.
+func TestSearchAPIKeys_EmptyTenantNoResults(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	cfg := &config.Config{}
+	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
+
+	ctx := context.Background()
+
+	// Create keys in tenant-a
+	err := store.AddKey(ctx, "alice", "ta-key-1", "hash-ta1", "TA Key 1", "", []string{"system:authenticated"}, testSubscriptionName, "tenant-a", nil, false, nil)
+	require.NoError(t, err)
+	err = store.AddKey(ctx, "alice", "ta-key-2", "hash-ta2", "TA Key 2", "", []string{"system:authenticated"}, testSubscriptionName, "tenant-a", nil, false, nil)
+	require.NoError(t, err)
+
+	// User from tenant-c (no keys exist) searches
+	tenantCUser := &token.UserContext{
+		Username: "alice",
+		Groups:   []string{"system:authenticated"},
+		Tenant:   "tenant-c",
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys/search", nil)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Body = io.NopCloser(strings.NewReader(`{}`))
+	c.Set("user", tenantCUser)
+
+	handler.SearchAPIKeys(c)
+
+	assert.Equal(t, http.StatusOK, w.Code, "should return 200 OK even with no results")
+	var response SearchAPIKeysResponse
+	err = json.Unmarshal(w.Body.Bytes(), &response)
+	require.NoError(t, err)
+	assert.Equal(t, "list", response.Object)
+	assert.Empty(t, response.Data, "tenant-c user should see no keys")
+	assert.False(t, response.HasMore)
+}
+
+// ============================================================
+// NO AUTH CONTEXT TESTS (optional auth for /v1/api-keys)
+// ============================================================
+
+// TestSearchAPIKeys_NoAuthContext verifies that POST /v1/api-keys/search returns
+// an empty list when no user context is present (ExtractUserInfoOptional did not
+// set one). This covers the case where no LLMInferenceService is deployed.
+func TestSearchAPIKeys_NoAuthContext(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	log := logger.Development()
+	store := NewMockStore()
+	cfg := &config.Config{}
+	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, log)
+	handler := NewHandler(log, service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
+
+	tokenHandler := token.NewHandler(log, "test-tenant")
+
+	// Wire up with ExtractUserInfoOptional — same as production wiring.
+	router := gin.New()
+	router.POST("/v1/api-keys/search", tokenHandler.ExtractUserInfoOptional(), handler.SearchAPIKeys)
+
+	// Seed data so we can verify no keys leak when there is no auth context.
+	ctx := context.Background()
+	err := store.AddKey(ctx, "alice", "key-1", "hash-1", "Key 1", "",
+		[]string{"system:authenticated"}, testSubscriptionName, "test-tenant", nil, false, nil)
+	require.NoError(t, err)
+
+	t.Run("returns empty list when no auth headers at all", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/v1/api-keys/search", strings.NewReader(`{}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		var response SearchAPIKeysResponse
+		err := json.Unmarshal(w.Body.Bytes(), &response)
+		require.NoError(t, err)
+		assert.Equal(t, "list", response.Object)
+		assert.Empty(t, response.Data, "should return empty list when no auth context")
+		assert.False(t, response.HasMore)
+		assert.Equal(t, "no-store", w.Header().Get("Cache-Control"),
+			"expected Cache-Control: no-store to prevent caching of personalized listings")
+	})
+
+	t.Run("returns empty list when Authorization present but no identity headers", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/v1/api-keys/search", strings.NewReader(`{}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer some-token")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		var response SearchAPIKeysResponse
+		err := json.Unmarshal(w.Body.Bytes(), &response)
+		require.NoError(t, err)
+		assert.Equal(t, "list", response.Object)
+		assert.Empty(t, response.Data, "should return empty list when no identity headers")
+		assert.False(t, response.HasMore)
+	})
+
+	t.Run("returns normal response when all auth headers present", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/v1/api-keys/search", strings.NewReader(`{}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Maas-Username", "alice")
+		req.Header.Set("X-Maas-Group", `["system:authenticated"]`)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		var response SearchAPIKeysResponse
+		err := json.Unmarshal(w.Body.Bytes(), &response)
+		require.NoError(t, err)
+		assert.Equal(t, "list", response.Object)
+		assert.Len(t, response.Data, 1, "should return keys when auth context is present")
+	})
+}
+
+func TestCreateAPIKey_NameValidation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	cfg := &config.Config{}
+	service := NewServiceWithLogger(store, cfg, fixedSubSelector{}, logger.Development())
+	handler := NewHandler(logger.Development(), service, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
+
+	user := &token.UserContext{
+		Username: "user",
+		Groups:   []string{"test-group"},
+		Tenant:   "tenant",
+	}
+
+	validNames := []struct {
+		name        string
+		description string
+	}{
+		{"simple-key", "ASCII alphanumeric with dash"},
+		{"test_key_123", "ASCII with underscores and numbers"},
+		{"My API Key", "ASCII with spaces"},
+		{"café", "Latin-1 accented characters"},
+		{"🔑 api-key", "Emoji with ASCII"},
+		{"ключ", "Cyrillic characters"},
+		{"مفتاح", "Arabic characters"},
+		{"κλειδί", "Greek characters"},
+		{"a", "Single character"},
+		{strings.Repeat("a", 128), "Exactly 128 characters"},
+		{"key.with.dots", "Dots"},
+		{"key:with:colons", "Colons"},
+		{"key-with_mixed.chars:123", "Mixed valid punctuation"},
+	}
+
+	for _, tc := range validNames {
+		t.Run("valid_"+tc.description, func(t *testing.T) {
+			requestBody := fmt.Sprintf(`{"name": %q}`, tc.name)
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys", nil)
+			c.Request.Header.Set("Content-Type", "application/json")
+			c.Request.Body = io.NopCloser(strings.NewReader(requestBody))
+			c.Set("user", user)
+
+			handler.CreateAPIKey(c)
+
+			assert.Equal(t, http.StatusCreated, w.Code, "key name %q should be valid: %s", tc.name, tc.description)
+			var response CreateAPIKeyResponse
+			err := json.Unmarshal(w.Body.Bytes(), &response)
+			require.NoError(t, err)
+			// Verify the name is stored (trimmed if had whitespace)
+			assert.Equal(t, strings.TrimSpace(tc.name), response.Name)
+		})
+	}
+
+	invalidNames := []struct {
+		name   string
+		reason string
+		errMsg string
+	}{
+		{"   ", "whitespace only", "whitespace only"},
+		{"\t\t", "tabs only", "whitespace only"},
+		{"\n\n", "newlines only", "whitespace only"},
+		{"key\nwith\nnewline", "newline character", "control characters"},
+		{"key\twith\ttab", "tab character", "control characters"},
+		{"key\rwith\rcarriage", "carriage return", "control characters"},
+		{strings.Repeat("a", 129), "129 characters (over limit)", "exceed 128"},
+		{strings.Repeat("x", 200), "200 characters (way over limit)", "exceed 128"},
+		{"line1\nline2\nline3", "multiple newlines", "control characters"},
+	}
+
+	for _, tc := range invalidNames {
+		t.Run("invalid_"+tc.reason, func(t *testing.T) {
+			requestBody := fmt.Sprintf(`{"name": %q}`, tc.name)
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys", nil)
+			c.Request.Header.Set("Content-Type", "application/json")
+			c.Request.Body = io.NopCloser(strings.NewReader(requestBody))
+			c.Set("user", user)
+
+			handler.CreateAPIKey(c)
+
+			assert.Equal(t, http.StatusBadRequest, w.Code, "key name should be rejected: %s", tc.reason)
+			var response map[string]any
+			err := json.Unmarshal(w.Body.Bytes(), &response)
+			require.NoError(t, err)
+			assert.Contains(t, response["error"], tc.errMsg, "error message should mention %s for %s", tc.errMsg, tc.reason)
+		})
+	}
+}
+
+// TestValidateLabels_Success tests valid label configurations.
+func TestValidateLabels_Success(t *testing.T) {
+	tests := []struct {
+		name   string
+		labels map[string]string
+	}{
+		{
+			name:   "nil labels",
+			labels: nil,
+		},
+		{
+			name:   "empty labels",
+			labels: map[string]string{},
+		},
+		{
+			name: "single label",
+			labels: map[string]string{
+				"environment": "production",
+			},
+		},
+		{
+			name: "multiple valid labels",
+			labels: map[string]string{
+				"cmdb_id":      "AST123456",
+				"cost_center":  "CC-DATA-001",
+				"environment":  "production",
+				"project_code": "PROJ-ML-2024",
+				"owner_email":  "ml-team@company.com",
+			},
+		},
+		{
+			name: "kubernetes-style prefixed keys",
+			labels: map[string]string{
+				"app.kubernetes.io/name":    "maas",
+				"app.kubernetes.io/version": "1.0",
+				"company.com/project-id":    "PROJ-123",
+				"example.org/owner":         "ml-team",
+			},
+		},
+		{
+			name: "simple keys with dots underscores hyphens",
+			labels: map[string]string{
+				"some_underscore_key": "value",
+				"some-hyphen-key":     "value",
+				"some.dot.key":        "value",
+				"mixed.key_with-all":  "value",
+			},
+		},
+		{
+			name:   "max entries (50)",
+			labels: makeLargeLabels(constant.MaxLabelsEntries),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateLabels(tt.labels)
+			assert.NoError(t, err)
+		})
+	}
+}
+
+// TestValidateLabels_Errors tests label validation failures.
+func TestValidateLabels_Errors(t *testing.T) {
+	tests := []struct {
+		name    string
+		labels  map[string]string
+		wantErr string
+	}{
+		{
+			name:    "too many entries",
+			labels:  makeLargeLabels(constant.MaxLabelsEntries + 1),
+			wantErr: fmt.Sprintf("cannot exceed %d", constant.MaxLabelsEntries),
+		},
+		{
+			name:    "empty key",
+			labels:  map[string]string{"": "value"},
+			wantErr: "label keys cannot be empty",
+		},
+		{
+			name:    "key too long",
+			labels:  map[string]string{strings.Repeat("a", constant.MaxLabelKeyLength+1): "value"},
+			wantErr: fmt.Sprintf("exceeds %d characters", constant.MaxLabelKeyLength),
+		},
+		{
+			name:    "empty value",
+			labels:  map[string]string{"key": ""},
+			wantErr: "label value for key 'key' cannot be empty",
+		},
+		{
+			name:    "value too long",
+			labels:  map[string]string{"key": strings.Repeat("a", constant.MaxLabelValueLength+1)},
+			wantErr: fmt.Sprintf("exceeds %d characters", constant.MaxLabelValueLength),
+		},
+		{
+			name:    "invalid key - spaces",
+			labels:  map[string]string{"key with spaces": "value"},
+			wantErr: "contains invalid characters",
+		},
+		{
+			name:    "invalid key - special chars",
+			labels:  map[string]string{"key!@#$": "value"},
+			wantErr: "contains invalid characters",
+		},
+		{
+			name:    "invalid key - slash without prefix",
+			labels:  map[string]string{"key/slash/invalid": "value"},
+			wantErr: "contains invalid characters",
+		},
+		{
+			name:    "invalid key - prefix with underscore",
+			labels:  map[string]string{"bad_prefix.com/name": "value"},
+			wantErr: "contains invalid characters",
+		},
+		{
+			name:    "invalid key - starts with hyphen",
+			labels:  map[string]string{"-starts-with-hyphen": "value"},
+			wantErr: "contains invalid characters",
+		},
+		{
+			name:    "invalid key - ends with hyphen",
+			labels:  map[string]string{"ends-with-hyphen-": "value"},
+			wantErr: "contains invalid characters",
+		},
+		{
+			name:    "invalid key - starts with dot",
+			labels:  map[string]string{".starts.with.dot": "value"},
+			wantErr: "contains invalid characters",
+		},
+		{
+			name:    "control characters in value - null",
+			labels:  map[string]string{"key": "value\x00null"},
+			wantErr: "invalid control characters",
+		},
+		{
+			name:    "control characters in value - newline",
+			labels:  map[string]string{"key": "value\nwith\nnewlines"},
+			wantErr: "invalid control characters",
+		},
+		{
+			name:    "control characters in value - tab",
+			labels:  map[string]string{"key": "value\twith\ttabs"},
+			wantErr: "invalid control characters",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateLabels(tt.labels)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
+// Helper function to create a map with a specific number of entries.
+func makeLargeLabels(count int) map[string]string {
+	labels := make(map[string]string)
+	for i := range count {
+		labels[fmt.Sprintf("key_%d", i)] = fmt.Sprintf("value_%d", i)
+	}
+	return labels
+}
+
+// TestCreateAPIKey_WithLabels tests creating an API key with labels.
+func TestCreateAPIKey_WithLabels(t *testing.T) {
+	store := NewMockStore()
+	svc := NewService(store, &config.Config{}, fixedSubSelector{})
+	handler := NewHandler(logger.Development(), svc, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
+
+	labels := map[string]string{
+		"cmdb_id":      "AST123456",
+		"cost_center":  "CC-DATA-001",
+		"environment":  "production",
+		"project_code": "PROJ-ML-2024",
+	}
+
+	body := `{
+		"name": "prod-pipeline",
+		"description": "Production data processing",
+		"labels": {
+			"cmdb_id": "AST123456",
+			"cost_center": "CC-DATA-001",
+			"environment": "production",
+			"project_code": "PROJ-ML-2024"
+		}
+	}`
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys", strings.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("user", &token.UserContext{
+		Username: "alice",
+		Groups:   []string{"data-science"},
+		Tenant:   "test-tenant",
+	})
+
+	handler.CreateAPIKey(c)
+
+	assert.Equal(t, http.StatusCreated, w.Code)
+
+	var resp CreateAPIKeyResponse
+	err := json.Unmarshal(w.Body.Bytes(), &resp)
+	require.NoError(t, err)
+
+	// Verify labels are in the response
+	assert.Equal(t, labels, resp.Labels)
+
+	// Verify labels were stored
+	storedKey, err := store.Get(context.Background(), resp.ID)
+	require.NoError(t, err)
+	assert.Equal(t, labels, storedKey.Labels)
+}
+
+// TestCreateAPIKey_WithoutLabels tests backward compatibility.
+func TestCreateAPIKey_WithoutLabels(t *testing.T) {
+	store := NewMockStore()
+	svc := NewService(store, &config.Config{}, fixedSubSelector{})
+	handler := NewHandler(logger.Development(), svc, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
+
+	body := `{
+		"name": "legacy-key",
+		"description": "Key without labels"
+	}`
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys", strings.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("user", &token.UserContext{
+		Username: "alice",
+		Groups:   []string{"data-science"},
+		Tenant:   "test-tenant",
+	})
+
+	handler.CreateAPIKey(c)
+
+	assert.Equal(t, http.StatusCreated, w.Code)
+
+	var resp CreateAPIKeyResponse
+	err := json.Unmarshal(w.Body.Bytes(), &resp)
+	require.NoError(t, err)
+
+	// Labels should be nil (not present in request)
+	assert.Nil(t, resp.Labels)
+
+	// Verify stored key also has nil labels
+	storedKey, err := store.Get(context.Background(), resp.ID)
+	require.NoError(t, err)
+	assert.Nil(t, storedKey.Labels)
+}
+
+// TestCreateAPIKey_InvalidLabels tests validation error responses.
+func TestCreateAPIKey_InvalidLabels(t *testing.T) {
+	tests := []struct {
+		name       string
+		labelsJSON string
+		wantStatus int
+		wantErr    string
+	}{
+		{
+			name:       "empty key",
+			labelsJSON: `{"": "value"}`,
+			wantStatus: http.StatusBadRequest,
+			wantErr:    "label keys cannot be empty",
+		},
+		{
+			name:       "too many labels",
+			labelsJSON: makeLargeLabelsJSON(t, constant.MaxLabelsEntries+1),
+			wantStatus: http.StatusBadRequest,
+			wantErr:    "cannot exceed 50",
+		},
+		{
+			name:       "invalid key characters",
+			labelsJSON: `{"invalid key!": "value"}`,
+			wantStatus: http.StatusBadRequest,
+			wantErr:    "invalid characters",
+		},
+		{
+			name:       "key too long",
+			labelsJSON: fmt.Sprintf(`{"%s": "value"}`, strings.Repeat("a", constant.MaxLabelKeyLength+1)),
+			wantStatus: http.StatusBadRequest,
+			wantErr:    fmt.Sprintf("exceeds %d characters", constant.MaxLabelKeyLength),
+		},
+		{
+			name:       "value too long",
+			labelsJSON: fmt.Sprintf(`{"key": "%s"}`, strings.Repeat("a", constant.MaxLabelValueLength+1)),
+			wantStatus: http.StatusBadRequest,
+			wantErr:    fmt.Sprintf("exceeds %d characters", constant.MaxLabelValueLength),
+		},
+		{
+			name:       "control characters in value",
+			labelsJSON: `{"k": "val\u0000ue"}`,
+			wantStatus: http.StatusBadRequest,
+			wantErr:    "contains invalid control characters",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewMockStore()
+			svc := NewService(store, &config.Config{}, fixedSubSelector{})
+			handler := NewHandler(logger.Development(), svc, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
+
+			body := fmt.Sprintf(`{"name": "test-key", "labels": %s}`, tt.labelsJSON)
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys", strings.NewReader(body))
+			c.Request.Header.Set("Content-Type", "application/json")
+			c.Set("user", &token.UserContext{
+				Username: "alice",
+				Groups:   []string{"data-science"},
+				Tenant:   "test-tenant",
+			})
+
+			handler.CreateAPIKey(c)
+
+			assert.Equal(t, tt.wantStatus, w.Code)
+
+			var errResp map[string]any
+			err := json.Unmarshal(w.Body.Bytes(), &errResp)
+			require.NoError(t, err)
+			assert.Contains(t, errResp["error"], tt.wantErr)
+		})
+	}
+}
+
+// TestCreateEphemeralKey_InvalidLabels verifies that label validation
+// is enforced for ephemeral keys with auto-generated names.
+func TestCreateEphemeralKey_InvalidLabels(t *testing.T) {
+	store := NewMockStore()
+	svc := NewService(store, &config.Config{}, fixedSubSelector{})
+	handler := NewHandler(logger.Development(), svc, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
+
+	body := fmt.Sprintf(`{"ephemeral": true, "labels": {"%s": "value"}}`, strings.Repeat("a", constant.MaxLabelKeyLength+1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys", strings.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("user", &token.UserContext{
+		Username: "alice",
+		Groups:   []string{"data-science"},
+		Tenant:   "test-tenant",
+	})
+
+	handler.CreateAPIKey(c)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	var errResp map[string]any
+	err := json.Unmarshal(w.Body.Bytes(), &errResp)
+	require.NoError(t, err)
+	assert.Contains(t, errResp["error"], fmt.Sprintf("exceeds %d characters", constant.MaxLabelKeyLength))
+}
+
+// Helper to generate JSON for large labels map.
+func makeLargeLabelsJSON(t *testing.T, count int) string {
+	t.Helper()
+	labels := makeLargeLabels(count)
+	bytes, err := json.Marshal(labels)
+	require.NoError(t, err)
+	return string(bytes)
+}
+
+// TestSearchAPIKeys_ByLabels tests searching API keys by label filters.
+func TestSearchAPIKeys_ByLabels(t *testing.T) {
+	ctx := context.Background()
+	store := NewMockStore()
+	svc := NewService(store, &config.Config{}, fixedSubSelector{})
+	handler := NewHandler(logger.Development(), svc, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
+
+	testUser := &token.UserContext{Username: "alice", Tenant: "test-tenant"}
+
+	// Create keys with different labels
+	err := store.AddKey(ctx, testUser.Username, "key-1", "hash-1", "Key 1", "",
+		[]string{}, testSubscriptionName, "test-tenant", nil, false,
+		map[string]string{"cmdb_id": "AST123", "env": "prod"})
+	require.NoError(t, err)
+
+	err = store.AddKey(ctx, testUser.Username, "key-2", "hash-2", "Key 2", "",
+		[]string{}, testSubscriptionName, "test-tenant", nil, false,
+		map[string]string{"cmdb_id": "AST456", "env": "dev"})
+	require.NoError(t, err)
+
+	err = store.AddKey(ctx, testUser.Username, "key-3", "hash-3", "Key 3", "",
+		[]string{}, testSubscriptionName, "test-tenant", nil, false,
+		map[string]string{"cost_center": "CC-001"})
+	require.NoError(t, err)
+
+	err = store.AddKey(ctx, testUser.Username, "key-4", "hash-4", "Key 4", "",
+		[]string{}, testSubscriptionName, "test-tenant", nil, false, nil) // No labels
+	require.NoError(t, err)
+
+	tests := []struct {
+		name          string
+		labelsContain map[string]string
+		wantIDs       []string
+	}{
+		{
+			name:          "search by cmdb_id exact match",
+			labelsContain: map[string]string{"cmdb_id": "AST123"},
+			wantIDs:       []string{"key-1"},
+		},
+		{
+			name:          "search by env",
+			labelsContain: map[string]string{"env": "prod"},
+			wantIDs:       []string{"key-1"},
+		},
+		{
+			name:          "search by cost_center",
+			labelsContain: map[string]string{"cost_center": "CC-001"},
+			wantIDs:       []string{"key-3"},
+		},
+		{
+			name:          "search by multiple labels (AND logic)",
+			labelsContain: map[string]string{"cmdb_id": "AST123", "env": "prod"},
+			wantIDs:       []string{"key-1"},
+		},
+		{
+			name:          "search with no matches",
+			labelsContain: map[string]string{"cmdb_id": "NONEXISTENT"},
+			wantIDs:       []string{},
+		},
+		{
+			name:          "search with empty filter returns all",
+			labelsContain: nil,
+			wantIDs:       []string{"key-1", "key-2", "key-3", "key-4"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reqBody := SearchAPIKeysRequest{
+				Filters: &SearchFilters{
+					LabelsContain: tt.labelsContain,
+				},
+			}
+			body, _ := json.Marshal(reqBody)
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys/search", strings.NewReader(string(body)))
+			c.Request.Header.Set("Content-Type", "application/json")
+			c.Set("user", testUser)
+
+			handler.SearchAPIKeys(c)
+
+			assert.Equal(t, http.StatusOK, w.Code)
+
+			var resp SearchAPIKeysResponse
+			err := json.Unmarshal(w.Body.Bytes(), &resp)
+			require.NoError(t, err)
+
+			gotIDs := make([]string, len(resp.Data))
+			for i, key := range resp.Data {
+				gotIDs[i] = key.ID
+			}
+
+			assert.ElementsMatch(t, tt.wantIDs, gotIDs)
+		})
+	}
+}
+
+// TestGetAPIKey_WithLabels tests retrieving an API key that has labels.
+func TestGetAPIKey_WithLabels(t *testing.T) {
+	ctx := context.Background()
+	store := NewMockStore()
+	svc := NewService(store, &config.Config{}, fixedSubSelector{})
+	handler := NewHandler(logger.Development(), svc, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
+
+	testUser := &token.UserContext{Username: "alice", Tenant: "test-tenant"}
+
+	labels := map[string]string{
+		"environment": "production",
+		"team":        "data-science",
+	}
+
+	err := store.AddKey(ctx, testUser.Username, "test-key-id", "hash", "Test Key", "Description",
+		[]string{}, testSubscriptionName, "test-tenant", nil, false, labels)
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/api-keys/test-key-id", nil)
+	c.Params = gin.Params{{Key: "id", Value: "test-key-id"}}
+	c.Set("user", testUser)
+
+	handler.GetAPIKey(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var key ApiKey
+	err = json.Unmarshal(w.Body.Bytes(), &key)
+	require.NoError(t, err)
+
+	assert.Equal(t, labels, key.Labels)
+}
+
+// TestSearchAPIKeys_InvalidLabelsContain verifies that labelsContain filters
+// in search requests are validated with the same rules as label creation.
+func TestSearchAPIKeys_InvalidLabelsContain(t *testing.T) {
+	tests := []struct {
+		name          string
+		labelsContain map[string]string
+		wantErr       string
+	}{
+		{
+			name:          "empty key",
+			labelsContain: map[string]string{"": "value"},
+			wantErr:       "label keys cannot be empty",
+		},
+		{
+			name:          "empty value",
+			labelsContain: map[string]string{"key": ""},
+			wantErr:       "cannot be empty",
+		},
+		{
+			name:          "too many labels",
+			labelsContain: makeLargeLabels(constant.MaxLabelsEntries + 1),
+			wantErr:       fmt.Sprintf("cannot exceed %d", constant.MaxLabelsEntries),
+		},
+		{
+			name:          "invalid key characters",
+			labelsContain: map[string]string{"invalid key!": "value"},
+			wantErr:       "invalid characters",
+		},
+		{
+			name:          "key too long",
+			labelsContain: map[string]string{strings.Repeat("a", constant.MaxLabelKeyLength+1): "value"},
+			wantErr:       fmt.Sprintf("exceeds %d characters", constant.MaxLabelKeyLength),
+		},
+		{
+			name:          "value too long",
+			labelsContain: map[string]string{"key": strings.Repeat("a", constant.MaxLabelValueLength+1)},
+			wantErr:       fmt.Sprintf("exceeds %d characters", constant.MaxLabelValueLength),
+		},
+		{
+			name:          "control characters in value",
+			labelsContain: map[string]string{"k": "val\x00ue"},
+			wantErr:       "contains invalid control characters",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewMockStore()
+			svc := NewService(store, &config.Config{}, fixedSubSelector{})
+			handler := NewHandler(logger.Development(), svc, newMockAdminChecker(), nil, noopSubscriptionAdminResolver{})
+
+			reqBody := SearchAPIKeysRequest{
+				Filters: &SearchFilters{
+					LabelsContain: tt.labelsContain,
+				},
+			}
+			body, err := json.Marshal(reqBody)
+			require.NoError(t, err)
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys/search", strings.NewReader(string(body)))
+			c.Request.Header.Set("Content-Type", "application/json")
+			c.Set("user", &token.UserContext{
+				Username: "alice",
+				Groups:   []string{"data-science"},
+				Tenant:   "test-tenant",
+			})
+
+			handler.SearchAPIKeys(c)
+
+			assert.Equal(t, http.StatusBadRequest, w.Code)
+
+			var errResp map[string]any
+			err = json.Unmarshal(w.Body.Bytes(), &errResp)
+			require.NoError(t, err)
+			assert.Contains(t, errResp["error"], tt.wantErr)
+		})
+	}
+}
+
+type noopSubscriptionAdminResolver struct{}
+
+func (noopSubscriptionAdminResolver) ResolveSubscriptionAdmin(
+	*token.VerifiedIdentity,
+	string,
+) (*subscription.AdminScope, error) {
+	return nil, nil
+}
+
+func (noopSubscriptionAdminResolver) ResolveSubscriptionAdminScopes(
+	*token.VerifiedIdentity,
+) ([]*subscription.AdminScope, error) {
+	return nil, nil
+}
+
+func (noopSubscriptionAdminResolver) CanonicalizeSubscription(requestedSubscription string) (string, error) {
+	return requestedSubscription, nil
+}
+
+type subscriptionAdminResolverStub struct {
+	scope          *subscription.AdminScope
+	scopes         []*subscription.AdminScope
+	err            error
+	calls          int
+	scopeCalls     int
+	canonical      map[string]string
+	canonicalErr   error
+	canonicalCalls int
+}
+
+func (r *subscriptionAdminResolverStub) ResolveSubscriptionAdmin(
+	_ *token.VerifiedIdentity,
+	requestedSubscription string,
+) (*subscription.AdminScope, error) {
+	r.calls++
+	_ = requestedSubscription
+	if r.err != nil {
+		return nil, r.err
+	}
+	return r.scope, nil
+}
+
+func (r *subscriptionAdminResolverStub) ResolveSubscriptionAdminScopes(
+	*token.VerifiedIdentity,
+) ([]*subscription.AdminScope, error) {
+	r.scopeCalls++
+	if r.err != nil {
+		return nil, r.err
+	}
+	return r.scopes, nil
+}
+
+func (r *subscriptionAdminResolverStub) CanonicalizeSubscription(requestedSubscription string) (string, error) {
+	r.canonicalCalls++
+	if r.canonicalErr != nil {
+		return "", r.canonicalErr
+	}
+	if canonical, found := r.canonical[requestedSubscription]; found {
+		return canonical, nil
+	}
+	return requestedSubscription, nil
+}
+
+const subscriptionAdminIdentity = `{
+  "source": "oidc",
+  "claims": {
+    "iss": "https://issuer.example.com",
+    "sub": "admin-subject",
+    "aud": "maas-api",
+    "azp": "maas-client",
+    "preferred_username": "alice",
+    "org_id": "42c3e46f-2477-44d7-a85b-d3b43f6b31fa",
+    "roles": ["admins"]
+  }
+}`
+
+func verifiedIdentityForSubscriptionAdmin() *token.VerifiedIdentity {
+	var identity token.VerifiedIdentity
+	if err := json.Unmarshal([]byte(subscriptionAdminIdentity), &identity); err != nil {
+		panic(err)
+	}
+	return &identity
+}
+
+func addSubscriptionAdminTestKey(
+	t *testing.T,
+	store *MockStore,
+	id,
+	username,
+	subscription string,
+) {
+	t.Helper()
+	err := store.AddKey(
+		context.Background(),
+		username,
+		id,
+		"hash-"+id,
+		"Key "+id,
+		"",
+		[]string{},
+		subscription,
+		"test-tenant",
+		nil,
+		false,
+		nil,
+	)
+	require.NoError(t, err)
+}
+
+func TestSearchAPIKeys_SubscriptionAdminUsesCanonicalScope(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	addSubscriptionAdminTestKey(t, store, "alice-a", "alice", "subscription-a")
+	addSubscriptionAdminTestKey(t, store, "alice-b", "alice", "subscription-b")
+	addSubscriptionAdminTestKey(t, store, "bob-a", "bob", "subscription-a")
+	addSubscriptionAdminTestKey(t, store, "bob-b", "bob", "subscription-b")
+
+	resolver := &subscriptionAdminResolverStub{scope: &subscription.AdminScope{
+		Tenant:       "test-tenant",
+		Namespace:    "test-ns",
+		Subscription: "subscription-a",
+	}}
+	handler := NewHandler(
+		logger.Development(),
+		NewService(store, &config.Config{}, fixedSubSelector{}),
+		newMockAdminChecker(),
+		nil,
+		resolver,
+	)
+
+	requestedSubscription := "test-ns/subscription-a"
+	body, err := json.Marshal(SearchAPIKeysRequest{
+		Filters: &SearchFilters{Subscription: &requestedSubscription},
+	})
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys/search", strings.NewReader(string(body)))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("user", &token.UserContext{Username: "alice", Tenant: "test-tenant"})
+	c.Set("verified_identity", verifiedIdentityForSubscriptionAdmin())
+
+	handler.SearchAPIKeys(c)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var response SearchAPIKeysResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	gotIDs := make([]string, 0, len(response.Data))
+	for _, key := range response.Data {
+		gotIDs = append(gotIDs, key.ID)
+	}
+	assert.ElementsMatch(t, []string{"alice-a", "bob-a"}, gotIDs)
+	require.Equal(t, 1, resolver.calls)
+}
+
+func TestSearchAPIKeys_SubscriptionAdminSelfUsernameUsesCanonicalScope(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	addSubscriptionAdminTestKey(t, store, "alice-a", "alice", "subscription-a")
+	addSubscriptionAdminTestKey(t, store, "alice-b", "alice", "subscription-b")
+
+	resolver := &subscriptionAdminResolverStub{scope: &subscription.AdminScope{
+		Tenant:         "test-tenant",
+		Namespace:      "test-ns",
+		Subscription:   "subscription-a",
+		OrganizationID: "42c3e46f-2477-44d7-a85b-d3b43f6b31fa",
+	}}
+	handler := NewHandler(
+		logger.Development(),
+		NewService(store, &config.Config{}, fixedSubSelector{}),
+		newMockAdminChecker(),
+		nil,
+		resolver,
+	)
+
+	requestedSubscription := "test-ns/subscription-a"
+	body, err := json.Marshal(SearchAPIKeysRequest{
+		Filters: &SearchFilters{
+			Username:     "alice",
+			Subscription: &requestedSubscription,
+		},
+	})
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys/search", strings.NewReader(string(body)))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("user", &token.UserContext{Username: "alice", Tenant: "test-tenant"})
+	c.Set("verified_identity", verifiedIdentityForSubscriptionAdmin())
+
+	handler.SearchAPIKeys(c)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var response SearchAPIKeysResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Len(t, response.Data, 1)
+	assert.Equal(t, "alice-a", response.Data[0].ID)
+	require.Equal(t, 1, resolver.calls)
+}
+
+func TestSearchAndBulkRevoke_PlatformAdminCanonicalizesSubscriptionAlias(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	addSubscriptionAdminTestKey(t, store, "alice-a", "alice", "subscription-a")
+	addSubscriptionAdminTestKey(t, store, "bob-b", "bob", "subscription-b")
+
+	resolver := &subscriptionAdminResolverStub{
+		canonical: map[string]string{"test-ns/subscription-a": "subscription-a"},
+	}
+	handler := NewHandler(
+		logger.Development(),
+		NewService(store, &config.Config{}, fixedSubSelector{}),
+		newMockAdminChecker(),
+		nil,
+		resolver,
+	)
+	platformAdmin := &token.UserContext{
+		Username: "admin",
+		Groups:   []string{"admin-users"},
+		Tenant:   "test-tenant",
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/v1/api-keys/search",
+		strings.NewReader(`{"filters":{"subscription":"test-ns/subscription-a"}}`),
+	)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("user", platformAdmin)
+	handler.SearchAPIKeys(c)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var searchResponse SearchAPIKeysResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &searchResponse))
+	require.Len(t, searchResponse.Data, 1)
+	assert.Equal(t, "alice-a", searchResponse.Data[0].ID)
+
+	w = httptest.NewRecorder()
+	c, _ = gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/v1/api-keys/bulk-revoke",
+		strings.NewReader(`{"subscription":"test-ns/subscription-a","dryRun":true}`),
+	)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("user", platformAdmin)
+	handler.BulkRevokeAPIKeys(c)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var revokeResponse BulkRevokeResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &revokeResponse))
+	assert.Equal(t, 1, revokeResponse.RevokedCount)
+	assert.True(t, revokeResponse.DryRun)
+	assert.Equal(t, 0, resolver.calls)
+	assert.Equal(t, 2, resolver.canonicalCalls)
+}
+
+func TestSearchAPIKeys_OwnerSubscriptionResolutionErrorReturnsEmptyResult(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	for _, code := range []string{"not_found", "ambiguous_subscription"} {
+		t.Run(code, func(t *testing.T) {
+			store := NewMockStore()
+			addSubscriptionAdminTestKey(t, store, "alice-a", "alice", "subscription-a")
+			resolver := &subscriptionAdminResolverStub{
+				canonicalErr: &subscription.SubscriptionAdminError{
+					Code:    code,
+					Message: code,
+				},
+			}
+			handler := NewHandler(
+				logger.Development(),
+				NewService(store, &config.Config{}, fixedSubSelector{}),
+				newMockAdminChecker(),
+				nil,
+				resolver,
+			)
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(
+				http.MethodPost,
+				"/v1/api-keys/search",
+				strings.NewReader(`{"filters":{"subscription":"test-ns/unknown"}}`),
+			)
+			c.Request.Header.Set("Content-Type", "application/json")
+			c.Set("user", &token.UserContext{Username: "alice", Tenant: "test-tenant"})
+
+			handler.SearchAPIKeys(c)
+
+			require.Equal(t, http.StatusOK, w.Code)
+			var response SearchAPIKeysResponse
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+			assert.Empty(t, response.Data)
+			require.Equal(t, 1, resolver.canonicalCalls)
+		})
+	}
+}
+
+func TestDelegatedAdminAuditFieldsIncludeAuthorizationScope(t *testing.T) {
+	user := &token.UserContext{Username: "alice", Tenant: "test-tenant"}
+	identity := verifiedIdentityForSubscriptionAdmin()
+	scope := &subscription.AdminScope{
+		Tenant:         "test-tenant",
+		Namespace:      "test-ns",
+		Subscription:   "subscription-a",
+		OrganizationID: "42c3e46f-2477-44d7-a85b-d3b43f6b31fa",
+	}
+
+	fields := delegatedAdminAuditFields(delegatedAdminAuditEvent{
+		Action:         "api-key-revoke",
+		Outcome:        "allowed",
+		User:           user,
+		Identity:       identity,
+		Scope:          scope,
+		KeyID:          "bob-a",
+		TargetUsername: "bob",
+	}, "request-123")
+
+	require.Zero(t, len(fields)%2)
+	values := make(map[string]any, len(fields)/2)
+	for index := 0; index < len(fields); index += 2 {
+		key, ok := fields[index].(string)
+		require.True(t, ok)
+		values[key] = fields[index+1]
+	}
+
+	assert.Equal(t, "api-key-revoke", values["audit.action"])
+	assert.Equal(t, "delegated-subscription-admin", values["audit.authorizationPath"])
+	assert.Equal(t, "test-tenant", values["audit.tenant"])
+	assert.Equal(t, "test-ns", values["audit.namespace"])
+	assert.NotEmpty(t, values["audit.targetSubscription"])
+	assert.Equal(t, "42c3e46f-2477-44d7-a85b-d3b43f6b31fa", values["audit.organizationId"])
+	assert.Equal(t, "allowed", values["audit.outcome"])
+	assert.Equal(t, "request-123", values["audit.requestId"])
+	assert.Contains(t, values, "audit.actor")
+	assert.Equal(t, "https://issuer.example.com", values["audit.actorIssuer"])
+	assert.Contains(t, values, "audit.actorSubject")
+	assert.Contains(t, values, "audit.targetUser")
+	assert.Contains(t, values, "audit.keyId")
+}
+
+func TestDelegatedAdminAuditFieldsIncludeFallbackAuthorizationPath(t *testing.T) {
+	fields := delegatedAdminAuditFields(delegatedAdminAuditEvent{
+		AuthorizationPath:  "platform-admin-fallback",
+		Action:             "api-key-get",
+		Outcome:            "allowed",
+		Reason:             "platform_admin_fallback",
+		User:               &token.UserContext{Username: "admin", Tenant: "test-tenant"},
+		KeyID:              "bob-a",
+		TargetUsername:     "bob",
+		TargetSubscription: "subscription-a",
+	}, "request-123")
+
+	require.Zero(t, len(fields)%2)
+	values := make(map[string]any, len(fields)/2)
+	for index := 0; index < len(fields); index += 2 {
+		key, ok := fields[index].(string)
+		require.True(t, ok)
+		values[key] = fields[index+1]
+	}
+
+	assert.Equal(t, "platform-admin-fallback", values["audit.authorizationPath"])
+	assert.Equal(t, "allowed", values["audit.outcome"])
+	assert.Equal(t, "platform_admin_fallback", values["audit.reason"])
+	assert.Contains(t, values, "audit.targetUser")
+}
+
+func capturedLogger(t *testing.T) (*logger.Logger, func() string) {
+	t.Helper()
+
+	reader, writer, err := os.Pipe()
+	require.NoError(t, err)
+	originalStdout := os.Stdout
+	os.Stdout = writer
+	captured := logger.NewWithFormat(false, logger.FormatZap)
+	os.Stdout = originalStdout
+
+	t.Cleanup(func() {
+		_ = writer.Close()
+		_ = reader.Close()
+	})
+
+	return captured, func() string {
+		require.NoError(t, writer.Close())
+		output, err := io.ReadAll(reader)
+		require.NoError(t, err)
+		return string(output)
+	}
+}
+
+func requireDelegatedAudit(t *testing.T, output string) map[string]any {
+	t.Helper()
+
+	for line := range strings.SplitSeq(output, "\n") {
+		if !strings.Contains(line, "AUDIT delegated API key administration") {
+			continue
+		}
+		audit := map[string]any{}
+		require.NoError(t, json.Unmarshal([]byte(line), &audit))
+		return audit
+	}
+	t.Fatal("delegated API key administration audit was not emitted")
+	return nil
+}
+
+func newSubscriptionAdminAuditHandler(
+	log *logger.Logger,
+	store MetadataStore,
+	resolver *subscriptionAdminResolverStub,
+) *Handler {
+	return NewHandler(
+		log,
+		NewService(store, &config.Config{}, fixedSubSelector{}),
+		newMockAdminChecker(),
+		nil,
+		resolver,
+	)
+}
+
+func executeSubscriptionAdminAuditRequest(
+	t *testing.T,
+	handler *Handler,
+	method string,
+	path string,
+	body string,
+	invoke func(*Handler, *gin.Context),
+) *httptest.ResponseRecorder {
+	t.Helper()
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(method, path, strings.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Params = gin.Params{{Key: "id", Value: "key-a"}}
+	c.Set("user", &token.UserContext{
+		Username: "alice",
+		Groups:   []string{"admin-users"},
+		Tenant:   "test-tenant",
+	})
+	c.Set("verified_identity", verifiedIdentityForSubscriptionAdmin())
+	invoke(handler, c)
+	return w
+}
+
+func TestIsAuthorizedForKey_DeferredAuditAndResolverError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	t.Run("authorized event is not emitted before the operation", func(t *testing.T) {
+		log, output := capturedLogger(t)
+		handler := NewHandler(
+			log,
+			NewService(NewMockStore(), &config.Config{}, fixedSubSelector{}),
+			newMockAdminChecker(),
+			nil,
+			&subscriptionAdminResolverStub{scope: &subscription.AdminScope{
+				Tenant:       "test-tenant",
+				Namespace:    "test-ns",
+				Subscription: "subscription-a",
+			}},
+		)
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/v1/api-keys/key-a", nil)
+		user := &token.UserContext{Username: "alice", Tenant: "test-tenant"}
+		key := &ApiKey{ID: "key-a", Username: "bob", Subscription: "subscription-a", Tenant: "test-tenant"}
+
+		authorized, audit, err := handler.isAuthorizedForKey(
+			context.Background(),
+			user,
+			verifiedIdentityForSubscriptionAdmin(),
+			key,
+			"api-key-get",
+		)
+
+		require.NoError(t, err)
+		assert.True(t, authorized)
+		require.NotNil(t, audit)
+		assert.Equal(t, "allowed", audit.Outcome)
+		assert.Empty(t, output())
+	})
+
+	t.Run("resolver error returns an error outcome without emitting early", func(t *testing.T) {
+		log, output := capturedLogger(t)
+		resolveErr := errors.New("resolver unavailable")
+		handler := NewHandler(
+			log,
+			NewService(NewMockStore(), &config.Config{}, fixedSubSelector{}),
+			newMockAdminChecker(),
+			nil,
+			&subscriptionAdminResolverStub{err: resolveErr},
+		)
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/v1/api-keys/key-a", nil)
+		user := &token.UserContext{Username: "alice", Tenant: "test-tenant"}
+		key := &ApiKey{ID: "key-a", Username: "bob", Subscription: "subscription-a", Tenant: "test-tenant"}
+
+		authorized, audit, err := handler.isAuthorizedForKey(
+			context.Background(),
+			user,
+			verifiedIdentityForSubscriptionAdmin(),
+			key,
+			"api-key-get",
+		)
+
+		require.ErrorIs(t, err, resolveErr)
+		assert.False(t, authorized)
+		require.NotNil(t, audit)
+		assert.Equal(t, "error", audit.Outcome)
+		assert.Equal(t, "resolution_error", audit.Reason)
+		assert.Empty(t, output())
+	})
+}
+
+func TestSearchAPIKeys_SubscriptionAdminServiceFailureAuditsError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	log, output := capturedLogger(t)
+	store := failingSearchStore{MockStore: NewMockStore(), err: errors.New("search unavailable")}
+	handler := newSubscriptionAdminAuditHandler(log, store, &subscriptionAdminResolverStub{
+		scope: &subscription.AdminScope{
+			Tenant:       "test-tenant",
+			Namespace:    "test-ns",
+			Subscription: "subscription-a",
+		},
+	})
+
+	w := executeSubscriptionAdminAuditRequest(
+		t,
+		handler,
+		http.MethodPost,
+		"/v1/api-keys/search",
+		`{"filters":{"subscription":"test-ns/subscription-a"}}`,
+		func(handler *Handler, c *gin.Context) {
+			handler.SearchAPIKeys(c)
+		},
+	)
+
+	require.Equal(t, http.StatusInternalServerError, w.Code)
+	audit := requireDelegatedAudit(t, output())
+	assert.Equal(t, "api-key-search", audit["audit.action"])
+	assert.Equal(t, "error", audit["audit.outcome"])
+	assert.Equal(t, "request_failed", audit["audit.reason"])
+}
+
+func TestBulkRevokeAPIKeys_SubscriptionAdminServiceFailureAuditsError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	log, output := capturedLogger(t)
+	store := failingBulkRevokeStore{MockStore: NewMockStore(), err: errors.New("bulk revoke unavailable")}
+	handler := newSubscriptionAdminAuditHandler(log, store, &subscriptionAdminResolverStub{
+		scope: &subscription.AdminScope{
+			Tenant:       "test-tenant",
+			Namespace:    "test-ns",
+			Subscription: "subscription-a",
+		},
+	})
+
+	w := executeSubscriptionAdminAuditRequest(
+		t,
+		handler,
+		http.MethodPost,
+		"/v1/api-keys/bulk-revoke",
+		`{"subscription":"test-ns/subscription-a"}`,
+		func(handler *Handler, c *gin.Context) {
+			handler.BulkRevokeAPIKeys(c)
+		},
+	)
+
+	require.Equal(t, http.StatusInternalServerError, w.Code)
+	audit := requireDelegatedAudit(t, output())
+	assert.Equal(t, "api-key-bulk-revoke", audit["audit.action"])
+	assert.Equal(t, "error", audit["audit.outcome"])
+	assert.Equal(t, "request_failed", audit["audit.reason"])
+}
+
+func TestBulkRevokeAPIKeys_DryRunPreservesFallbackReasonAndMarksDryRun(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	log, output := capturedLogger(t)
+	store := NewMockStore()
+	addSubscriptionAdminTestKey(t, store, "key-a", "bob", "subscription-a")
+	handler := newSubscriptionAdminAuditHandler(log, store, &subscriptionAdminResolverStub{
+		canonical: map[string]string{"test-ns/subscription-a": "subscription-a"},
+	})
+
+	w := executeSubscriptionAdminAuditRequest(
+		t,
+		handler,
+		http.MethodPost,
+		"/v1/api-keys/bulk-revoke",
+		`{"subscription":"test-ns/subscription-a","dryRun":true}`,
+		func(handler *Handler, c *gin.Context) {
+			handler.BulkRevokeAPIKeys(c)
+		},
+	)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	audit := requireDelegatedAudit(t, output())
+	assert.Equal(t, "allowed", audit["audit.outcome"])
+	assert.Equal(t, "platform_admin_fallback", audit["audit.reason"])
+	assert.Equal(t, true, audit["audit.dryRun"])
+}
+
+func TestRevokeAPIKeys_MetadataFailurePreservesSuccessfulRevocation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	log, output := capturedLogger(t)
+	store := &failingRevokedMetadataStore{
+		MockStore: NewMockStore(),
+		err:       errors.New("metadata unavailable"),
+	}
+	addSubscriptionAdminTestKey(t, store.MockStore, "key-a", "bob", "subscription-a")
+	handler := newSubscriptionAdminAuditHandler(log, store, &subscriptionAdminResolverStub{
+		scope: &subscription.AdminScope{
+			Tenant:       "test-tenant",
+			Namespace:    "test-ns",
+			Subscription: "subscription-a",
+		},
+	})
+
+	w := executeSubscriptionAdminAuditRequest(
+		t,
+		handler,
+		http.MethodDelete,
+		"/v1/api-keys/key-a",
+		"",
+		func(handler *Handler, c *gin.Context) {
+			handler.RevokeAPIKey(c)
+		},
+	)
+
+	require.Equal(t, http.StatusInternalServerError, w.Code)
+	audit := requireDelegatedAudit(t, output())
+	assert.Equal(t, "allowed", audit["audit.outcome"])
+	assert.Equal(t, "metadata_retrieval_failed", audit["audit.reason"])
+	key, err := store.MockStore.Get(context.Background(), "key-a")
+	require.NoError(t, err)
+	assert.Equal(t, StatusRevoked, key.Status)
+}
+
+func TestSearchAPIKeys_SubscriptionAdminWithoutSubscriptionUnionsAdministeredScopes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	addSubscriptionAdminTestKey(t, store, "alice-a", "alice", "subscription-a")
+	addSubscriptionAdminTestKey(t, store, "bob-a", "bob", "subscription-a")
+	addSubscriptionAdminTestKey(t, store, "bob-b", "bob", "subscription-b")
+	addSubscriptionAdminTestKey(t, store, "alice-other", "alice", "subscription-other")
+
+	resolver := &subscriptionAdminResolverStub{scopes: []*subscription.AdminScope{
+		{
+			Tenant:       "test-tenant",
+			Namespace:    "test-ns",
+			Subscription: "subscription-a",
+		},
+		{
+			Tenant:       "test-tenant",
+			Namespace:    "test-ns",
+			Subscription: "subscription-b",
+		},
+	}}
+	handler := NewHandler(
+		logger.Development(),
+		NewService(store, &config.Config{}, fixedSubSelector{}),
+		newMockAdminChecker(),
+		nil,
+		resolver,
+	)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys/search", strings.NewReader(`{}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("user", &token.UserContext{Username: "alice", Tenant: "test-tenant"})
+	c.Set("verified_identity", verifiedIdentityForSubscriptionAdmin())
+
+	handler.SearchAPIKeys(c)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var response SearchAPIKeysResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	gotIDs := make([]string, 0, len(response.Data))
+	for _, key := range response.Data {
+		gotIDs = append(gotIDs, key.ID)
+	}
+	assert.ElementsMatch(t, []string{"alice-a", "bob-a", "bob-b"}, gotIDs)
+	assert.Equal(t, 0, resolver.calls)
+	assert.Equal(t, 1, resolver.scopeCalls)
+}
+
+func TestSearchAPIKeys_SubscriptionAdminWithoutOrganizationUsesSelfService(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	addSubscriptionAdminTestKey(t, store, "alice-a", "alice", "subscription-a")
+	addSubscriptionAdminTestKey(t, store, "bob-a", "bob", "subscription-b")
+	resolver := subscription.NewSelector(
+		logger.Development(),
+		nil,
+		nil,
+		nil,
+		subscription.WithTenantName("test-tenant"),
+	)
+	handler := NewHandler(
+		logger.Development(),
+		NewService(store, &config.Config{}, fixedSubSelector{}),
+		newMockAdminChecker(),
+		nil,
+		resolver,
+	)
+	identity := verifiedIdentityForSubscriptionAdmin()
+	identity.Claims.OrgID = ""
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys/search", strings.NewReader(`{}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("user", &token.UserContext{Username: "alice", Tenant: "test-tenant"})
+	c.Set("verified_identity", identity)
+
+	handler.SearchAPIKeys(c)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var response SearchAPIKeysResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Len(t, response.Data, 1)
+	assert.Equal(t, "alice-a", response.Data[0].ID)
+}
+
+func TestSearchAPIKeys_SubscriptionAdminWithoutSubscriptionFiltersUsername(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	addSubscriptionAdminTestKey(t, store, "alice-a", "alice", "subscription-a")
+	addSubscriptionAdminTestKey(t, store, "bob-a", "bob", "subscription-a")
+	addSubscriptionAdminTestKey(t, store, "bob-b", "bob", "subscription-b")
+
+	resolver := &subscriptionAdminResolverStub{scopes: []*subscription.AdminScope{
+		{
+			Tenant:       "test-tenant",
+			Namespace:    "test-ns",
+			Subscription: "subscription-a",
+		},
+		{
+			Tenant:       "test-tenant",
+			Namespace:    "test-ns",
+			Subscription: "subscription-b",
+		},
+	}}
+	handler := NewHandler(
+		logger.Development(),
+		NewService(store, &config.Config{}, fixedSubSelector{}),
+		newMockAdminChecker(),
+		nil,
+		resolver,
+	)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/v1/api-keys/search",
+		strings.NewReader(`{"filters":{"username":"bob"}}`),
+	)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("user", &token.UserContext{Username: "alice", Tenant: "test-tenant"})
+	c.Set("verified_identity", verifiedIdentityForSubscriptionAdmin())
+
+	handler.SearchAPIKeys(c)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var response SearchAPIKeysResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	gotIDs := make([]string, 0, len(response.Data))
+	for _, key := range response.Data {
+		gotIDs = append(gotIDs, key.ID)
+	}
+	assert.ElementsMatch(t, []string{"bob-a", "bob-b"}, gotIDs)
+}
+
+func TestSearchAPIKeys_PlatformAdminWithoutSubscriptionKeepsTenantScope(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	addSubscriptionAdminTestKey(t, store, "alice-a", "alice", "subscription-a")
+	addSubscriptionAdminTestKey(t, store, "bob-a", "bob", "subscription-a")
+	addSubscriptionAdminTestKey(t, store, "other-a", "other", "subscription-other")
+
+	resolver := &subscriptionAdminResolverStub{scopes: []*subscription.AdminScope{{
+		Tenant:       "test-tenant",
+		Namespace:    "test-ns",
+		Subscription: "subscription-a",
+	}}}
+	handler := NewHandler(
+		logger.Development(),
+		NewService(store, &config.Config{}, fixedSubSelector{}),
+		newMockAdminChecker(),
+		nil,
+		resolver,
+	)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys/search", strings.NewReader(`{}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("user", &token.UserContext{
+		Username: "alice",
+		Groups:   []string{"admin-users"},
+		Tenant:   "test-tenant",
+	})
+	c.Set("verified_identity", verifiedIdentityForSubscriptionAdmin())
+
+	handler.SearchAPIKeys(c)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var response SearchAPIKeysResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	gotIDs := make([]string, 0, len(response.Data))
+	for _, key := range response.Data {
+		gotIDs = append(gotIDs, key.ID)
+	}
+	assert.ElementsMatch(t, []string{"alice-a", "bob-a", "other-a"}, gotIDs)
+	assert.Equal(t, 0, resolver.scopeCalls)
+}
+
+func TestSearchAPIKeys_SubscriptionAdminWhitespaceSubscriptionUsesUnion(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	addSubscriptionAdminTestKey(t, store, "alice-a", "alice", "subscription-a")
+	addSubscriptionAdminTestKey(t, store, "bob-a", "bob", "subscription-a")
+
+	resolver := &subscriptionAdminResolverStub{scopes: []*subscription.AdminScope{{
+		Tenant:       "test-tenant",
+		Namespace:    "test-ns",
+		Subscription: "subscription-a",
+	}}}
+	handler := NewHandler(
+		logger.Development(),
+		NewService(store, &config.Config{}, fixedSubSelector{}),
+		newMockAdminChecker(),
+		nil,
+		resolver,
+	)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/v1/api-keys/search",
+		strings.NewReader(`{"filters":{"subscription":"   "}}`),
+	)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("user", &token.UserContext{Username: "alice", Tenant: "test-tenant"})
+	c.Set("verified_identity", verifiedIdentityForSubscriptionAdmin())
+
+	handler.SearchAPIKeys(c)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var response SearchAPIKeysResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	gotIDs := make([]string, 0, len(response.Data))
+	for _, key := range response.Data {
+		gotIDs = append(gotIDs, key.ID)
+	}
+	assert.ElementsMatch(t, []string{"alice-a", "bob-a"}, gotIDs)
+	assert.Equal(t, 0, resolver.calls)
+	assert.Equal(t, 1, resolver.scopeCalls)
+}
+
+func TestSearchAPIKeys_EmptyResultsSerializeAsArray(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := NewHandler(
+		logger.Development(),
+		NewService(&emptySearchResultStore{MockStore: NewMockStore()}, &config.Config{}, fixedSubSelector{}),
+		newMockAdminChecker(),
+		nil,
+		noopSubscriptionAdminResolver{},
+	)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys/search", strings.NewReader(`{}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("user", &token.UserContext{Username: "alice", Tenant: "test-tenant"})
+
+	handler.SearchAPIKeys(c)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var response struct {
+		Data json.RawMessage `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.NotNil(t, response.Data)
+	assert.JSONEq(t, `[]`, string(response.Data))
+}
+
+func TestSearchAPIKeys_SubscriptionAdminNotFoundMatchesUnauthorizedSubscription(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name string
+		code string
+	}{
+		{name: "not found", code: "not_found"},
+		{name: "unauthorized", code: "access_denied"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			adminErr := &subscription.SubscriptionAdminError{
+				Code:    test.code,
+				Message: "requested subscription was not found",
+			}
+			log, output := capturedLogger(t)
+			handler := newSubscriptionAdminAuditHandler(
+				log,
+				NewMockStore(),
+				&subscriptionAdminResolverStub{err: adminErr, canonicalErr: adminErr},
+			)
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(
+				http.MethodPost,
+				"/v1/api-keys/search",
+				strings.NewReader(`{"filters":{"subscription":"other-tenant/subscription-a"}}`),
+			)
+			c.Request.Header.Set("Content-Type", "application/json")
+			c.Set("user", &token.UserContext{Username: "alice", Tenant: "test-tenant"})
+			c.Set("verified_identity", verifiedIdentityForSubscriptionAdmin())
+			handler.SearchAPIKeys(c)
+
+			require.Equal(t, http.StatusOK, w.Code)
+			var response SearchAPIKeysResponse
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+			assert.Empty(t, response.Data)
+			audit := requireDelegatedAudit(t, output())
+			assert.Equal(t, test.code, audit["audit.reason"])
+		})
+	}
+}
+
+func TestSearchAPIKeys_SubscriptionAdminNotFoundWithOtherUsernameIsForbidden(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	adminErr := &subscription.SubscriptionAdminError{
+		Code:    "not_found",
+		Message: "requested subscription was not found",
+	}
+	handler := newSubscriptionAdminAuditHandler(
+		logger.Development(),
+		NewMockStore(),
+		&subscriptionAdminResolverStub{err: adminErr, canonicalErr: adminErr},
+	)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/v1/api-keys/search",
+		strings.NewReader(`{"filters":{"subscription":"other-tenant/subscription-a","username":"bob"}}`),
+	)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("user", &token.UserContext{Username: "alice", Tenant: "test-tenant"})
+	c.Set("verified_identity", verifiedIdentityForSubscriptionAdmin())
+	handler.SearchAPIKeys(c)
+
+	require.Equal(t, http.StatusForbidden, w.Code)
+	assert.JSONEq(t, `{"error":"non-admin users can only search their own API keys"}`, w.Body.String())
+}
+
+func TestGetAndRevokeAPIKey_SubscriptionAdminUsesStoredBinding(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	addSubscriptionAdminTestKey(t, store, "bob-a", "bob", "subscription-a")
+	addSubscriptionAdminTestKey(t, store, "bob-b", "bob", "subscription-b")
+
+	resolver := &subscriptionAdminResolverStub{scope: &subscription.AdminScope{
+		Tenant:       "test-tenant",
+		Namespace:    "test-ns",
+		Subscription: "subscription-a",
+	}}
+	handler := NewHandler(
+		logger.Development(),
+		NewService(store, &config.Config{}, fixedSubSelector{}),
+		newMockAdminChecker(),
+		nil,
+		resolver,
+	)
+
+	tests := []struct {
+		name       string
+		keyID      string
+		method     string
+		wantStatus int
+	}{
+		{name: "admin gets authorized key metadata", keyID: "bob-a", method: http.MethodGet, wantStatus: http.StatusOK},
+		{name: "admin cannot escape stored subscription binding", keyID: "bob-b", method: http.MethodGet, wantStatus: http.StatusNotFound},
+		{name: "admin revokes authorized key", keyID: "bob-a", method: http.MethodDelete, wantStatus: http.StatusOK},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(tt.method, "/v1/api-keys/"+tt.keyID, nil)
+			c.Params = gin.Params{{Key: "id", Value: tt.keyID}}
+			c.Set("user", &token.UserContext{Username: "alice", Tenant: "test-tenant"})
+			c.Set("verified_identity", verifiedIdentityForSubscriptionAdmin())
+
+			if tt.method == http.MethodGet {
+				handler.GetAPIKey(c)
+			} else {
+				handler.RevokeAPIKey(c)
+			}
+
+			require.Equal(t, tt.wantStatus, w.Code)
+			if tt.method == http.MethodDelete && tt.wantStatus == http.StatusOK {
+				key, err := store.Get(context.Background(), tt.keyID)
+				require.NoError(t, err)
+				assert.Equal(t, StatusRevoked, key.Status)
+			}
+		})
+	}
+}
+
+func TestGetAPIKey_APIKeyCallerDoesNotUseSSOOrganizationAdmin(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	addSubscriptionAdminTestKey(t, store, "bob-a", "bob", "subscription-a")
+	resolver := &subscriptionAdminResolverStub{scope: &subscription.AdminScope{
+		Tenant:       "test-tenant",
+		Namespace:    "test-ns",
+		Subscription: "subscription-a",
+	}}
+	handler := NewHandler(
+		logger.Development(),
+		NewService(store, &config.Config{}, fixedSubSelector{}),
+		newMockAdminChecker(),
+		nil,
+		resolver,
+	)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/api-keys/bob-a", nil)
+	c.Params = gin.Params{{Key: "id", Value: "bob-a"}}
+	c.Set("user", &token.UserContext{
+		Username: "alice",
+		Groups:   []string{"42c3e46f-2477-44d7-a85b-d3b43f6b31fa/admins"},
+		Tenant:   "test-tenant",
+	})
+
+	handler.GetAPIKey(c)
+
+	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.Zero(t, resolver.calls)
+}
+
+func TestGetAPIKey_PlatformAdminFallsBackWhenSubscriptionAdminDenied(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	addSubscriptionAdminTestKey(t, store, "bob-a", "bob", "subscription-a")
+
+	resolver := &subscriptionAdminResolverStub{err: &subscription.SubscriptionAdminError{
+		Code:    "access_denied",
+		Message: "organization administration is denied",
+	}}
+	handler := NewHandler(
+		logger.Development(),
+		NewService(store, &config.Config{}, fixedSubSelector{}),
+		newMockAdminChecker(),
+		nil,
+		resolver,
+	)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/api-keys/bob-a", nil)
+	c.Params = gin.Params{{Key: "id", Value: "bob-a"}}
+	c.Set("user", &token.UserContext{
+		Username: "alice",
+		Groups:   []string{"admin-users"},
+		Tenant:   "test-tenant",
+	})
+	c.Set("verified_identity", verifiedIdentityForSubscriptionAdmin())
+
+	handler.GetAPIKey(c)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var key ApiKey
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &key))
+	assert.Equal(t, "bob-a", key.ID)
+	assert.Equal(t, 1, resolver.calls)
+}
+
+func TestBulkRevokeAPIKeys_SubscriptionAdminScopeIsConsistent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	addSubscriptionAdminTestKey(t, store, "alice-a", "alice", "subscription-a")
+	addSubscriptionAdminTestKey(t, store, "bob-a", "bob", "subscription-a")
+	addSubscriptionAdminTestKey(t, store, "bob-b", "bob", "subscription-b")
+
+	resolver := &subscriptionAdminResolverStub{scope: &subscription.AdminScope{
+		Tenant:       "test-tenant",
+		Namespace:    "test-ns",
+		Subscription: "subscription-a",
+	}}
+	handler := NewHandler(
+		logger.Development(),
+		NewService(store, &config.Config{}, fixedSubSelector{}),
+		newMockAdminChecker(),
+		nil,
+		resolver,
+	)
+
+	executeBulkRevoke := func(t *testing.T, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/api-keys/bulk-revoke", strings.NewReader(body))
+		c.Request.Header.Set("Content-Type", "application/json")
+		c.Set("user", &token.UserContext{Username: "alice", Tenant: "test-tenant"})
+		c.Set("verified_identity", verifiedIdentityForSubscriptionAdmin())
+		handler.BulkRevokeAPIKeys(c)
+		return w
+	}
+
+	w := executeBulkRevoke(t, `{"subscription":"test-ns/subscription-a","dryRun":true}`)
+	require.Equal(t, http.StatusOK, w.Code)
+	var dryRun BulkRevokeResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &dryRun))
+	assert.Equal(t, 2, dryRun.RevokedCount)
+	assert.True(t, dryRun.DryRun)
+
+	w = executeBulkRevoke(t, `{"subscription":"test-ns/subscription-a"}`)
+	require.Equal(t, http.StatusOK, w.Code)
+	var mutation BulkRevokeResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &mutation))
+	assert.Equal(t, 2, mutation.RevokedCount)
+
+	for _, keyID := range []string{"alice-a", "bob-a"} {
+		key, err := store.Get(context.Background(), keyID)
+		require.NoError(t, err)
+		assert.Equal(t, StatusRevoked, key.Status)
+	}
+	key, err := store.Get(context.Background(), "bob-b")
+	require.NoError(t, err)
+	assert.Equal(t, StatusActive, key.Status)
+
+	w = executeBulkRevoke(t, `{"username":"bob"}`)
+	require.Equal(t, http.StatusForbidden, w.Code)
+	assert.Equal(t, 2, resolver.calls)
+}
+
+func TestBulkRevokeAPIKeys_SubscriptionAdminUsernameScopeIsOrganizationScoped(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	addSubscriptionAdminTestKey(t, store, "bob-a", "bob", "subscription-a")
+	addSubscriptionAdminTestKey(t, store, "bob-b", "bob", "subscription-b")
+	addSubscriptionAdminTestKey(t, store, "bob-other-tenant", "bob", "subscription-a")
+	store.mu.Lock()
+	if key, exists := store.keys["bob-other-tenant"]; exists {
+		key.metadata.Tenant = "other-tenant"
+	}
+	store.mu.Unlock()
+
+	resolver := &subscriptionAdminResolverStub{scopes: []*subscription.AdminScope{{
+		Tenant:       "test-tenant",
+		Namespace:    "test-ns",
+		Subscription: "subscription-a",
+	}}}
+	handler := NewHandler(
+		logger.Development(),
+		NewService(store, &config.Config{}, fixedSubSelector{}),
+		newMockAdminChecker(),
+		nil,
+		resolver,
+	)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/v1/api-keys/bulk-revoke",
+		strings.NewReader(`{"username":"bob","dryRun":true}`),
+	)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("user", &token.UserContext{Username: "alice", Tenant: "test-tenant"})
+	c.Set("verified_identity", verifiedIdentityForSubscriptionAdmin())
+	handler.BulkRevokeAPIKeys(c)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var dryRun BulkRevokeResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &dryRun))
+	assert.Equal(t, 1, dryRun.RevokedCount)
+
+	w = httptest.NewRecorder()
+	c, _ = gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/v1/api-keys/bulk-revoke",
+		strings.NewReader(`{"username":"bob"}`),
+	)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("user", &token.UserContext{Username: "alice", Tenant: "test-tenant"})
+	c.Set("verified_identity", verifiedIdentityForSubscriptionAdmin())
+	handler.BulkRevokeAPIKeys(c)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var mutation BulkRevokeResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &mutation))
+	assert.Equal(t, 1, mutation.RevokedCount)
+	assert.Equal(t, 2, resolver.scopeCalls)
+
+	key, err := store.Get(context.Background(), "bob-a")
+	require.NoError(t, err)
+	assert.Equal(t, StatusRevoked, key.Status)
+	key, err = store.Get(context.Background(), "bob-b")
+	require.NoError(t, err)
+	assert.Equal(t, StatusActive, key.Status)
+	key, err = store.Get(context.Background(), "bob-other-tenant")
+	require.NoError(t, err)
+	assert.Equal(t, StatusActive, key.Status)
+}
+
+func TestBulkRevokeAPIKeys_PlatformAdminPreservesUsernameOnlyScope(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMockStore()
+	addSubscriptionAdminTestKey(t, store, "bob-a", "bob", "subscription-a")
+	addSubscriptionAdminTestKey(t, store, "bob-b", "bob", "subscription-b")
+
+	resolver := &subscriptionAdminResolverStub{scopes: []*subscription.AdminScope{{
+		Tenant:       "test-tenant",
+		Namespace:    "test-ns",
+		Subscription: "subscription-a",
+	}}}
+	handler := NewHandler(
+		logger.Development(),
+		NewService(store, &config.Config{}, fixedSubSelector{}),
+		newMockAdminChecker(),
+		nil,
+		resolver,
+	)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/v1/api-keys/bulk-revoke",
+		strings.NewReader(`{"username":"bob","dryRun":true}`),
+	)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("user", &token.UserContext{
+		Username: "alice",
+		Groups:   []string{"admin-users"},
+		Tenant:   "test-tenant",
+	})
+	c.Set("verified_identity", verifiedIdentityForSubscriptionAdmin())
+	handler.BulkRevokeAPIKeys(c)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var response BulkRevokeResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.Equal(t, 2, response.RevokedCount)
+	assert.Zero(t, resolver.scopeCalls)
 }

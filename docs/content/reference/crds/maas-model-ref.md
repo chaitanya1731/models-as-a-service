@@ -12,6 +12,7 @@ Identifies an AI/ML model for the MaaS platform. The backend may be on-cluster (
 |-------|------|----------|-------------|
 | modelRef | ModelReference | Yes | Reference to the model backend (kind and name) |
 | endpointOverride | string | No | Optional override for the endpoint URL. See [Endpoint Override](#endpoint-override) below. |
+| tenantRef | string | No | Name of the AITenant this model belongs to. When omitted, the controller auto-resolves the tenant from the HTTPRoute's gateway. See [Multi-Tenant Models](#multi-tenant-models) below. |
 
 ### ModelReference
 
@@ -55,6 +56,7 @@ References external AI/ML providers (e.g., OpenAI, Anthropic, Azure OpenAI).
 
 The controller:
 - Fetches the ExternalModel CR from the same namespace
+- For an ExternalModel that reports per-gateway status (`status.gateways`), uses the HTTPRoute of the tenant's gateway and never falls back to another gateway. A model attached to several gateways needs one MaaSModelRef per tenant with `spec.tenantRef`; without it, the MaaSModelRef fails as ambiguous
 - Validates the user-supplied HTTPRoute references the correct gateway
 - Derives `status.endpoint` from HTTPRoute hostnames or gateway addresses
 - Sets `status.phase` based on HTTPRoute acceptance
@@ -102,6 +104,46 @@ The override does not bypass backend validation. The controller still checks tha
 
 ---
 
+## Multi-Tenant Models
+
+The controller auto-resolves the tenant for a MaaSModelRef from the HTTPRoute's gateway parentRef. Because the platform enforces a 1:1 Gateway-to-Tenant mapping (via the AITenant webhook), the controller can unambiguously derive which tenant owns a model by finding the AITenant whose gateway matches the HTTPRoute's parentRef.
+
+**Recommended (auto-resolve):** Omit `spec.tenantRef`. The controller resolves the tenant automatically from the gateway configured on the backend resource (LLMInferenceService or ExternalModel HTTPRoute). The MaaSModelRef enters `Pending` state during resolution and moves to `Ready` once the tenant is resolved and governance is attached. If no matching AITenant is found, the model enters `Failed` state with a descriptive message.
+
+```yaml
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSModelRef
+metadata:
+  name: granite-7b
+  namespace: llm
+spec:
+  modelRef:
+    kind: LLMInferenceService
+    name: granite-7b-instruct
+  # tenantRef omitted — auto-resolved from the HTTPRoute gateway
+```
+
+**Advanced override:** Set `spec.tenantRef` to explicitly select an AITenant. The controller looks up the named AITenant and uses its gateway directly, bypassing auto-resolution. A validating webhook rejects values that do not match an existing AITenant. The value must use lowercase alphanumeric characters and hyphens (matching the CRD pattern `^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`) and be no longer than 253 characters.
+
+```yaml
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSModelRef
+metadata:
+  name: granite-7b
+  namespace: llm
+spec:
+  modelRef:
+    kind: LLMInferenceService
+    name: granite-7b-instruct
+  tenantRef: red-team  # explicit override
+```
+
+The resolved tenant appears in `status.resolvedTenantRef` whether auto-resolved or explicitly set.
+
+For step-by-step instructions, see [Multi-Tenant Setup — Configure Models](../../install/multi-tenant-setup.md#5-configure-models).
+
+---
+
 ## Status
 
 ### MaaSModelRefStatus
@@ -115,6 +157,7 @@ The override does not bypass backend validation. The controller still checks tha
 | httpRouteGatewayName | string | Name of the Gateway that the HTTPRoute references |
 | httpRouteGatewayNamespace | string | Namespace of the Gateway that the HTTPRoute references |
 | httpRouteHostnames | []string | Hostnames configured on the HTTPRoute |
+| resolvedTenantRef | string | The AITenant this model was resolved to — set from `spec.tenantRef` when provided explicitly, or auto-resolved from the HTTPRoute's gateway parentRef. |
 | conditions | []Condition | Latest observations of the model's state |
 
 ---
@@ -129,6 +172,7 @@ MaaSModelRef supports standard Kubernetes and OpenShift annotations. The MaaS AP
 | `openshift.io/description` | Model description | `modelDetails.description` | `"A large language model optimized for chat"` |
 | `opendatahub.io/genai-use-case` | GenAI use case category | `modelDetails.genaiUseCase` | `"chat"` |
 | `opendatahub.io/context-window` | Context window size | `modelDetails.contextWindow` | `"4096"` |
+| `opendatahub.io/model-capabilities` | Model capabilities (JSON string array) | `modelDetails.modelCapabilities` | `'["text-generation","image-text-inferencing"]'` |
 
 ### Example with annotations
 
@@ -143,6 +187,7 @@ metadata:
     openshift.io/description: "A large language model optimized for chat use cases"
     opendatahub.io/genai-use-case: "chat"
     opendatahub.io/context-window: "4096"
+    opendatahub.io/model-capabilities: '["text-generation","chat"]'
 spec:
   modelRef:
     kind: LLMInferenceService
@@ -165,7 +210,8 @@ When annotations are set, the `GET /v1/models` response includes a `modelDetails
     "displayName": "Llama 2 7B Chat",
     "description": "A large language model optimized for chat use cases",
     "genaiUseCase": "chat",
-    "contextWindow": "4096"
+    "contextWindow": "4096",
+    "modelCapabilities": ["text-generation", "chat"]
   }
 }
 ```

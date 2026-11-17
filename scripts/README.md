@@ -37,7 +37,7 @@ Automated deployment script for OpenShift clusters supporting both operator-base
 - `--operator-type <odh|rhoai>` - Which operator to install (default: odh)
 - `--deployment-mode <operator|kustomize>` - Deployment method (default: operator)
 - `--namespace <namespace>` - Target namespace for deployment
-- `--external-oidc` - Enable external OIDC on the `maas-api` AuthPolicy (kustomize mode only; in operator mode, configure `spec.externalOIDC` on the `Tenant` CR)
+- `--external-oidc` - Enable external OIDC on the `maas-api` AuthPolicy (kustomize mode only; in operator mode, configure `spec.oidc` on the default `AITenant`)
 - `--enable-keycloak` - Deploy a Keycloak instance for external OIDC testing
 - `--enable-tls-backend` - Enable TLS backend (default)
 - `--disable-tls-backend` - Disable TLS backend
@@ -45,6 +45,7 @@ Automated deployment script for OpenShift clusters supporting both operator-base
 - `--dry-run` - Show what would be done without applying changes
 - `--operator-catalog <image>` - Custom operator catalog image for PR testing
 - `--operator-image <image>` - Custom operator image for PR testing
+- `--ai-gateway-operator-image <image>` - Custom ai-gateway-operator image (operator mode only); patches `RELATED_IMAGE_ODH_AI_GATEWAY_OPERATOR_IMAGE` on the ODH CSV and enables `spec.components.aigateway.managementState=Managed` on the DSC
 - `--channel <channel>` - Operator channel override (default: fast-3 for ODH, stable-3.x for RHOAI)
 
 **Requirements:**
@@ -57,6 +58,7 @@ Automated deployment script for OpenShift clusters supporting both operator-base
 **Environment Variables:**
 - `MAAS_API_IMAGE` - Custom MaaS API container image (passed to the Tenant reconciler via `RELATED_IMAGE_ODH_MAAS_API_IMAGE` on the controller Deployment)
 - `MAAS_CONTROLLER_IMAGE` - Custom MaaS controller container image
+- `AI_GATEWAY_OPERATOR_IMAGE` - Custom ai-gateway-operator image (operator mode only)
 - `OPERATOR_CATALOG` - Custom operator catalog for PR testing
 - `OPERATOR_IMAGE` - Custom operator image for PR testing
 - `OPERATOR_TYPE` - Operator type (odh/rhoai)
@@ -74,6 +76,50 @@ LOG_LEVEL=DEBUG ./scripts/deploy.sh --verbose
 # Dry-run to preview deployment plan
 ./scripts/deploy.sh --dry-run
 ```
+
+---
+
+### Testing a PR against ODH latest + ai-gateway-operator stable
+
+Integration gate for `main` → `stable` promotion PRs: deploy the ODH operator's **main-branch
+"latest" catalog**, pin **ai-gateway-operator to its stable image**, pin `maas-controller`/`maas-api`
+to the PR-built images, and run the full e2e suite against that combination. This proves a PR's
+MaaS images still work with the latest ODH build and the stable AI Gateway component before merge.
+
+Unlike the default CI path (`--deployment-mode kustomize`), this uses `DEPLOY_MODE=operator`, the
+only path where the ODH operator's own `ModelsAsService`/`AIGateway` component reconcilers run —
+the default CI path never deploys `ai-gateway-operator` at all. `test/e2e/scripts/prow_run_smoke_test.sh`
+already understands all the env vars needed for this, so no separate wrapper script is required:
+
+```bash
+DEPLOY_MODE=operator \
+AI_GATEWAY_OPERATOR_IMAGE=quay.io/opendatahub/odh-ai-gateway-operator:odh-stable \
+OPERATOR_CATALOG=quay.io/opendatahub/opendatahub-operator-catalog:latest \
+MAAS_CONTROLLER_IMAGE=quay.io/opendatahub/maas-controller:pr-406 \
+MAAS_API_IMAGE=quay.io/opendatahub/maas-api:pr-232 \
+./test/e2e/scripts/prow_run_smoke_test.sh
+```
+
+To deploy only (skip the e2e suite) while iterating, call `deploy.sh` directly instead:
+
+```bash
+./scripts/deploy.sh --deployment-mode operator --operator-type odh \
+  --operator-catalog quay.io/opendatahub/opendatahub-operator-catalog:latest \
+  --ai-gateway-operator-image quay.io/opendatahub/odh-ai-gateway-operator:odh-stable \
+  --maas-controller-image quay.io/opendatahub/maas-controller:pr-406 \
+  --maas-api-image quay.io/opendatahub/maas-api:pr-232
+```
+
+Requires an OpenShift cluster with `oc` logged in as cluster-admin.
+
+**Note:** In `operator` mode, `deploy.sh` no longer falls back to installing `maas-controller`
+directly via kustomize if the ODH operator fails to create it. That fallback previously masked
+real integration gaps (e.g. an RBAC permission the operator couldn't grant, catalog/channel
+mismatches). If the operator doesn't reconcile `maas-controller` within `ROLLOUT_TIMEOUT`
+(default 120s), or the DSC reports `AIGatewayReady: False`, `deploy.sh` fails with the underlying
+DataScienceCluster condition message instead of silently self-installing. Set
+`FORCE_OVERWRITE=true` to bypass this check for local debugging only — it defeats the purpose of
+operator-mode validation, so don't set it in the promotion-PR pipeline.
 
 ---
 
@@ -155,8 +201,9 @@ Results:
 
 External OIDC can be enabled in two ways:
 
-**Operator mode:** Edit the `Tenant` CR to add `spec.externalOIDC` with
-`issuerUrl` and `clientId`. The Tenant reconciler patches the AuthPolicy automatically.
+**Operator mode:** Edit `AITenant/models-as-a-service` in the configured AITenant namespace
+(default `ai-tenants`) to add `spec.oidc` with `issuerUrl` and `clientId`. The controller
+uses that AITenant platform context when reconciling the AuthPolicy.
 
 **Kustomize mode:** Use `--external-oidc` with env vars:
 ```bash
@@ -196,6 +243,87 @@ AUTHORINO_NAMESPACE=rh-connectivity-link ./scripts/setup-authorino-tls.sh
 
 ---
 
+### `setup-gateway.sh`
+Creates `maas-default-gateway` Gateway API resource for MaaS.
+
+**Usage:**
+```bash
+# Route mode (ROSA, OSD, cloud clusters - default)
+./scripts/setup-gateway.sh
+
+# ClusterIP mode (on-prem, disconnected, bare-metal)
+INGRESS_MODE=clusterip ./scripts/setup-gateway.sh
+
+# Disconnected environment (no GitHub fallback)
+DISCONNECTED=true INGRESS_MODE=clusterip ./scripts/setup-gateway.sh
+
+# Preview changes without applying
+DRY_RUN=true ./scripts/setup-gateway.sh
+```
+
+**What it does:**
+- Creates GatewayClass (`openshift-default`)
+- **Route mode:** Creates Gateway with LoadBalancer Service and auto-detected TLS certificate
+- **ClusterIP mode:** Creates ConfigMap/gw-options, Gateway with ClusterIP Service, OpenShift Route with reencrypt termination
+- Auto-detects cluster domain and TLS certificate (four-level fallback in route mode)
+- Waits for Gateway to be Programmed
+
+**Environment Variables:**
+- `INGRESS_MODE` - Deployment mode: `route` (default) or `clusterip`
+- `CLUSTER_DOMAIN` - Override cluster domain auto-detection
+- `CERT_NAME` - Override TLS certificate secret name (route mode only)
+- `DISCONNECTED` - Disable GitHub manifest fallback (`true`/`false`, default: false)
+- `DRY_RUN` - Preview changes without applying (`true`/`false`, default: false)
+- `MAAS_MANIFEST_REF` - Git tag or commit SHA for remote kustomize fallback (defaults to current repo `HEAD` when run from a clone; required when fetching without a local tree)
+- `ALLOWED_ROUTE_NAMESPACES` - Comma-separated list of namespaces allowed to attach HTTPRoutes to the Gateway (e.g. `"opendatahub,odh-ai-gateway-infra,llm"`). Uses `from: Selector` with `matchExpressions` on `kubernetes.io/metadata.name`. Takes precedence over `NAMESPACE_SELECTOR_LABELS`.
+- `NAMESPACE_SELECTOR_LABELS` - Comma-separated `key=value` label pairs for namespace selection (e.g. `"gateway-access=true"`). Uses `from: Selector` with `matchLabels`. Ignored when `ALLOWED_ROUTE_NAMESPACES` is set.
+
+When neither is set, the Gateway defaults to `allowedRoutes: namespaces: from: Same`, which restricts HTTPRoute attachment to the Gateway's own namespace (`openshift-ingress`).
+
+> **Important for MaaS:** The infra namespace (`odh-ai-gateway-infra` / `redhat-ai-gateway-infra`) hosts `maas-api-route` — omitting it causes 404 on all MaaS API calls. `deploy.sh` sets `ALLOWED_ROUTE_NAMESPACES` automatically to `<app-ns>,<infra-ns>[,<model-ns>]`; set `MODEL_NAMESPACE` to also include the model namespace.
+
+**Note:** Route mode auto-detects cluster TLS certificates. Override with `CERT_NAME` if needed.
+
+---
+
+### `create-ai-tenant.sh`
+Creates a new AITenant with an isolated Gateway and infrastructure for multi-tenant deployments.
+
+**Usage:**
+```bash
+# Auto-detect cluster domain (creates <tenant>-maas.<cluster-domain> hostname)
+./scripts/create-ai-tenant.sh <tenant-name>
+
+# Specify a custom gateway hostname
+./scripts/create-ai-tenant.sh <tenant-name> <gateway-hostname>
+
+# MaaS on ODH — allow app, infra, and model namespaces to attach HTTPRoutes
+ALLOWED_ROUTE_NAMESPACES="opendatahub,odh-ai-gateway-infra,llm" \
+  ./scripts/create-ai-tenant.sh myteam
+
+# MaaS on RHOAI
+ALLOWED_ROUTE_NAMESPACES="redhat-ods-applications,redhat-ai-gateway-infra,llm" \
+  ./scripts/create-ai-tenant.sh myteam
+
+# Restrict by label selector
+NAMESPACE_SELECTOR_LABELS="gateway-access=true" \
+  ./scripts/create-ai-tenant.sh myteam
+```
+
+**What it does:**
+- Creates a Gateway in `openshift-ingress` with LoadBalancer service and auto-detected TLS certificate
+- Creates an AITenant CR (triggers controller to create MaasTenantConfig, maas-api, etc.)
+
+**Environment Variables:**
+- `ALLOWED_ROUTE_NAMESPACES` - Comma-separated list of namespaces allowed to attach HTTPRoutes. Uses `from: Selector` with `matchExpressions` on `kubernetes.io/metadata.name`.
+- `NAMESPACE_SELECTOR_LABELS` - Comma-separated `key=value` label pairs for namespace selection (e.g. `"gateway-access=true"`). Uses `from: Selector` with `matchLabels`. Ignored when `ALLOWED_ROUTE_NAMESPACES` is set.
+
+When neither is set, the Gateway defaults to `allowedRoutes: namespaces: from: Same`.
+
+> **Important for MaaS deployments:** HTTPRoutes are created in the application namespace (`opendatahub` / `redhat-ods-applications`) and often in model namespaces (e.g. `llm`), not in `openshift-ingress`. Set `ALLOWED_ROUTE_NAMESPACES` (or a label selector) accordingly, otherwise the tenant Gateway will block HTTPRoute attachment.
+
+---
+
 ### `install-dependencies.sh`
 Installs individual dependencies (Kuadrant, ODH, etc.).
 
@@ -214,7 +342,6 @@ Installs individual dependencies (Kuadrant, ODH, etc.).
 - `--istio`: Install Istio service mesh
 - `--odh`: Install OpenDataHub operator (OpenShift only)
 - `--kserve`: Install KServe model serving platform
-- `--prometheus`: Install Prometheus operator
 - `--ocp`: Use OpenShift-specific handling
 
 ---
@@ -363,6 +490,17 @@ MAAS_API_IMAGE=quay.io/opendatahub/maas-api:pr-456 \
 
 See [test/e2e/README.md](../test/e2e/README.md) for complete testing documentation and CI/CD pipeline usage examples.
 
+To also exercise `ai-gateway-operator` (not part of the default CI path — see
+[Testing a PR against ODH latest + ai-gateway-operator stable](#testing-a-pr-against-odh-latest--ai-gateway-operator-stable)
+above), set `DEPLOY_MODE=operator`:
+
+```bash
+DEPLOY_MODE=operator \
+AI_GATEWAY_OPERATOR_IMAGE=quay.io/opendatahub/odh-ai-gateway-operator:odh-stable \
+MAAS_CONTROLLER_IMAGE=quay.io/opendatahub/maas-controller:pr-406 \
+./test/e2e/scripts/prow_run_smoke_test.sh
+```
+
 ---
 
 ## Support
@@ -372,4 +510,3 @@ For issues or questions:
 2. Check the main project [README](../README.md)
 3. Review [deployment documentation](../docs/content/quickstart.md)
 4. Check sample model configurations in [docs/samples/models/](../docs/samples/models/)
-

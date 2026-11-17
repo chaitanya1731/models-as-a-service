@@ -1,4 +1,4 @@
-"""Read-only E2E for cluster Config/default (anchor + owner refs on Tenant and maas-controller).
+"""Read-only E2E for cluster Config/default owner refs.
 
 Does not delete Config; destructive GC checks belong in operator or dedicated jobs.
 """
@@ -10,6 +10,8 @@ import subprocess
 import time
 
 import pytest
+
+from test_helper import _ns
 
 _OC_TIMEOUT = int(os.environ.get("E2E_OC_TIMEOUT", "60"))
 
@@ -54,13 +56,16 @@ def _oc_json(args):
     return json.loads(result.stdout)
 
 
+pytestmark = [pytest.mark.xdist_group("readonly"), pytest.mark.smoke]
+
 CONFIG_CRD = "configs.maas.opendatahub.io"
 CONFIG_NAME = "default"
 CONFIG_KIND = "Config"
 CONFIG_API_PREFIX = "maas.opendatahub.io/"
 
 TENANT_NAME = "default-tenant"
-TENANT_NAMESPACE = os.environ.get("MAAS_SUBSCRIPTION_NAMESPACE", "models-as-a-service")
+DEFAULT_AITENANT_NAME = "models-as-a-service"
+AITENANT_NAMESPACE = os.environ.get("AITENANT_NAMESPACE", "ai-tenants")
 CONTROLLER_DEPLOY_NS = os.environ.get("DEPLOYMENT_NAMESPACE", "opendatahub")
 CONTROLLER_DEPLOYMENT = "maas-controller"
 
@@ -70,7 +75,11 @@ def _config_doc():
 
 
 def _tenant_doc():
-    return _oc_json(["get", "tenant", TENANT_NAME, "-n", TENANT_NAMESPACE, "-o", "json"])
+    return _oc_json(["get", "maastenantconfig", TENANT_NAME, "-n", _ns(), "-o", "json"])
+
+
+def _aitenant_doc():
+    return _oc_json(["get", "aitenant", DEFAULT_AITENANT_NAME, "-n", AITENANT_NAMESPACE, "-o", "json"])
 
 
 def _config_uid_or_none():
@@ -82,6 +91,21 @@ def _config_uid_or_none():
         if _oc_not_found(exc):
             return None
         raise
+
+
+def _wait_for_aitenant_doc(timeout=180, interval=5):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            return _aitenant_doc()
+        except subprocess.CalledProcessError as exc:
+            if not _oc_not_found(exc):
+                raise
+            time.sleep(interval)
+    pytest.fail(
+        f"AITenant {DEFAULT_AITENANT_NAME}/{AITENANT_NAMESPACE} not found "
+        "after waiting for default AITenant bootstrap."
+    )
 
 
 def _ref_to_config(refs):
@@ -135,22 +159,30 @@ class TestConfigAnchorPresence:
 
 
 class TestConfigTenantOwnership:
-    def test_tenant_lists_config_owner_reference(self):
+    def test_default_aitenant_lists_config_owner_reference(self):
+        doc = _wait_for_aitenant_doc()
+        ref = _ref_to_config(doc.get("metadata", {}).get("ownerReferences"))
+        assert ref is not None, (
+            f"AITenant {DEFAULT_AITENANT_NAME}/{AITENANT_NAMESPACE} should reference "
+            f"Config/{CONFIG_NAME} (LifecycleReconciler links the anchor for GC)."
+        )
+
+    def test_tenant_config_lists_config_owner_reference(self):
         try:
             doc = _tenant_doc()
         except subprocess.CalledProcessError as exc:
             if _oc_not_found(exc):
                 pytest.skip(
-                    f"Tenant {TENANT_NAME}/{TENANT_NAMESPACE} not found; run after Tenant bootstrap."
+                    f"MaasTenantConfig {TENANT_NAME}/{_ns()} not found; run after tenant config bootstrap."
                 )
             raise
         ref = _ref_to_config(doc.get("metadata", {}).get("ownerReferences"))
         assert ref is not None, (
-            f"Tenant {TENANT_NAME}/{TENANT_NAMESPACE} should reference Config/{CONFIG_NAME} "
+            f"MaasTenantConfig {TENANT_NAME}/{_ns()} should reference Config/{CONFIG_NAME} "
             "(LifecycleReconciler links the anchor for GC)."
         )
 
-    def test_maas_controller_deployment_lists_config_owner_reference(self):
+    def test_maas_controller_deployment_does_not_list_config_owner_reference(self):
         result = _oc_run(
             [
                 "get",
@@ -175,7 +207,9 @@ class TestConfigTenantOwnership:
             )
         doc = json.loads(result.stdout)
         ref = _ref_to_config(doc.get("metadata", {}).get("ownerReferences"))
-        assert ref is not None, (
-            f"Deployment {CONTROLLER_DEPLOYMENT}/{CONTROLLER_DEPLOY_NS} should list an owner "
-            f"reference to Config/{CONFIG_NAME}."
+        assert ref is None, (
+            f"Deployment {CONTROLLER_DEPLOYMENT}/{CONTROLLER_DEPLOY_NS} should not reference "
+            f"Config/{CONFIG_NAME}: the controller's own workload must keep running independent "
+            "of Config's lifecycle (self-heal, TeardownCompletedAnnotation reporting), so it must "
+            "not be a GC dependent of the resource it manages."
         )

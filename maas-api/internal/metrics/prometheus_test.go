@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -58,12 +59,40 @@ func gatherMetricValue(t *testing.T, reg *prometheus.Registry, name string, labe
 func TestRecordRequestDuration(t *testing.T) {
 	r, reg := newTestRecorder(t)
 
-	r.RecordRequestDuration("GET", "/v1/models", "200", 150*time.Millisecond)
-	r.RecordRequestDuration("GET", "/v1/models", "200", 250*time.Millisecond)
-	r.RecordRequestDuration("POST", "/v1/api-keys", "201", 50*time.Millisecond)
+	r.RecordRequestDuration("GET", "/v1/models", "200", "tenant-a", 150*time.Millisecond)
+	r.RecordRequestDuration("GET", "/v1/models", "200", "tenant-a", 250*time.Millisecond)
+	r.RecordRequestDuration("POST", "/v1/api-keys", "201", "tenant-b", 50*time.Millisecond)
 
-	assert.InDelta(t, float64(2), gatherMetricValue(t, reg, "maas_api_http_requests_total", map[string]string{"method": "GET", "route": "/v1/models", "status": "200"}), 0)
-	assert.InDelta(t, float64(1), gatherMetricValue(t, reg, "maas_api_http_requests_total", map[string]string{"method": "POST", "route": "/v1/api-keys", "status": "201"}), 0)
+	assert.InDelta(t, float64(2), gatherMetricValue(t, reg, "maas_api_http_requests_total",
+		map[string]string{"method": "GET", "route": "/v1/models", "status": "200", "tenant_name": "tenant-a"}), 0)
+	assert.InDelta(t, float64(1), gatherMetricValue(t, reg, "maas_api_http_requests_total",
+		map[string]string{"method": "POST", "route": "/v1/api-keys", "status": "201", "tenant_name": "tenant-b"}), 0)
+}
+
+// TestRecordRequestDuration_TenantLabel verifies that the same route with different
+// tenants produces distinct metric series.
+func TestRecordRequestDuration_TenantLabel(t *testing.T) {
+	r, reg := newTestRecorder(t)
+
+	r.RecordRequestDuration("GET", "/v1/models", "200", "tenant-a", 100*time.Millisecond)
+	r.RecordRequestDuration("GET", "/v1/models", "200", "tenant-b", 100*time.Millisecond)
+	r.RecordRequestDuration("GET", "/v1/models", "200", "tenant-b", 100*time.Millisecond)
+
+	assert.InDelta(t, float64(1), gatherMetricValue(t, reg, "maas_api_http_requests_total",
+		map[string]string{"tenant_name": "tenant-a"}), 0)
+	assert.InDelta(t, float64(2), gatherMetricValue(t, reg, "maas_api_http_requests_total",
+		map[string]string{"tenant_name": "tenant-b"}), 0)
+}
+
+// TestRecordRequestDuration_EmptyTenant verifies that requests without tenant context
+// (internal routes, health checks) produce metrics with an empty tenant label.
+func TestRecordRequestDuration_EmptyTenant(t *testing.T) {
+	r, reg := newTestRecorder(t)
+
+	r.RecordRequestDuration("POST", "/internal/v1/api-keys/validate", "200", "", 10*time.Millisecond)
+
+	assert.InDelta(t, float64(1), gatherMetricValue(t, reg, "maas_api_http_requests_total",
+		map[string]string{"tenant_name": "", "route": "/internal/v1/api-keys/validate"}), 0)
 }
 
 func TestInFlightGauge(t *testing.T) {
@@ -95,10 +124,43 @@ func TestNewPrometheusRecorderDuplicateRegistration(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// TestRecordKeyValidation verifies that the key validation counter increments
+// correctly with tenant and result labels.
+func TestRecordKeyValidation(t *testing.T) {
+	r, reg := newTestRecorder(t)
+
+	r.RecordKeyValidation("redteam", "valid")
+	r.RecordKeyValidation("redteam", "valid")
+	r.RecordKeyValidation("redteam", "invalid")
+	r.RecordKeyValidation("blueteam", "valid")
+
+	assert.InDelta(t, float64(2), gatherMetricValue(t, reg, "maas_api_key_validation_total",
+		map[string]string{"tenant_name": "redteam", "result": "valid"}), 0)
+	assert.InDelta(t, float64(1), gatherMetricValue(t, reg, "maas_api_key_validation_total",
+		map[string]string{"tenant_name": "redteam", "result": "invalid"}), 0)
+	assert.InDelta(t, float64(1), gatherMetricValue(t, reg, "maas_api_key_validation_total",
+		map[string]string{"tenant_name": "blueteam", "result": "valid"}), 0)
+}
+
+// TestRecordTokenMint verifies that the token mint counter increments
+// correctly with tenant and result labels.
+func TestRecordTokenMint(t *testing.T) {
+	r, reg := newTestRecorder(t)
+
+	r.RecordTokenMint("redteam", "success")
+	r.RecordTokenMint("redteam", "success")
+	r.RecordTokenMint("redteam", "failure")
+
+	assert.InDelta(t, float64(2), gatherMetricValue(t, reg, "maas_api_token_mint_total",
+		map[string]string{"tenant_name": "redteam", "result": "success"}), 0)
+	assert.InDelta(t, float64(1), gatherMetricValue(t, reg, "maas_api_token_mint_total",
+		map[string]string{"tenant_name": "redteam", "result": "failure"}), 0)
+}
+
 func TestDurationHistogramObserved(t *testing.T) {
 	r, reg := newTestRecorder(t)
 
-	r.RecordRequestDuration("GET", "/v1/models", "200", 150*time.Millisecond)
+	r.RecordRequestDuration("GET", "/v1/models", "200", "tenant-a", 150*time.Millisecond)
 
 	families, err := reg.Gather()
 	require.NoError(t, err)
@@ -112,4 +174,166 @@ func TestDurationHistogramObserved(t *testing.T) {
 		}
 	}
 	assert.True(t, found, "histogram metric not found in registry")
+}
+
+func TestRecordRequest(t *testing.T) {
+	r, reg := newTestRecorder(t)
+
+	r.RecordRequest(150 * time.Millisecond)
+	r.RecordRequest(250 * time.Millisecond)
+	r.RecordRequest(50 * time.Millisecond)
+
+	assert.InDelta(t, float64(3), gatherMetricValue(t, reg, "maas_requests_total", nil), 0)
+}
+
+func TestRecordRequestHistogram(t *testing.T) {
+	r, reg := newTestRecorder(t)
+
+	r.RecordRequest(150 * time.Millisecond)
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+
+	var found bool
+	for _, f := range families {
+		if f.GetName() == "maas_request_duration_seconds" {
+			found = true
+			require.Len(t, f.GetMetric(), 1)
+			assert.Equal(t, uint64(1), f.GetMetric()[0].GetHistogram().GetSampleCount())
+			assert.NotEmpty(t, f.GetMetric()[0].GetHistogram().GetBucket())
+		}
+	}
+	assert.True(t, found, "maas_request_duration_seconds histogram not found")
+}
+
+func TestRequestHistogramBucketsRegisteredAtStartup(t *testing.T) {
+	_, reg := newTestRecorder(t)
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+
+	var found bool
+	for _, f := range families {
+		if f.GetName() != "maas_request_duration_seconds" {
+			continue
+		}
+		found = true
+		require.Len(t, f.GetMetric(), 1)
+		assert.Equal(t, uint64(0), f.GetMetric()[0].GetHistogram().GetSampleCount())
+		assert.Len(t, f.GetMetric()[0].GetHistogram().GetBucket(), len(prometheus.DefBuckets))
+	}
+	assert.True(t, found, "histogram buckets must exist at registration before any Observe")
+}
+
+func TestRecordRejection(t *testing.T) {
+	r, reg := newTestRecorder(t)
+
+	r.RecordRejection("unauthorized")
+	r.RecordRejection("unauthorized")
+	r.RecordRejection("rate-limited")
+	r.RecordRejection("no-capacity")
+	r.RecordRejection("quota-exceeded")
+	r.RecordRejection("guardrail-unavailable")
+
+	assert.InDelta(t, float64(2), gatherMetricValue(t, reg, "maas_request_rejections_total",
+		map[string]string{"reason": "unauthorized"}), 0)
+	assert.InDelta(t, float64(1), gatherMetricValue(t, reg, "maas_request_rejections_total",
+		map[string]string{"reason": "guardrail-unavailable"}), 0)
+	assert.InDelta(t, float64(1), gatherMetricValue(t, reg, "maas_request_rejections_total",
+		map[string]string{"reason": "rate-limited"}), 0)
+	assert.InDelta(t, float64(1), gatherMetricValue(t, reg, "maas_request_rejections_total",
+		map[string]string{"reason": "no-capacity"}), 0)
+	assert.InDelta(t, float64(1), gatherMetricValue(t, reg, "maas_request_rejections_total",
+		map[string]string{"reason": "quota-exceeded"}), 0)
+}
+
+func TestRecordRejectionIgnoresUnknownReason(t *testing.T) {
+	r, reg := newTestRecorder(t)
+
+	r.RecordRejection("not-a-ticket-reason")
+
+	assert.InDelta(t, float64(0), gatherMetricValue(t, reg, "maas_request_rejections_total",
+		map[string]string{"reason": "rate-limited"}), 0)
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	for _, f := range families {
+		if f.GetName() != "maas_request_rejections_total" {
+			continue
+		}
+		assert.Len(t, f.GetMetric(), 5, "unknown reasons must not create extra series")
+	}
+}
+
+func TestRejectionLabelsPreInitialized(t *testing.T) {
+	_, reg := newTestRecorder(t)
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+
+	var rejectionMetric *struct{}
+	reasons := make(map[string]bool)
+
+	for _, f := range families {
+		if f.GetName() == "maas_request_rejections_total" {
+			rejectionMetric = &struct{}{}
+			for _, m := range f.GetMetric() {
+				for _, lp := range m.GetLabel() {
+					if lp.GetName() == "reason" {
+						reasons[lp.GetValue()] = true
+					}
+				}
+			}
+		}
+	}
+
+	require.NotNil(t, rejectionMetric, "maas_request_rejections_total not found")
+	assert.True(t, reasons["rate-limited"], "rate-limited label not pre-initialized")
+	assert.True(t, reasons["unauthorized"], "unauthorized label not pre-initialized")
+	assert.True(t, reasons["no-capacity"], "no-capacity label not pre-initialized")
+	assert.True(t, reasons["quota-exceeded"], "quota-exceeded label not pre-initialized")
+	assert.True(t, reasons["guardrail-unavailable"], "guardrail-unavailable label not pre-initialized")
+}
+
+func TestNewMetricsStayUnderCardinalityCeiling(t *testing.T) {
+	r, reg := newTestRecorder(t)
+	r.RecordRequest(10 * time.Millisecond)
+	r.RecordRejection("unauthorized")
+	r.RecordRejection("rate-limited")
+	r.RecordRejection("no-capacity")
+	r.RecordRejection("quota-exceeded")
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+
+	const ceiling = 20
+	newMetrics := map[string]int{
+		"maas_requests_total":           0,
+		"maas_request_duration_seconds": 0,
+		"maas_request_rejections_total": 0,
+	}
+	for _, f := range families {
+		name := f.GetName()
+		if _, ok := newMetrics[name]; !ok {
+			continue
+		}
+		newMetrics[name] = timeSeriesCount(f)
+	}
+	for name, count := range newMetrics {
+		assert.Positive(t, count, "%s missing from registry", name)
+		assert.LessOrEqual(t, count, ceiling, "%s produced %d time series (ceiling %d)", name, count, ceiling)
+	}
+}
+
+func timeSeriesCount(f *dto.MetricFamily) int {
+	total := 0
+	for _, m := range f.GetMetric() {
+		if f.GetType() == dto.MetricType_HISTOGRAM {
+			// Finite buckets from the proto, plus +Inf, _sum, and _count.
+			total += len(m.GetHistogram().GetBucket()) + 3
+			continue
+		}
+		total++
+	}
+	return total
 }

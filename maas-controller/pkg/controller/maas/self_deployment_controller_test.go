@@ -3,21 +3,32 @@ package maas
 
 import (
 	"context"
+	"path/filepath"
+	goruntime "runtime"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/managedfields"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	maasv1alpha1 "github.com/opendatahub-io/models-as-a-service/maas-controller/api/maas/v1alpha1"
+	"github.com/opendatahub-io/models-as-a-service/maas-controller/pkg/platform/tenantreconcile"
 
 	. "github.com/onsi/gomega"
 )
@@ -28,6 +39,43 @@ func lifecycleTestScheme(t *testing.T) *runtime.Scheme {
 	utilruntime.Must(clientgoscheme.AddToScheme(s))
 	utilruntime.Must(maasv1alpha1.AddToScheme(s))
 	return s
+}
+
+// newSSAFakeClientBuilder returns a fake client builder that can server-side apply NetworkPolicies.
+// controller-runtime's fake client (v0.23+) lists NetworkPolicy as having a status
+// subresource, which the built-in apply schema does not have, so applying one fails with
+// "expected objects with types from the same schema". The deduced type converter avoids it.
+func newSSAFakeClientBuilder(scheme *runtime.Scheme) *fake.ClientBuilder {
+	return fake.NewClientBuilder().WithScheme(scheme).WithTypeConverters(managedfields.NewDeducedTypeConverter())
+}
+
+func lifecycleUsageLogsPath(t *testing.T) string {
+	t.Helper()
+	_, testFile, _, ok := goruntime.Caller(0)
+	if !ok {
+		t.Fatal("resolve lifecycle test file path")
+	}
+	return filepath.Join(filepath.Dir(testFile), "../../../../deployment/components/observability/usage-logs")
+}
+
+func lifecycleObservabilityDashboardsPath(t *testing.T) string {
+	t.Helper()
+	_, testFile, _, ok := goruntime.Caller(0)
+	if !ok {
+		t.Fatal("resolve lifecycle test file path")
+	}
+	return filepath.Join(filepath.Dir(testFile), "../../../../deployment/components/observability/observability/dashboards")
+}
+
+func lifecycleTestUnstructured(gvk schema.GroupVersionKind, namespace, name string, finalizers ...string) *unstructured.Unstructured {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(gvk)
+	obj.SetNamespace(namespace)
+	obj.SetName(name)
+	if len(finalizers) > 0 {
+		obj.SetFinalizers(finalizers)
+	}
+	return obj
 }
 
 func TestLifecycleReconciler_CreatesConfigWhenMissing(t *testing.T) {
@@ -49,13 +97,19 @@ func TestLifecycleReconciler_CreatesConfigWhenMissing(t *testing.T) {
 		},
 	}
 
-	cl := fake.NewClientBuilder().WithScheme(s).WithObjects(dep).Build()
+	// Compute absolute path to the usage-logs manifest from this test file's location.
+	_, testFile, _, ok := goruntime.Caller(0)
+	g.Expect(ok).To(BeTrue())
+	usageLogsPath := filepath.Join(filepath.Dir(testFile), "../../../../deployment/components/observability/usage-logs")
+
+	cl := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&maasv1alpha1.Config{}).WithObjects(dep).Build()
 	r := &LifecycleReconciler{
 		Client:                      cl,
 		Scheme:                      s,
 		DeploymentName:              "maas-controller",
 		DeploymentNS:                depNS,
 		TenantSubscriptionNamespace: "",
+		UsageLogsManifestPath:       usageLogsPath,
 	}
 
 	_, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -81,12 +135,289 @@ func TestLifecycleReconciler_CreatesConfigWhenMissing(t *testing.T) {
 	g.Expect(cfg.Name).To(Equal(maasv1alpha1.ConfigInstanceName))
 }
 
-func TestLifecycleReconciler_ConfigTerminatingRequeues(t *testing.T) {
+func TestLifecycleReconciler_StripsLegacyFinalizerBeforeConfigRequeue(t *testing.T) {
+	g := NewWithT(t)
+	s := lifecycleTestScheme(t)
+	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+		Name:       "maas-controller",
+		Namespace:  "opendatahub",
+		Finalizers: []string{CleanupFinalizer, "example.com/other"},
+	}}
+	// A Config without a UID makes normal reconciliation requeue before module
+	// setup. Legacy finalizers still need to be cleared on this first pass.
+	cfg := &maasv1alpha1.Config{ObjectMeta: metav1.ObjectMeta{Name: maasv1alpha1.ConfigInstanceName}}
+	cl := fake.NewClientBuilder().WithScheme(s).WithObjects(dep, cfg).Build()
+	r := &LifecycleReconciler{Client: cl, Scheme: s}
+	key := client.ObjectKeyFromObject(dep)
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key})
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(res.RequeueAfter).To(Equal(2 * time.Second))
+
+	var updated appsv1.Deployment
+	g.Expect(cl.Get(context.Background(), key, &updated)).To(Succeed())
+	g.Expect(updated.Finalizers).To(Equal([]string{"example.com/other"}))
+}
+
+func TestLifecycleReconciler_SkipsOwnerReferenceOnTerminatingTenantConfig(t *testing.T) {
+	g := NewWithT(t)
+	s := lifecycleTestScheme(t)
+	const tenantNS = "models-as-a-service"
+
+	cfg := &maasv1alpha1.Config{ObjectMeta: metav1.ObjectMeta{
+		Name: maasv1alpha1.ConfigInstanceName,
+		UID:  types.UID("cfg-new"),
+	}}
+	// A terminating MaasTenantConfig must not be re-parented to the current Config:
+	// the patch both mis-links a deleting object and fails when its namespace is gone.
+	deletion := metav1.NewTime(time.Date(2026, 10, 28, 1, 46, 41, 0, time.UTC))
+	tenant := &maasv1alpha1.MaasTenantConfig{ObjectMeta: metav1.ObjectMeta{
+		Name:              maasv1alpha1.MaasTenantConfigInstanceName,
+		Namespace:         tenantNS,
+		DeletionTimestamp: &deletion,
+		Finalizers:        []string{tenantFinalizer},
+	}}
+	cl := fake.NewClientBuilder().WithScheme(s).WithObjects(cfg, tenant).Build()
+	r := &LifecycleReconciler{Client: cl, Scheme: s, TenantSubscriptionNamespace: tenantNS}
+
+	res, err := r.ensureTenantReferencesConfig(context.Background())
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(res).To(BeNil())
+
+	var updated maasv1alpha1.MaasTenantConfig
+	g.Expect(cl.Get(context.Background(), client.ObjectKeyFromObject(tenant), &updated)).To(Succeed())
+	g.Expect(updated.OwnerReferences).To(BeEmpty())
+}
+
+func TestLifecycleReconciler_DoesNotRecreateConfigWhenTeardownRequested(t *testing.T) {
 	g := NewWithT(t)
 	s := lifecycleTestScheme(t)
 
 	const depNS = "opendatahub"
-	now := metav1.NewTime(time.Now())
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "maas-controller",
+			Namespace: depNS,
+			Annotations: map[string]string{
+				TeardownRequestedAnnotation: "true",
+			},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "maas-controller"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "maas-controller"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "manager", Image: "test"}}},
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&maasv1alpha1.Config{}).WithObjects(dep).Build()
+	r := &LifecycleReconciler{
+		Client:                      cl,
+		Scheme:                      s,
+		DeploymentName:              "maas-controller",
+		DeploymentNS:                depNS,
+		TenantSubscriptionNamespace: "",
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "maas-controller", Namespace: depNS},
+	})
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(res).To(Equal(ctrl.Result{}))
+
+	var cfg maasv1alpha1.Config
+	g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: maasv1alpha1.ConfigInstanceName}, &cfg)).ToNot(Succeed())
+}
+
+func TestLifecycleReconciler_TeardownRequestedDeletesConfigAndMarksCompleted(t *testing.T) {
+	g := NewWithT(t)
+	s := lifecycleTestScheme(t)
+
+	const depNS = "opendatahub"
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "maas-controller",
+			Namespace: depNS,
+			Annotations: map[string]string{
+				TeardownRequestedAnnotation: "true",
+			},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "maas-controller"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "maas-controller"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "manager", Image: "test"}}},
+			},
+		},
+	}
+	cfg := &maasv1alpha1.Config{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: maasv1alpha1.ConfigInstanceName,
+			UID:  types.UID("cfg-delete-request"),
+		},
+	}
+	aitenantNS := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: tenantreconcile.DefaultAITenantNamespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by":       "maas-controller",
+				"opendatahub.io/generated-namespace": "true",
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&maasv1alpha1.Config{}).WithObjects(dep, cfg, aitenantNS).Build()
+	r := &LifecycleReconciler{
+		Client:            cl,
+		Scheme:            s,
+		DeploymentName:    "maas-controller",
+		DeploymentNS:      depNS,
+		AITenantNamespace: tenantreconcile.DefaultAITenantNamespace,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "maas-controller", Namespace: depNS},
+	})
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(res).To(Equal(ctrl.Result{}))
+
+	// Config/default is deleted as a plain step, no finalizer involved.
+	var updatedCfg maasv1alpha1.Config
+	g.Expect(apierrors.IsNotFound(cl.Get(context.Background(), client.ObjectKey{Name: maasv1alpha1.ConfigInstanceName}, &updatedCfg))).To(BeTrue())
+
+	// MaaS teardown must preserve every namespace, including the controller-created
+	// AITenant infrastructure namespace.
+	var survivingNamespace corev1.Namespace
+	g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: tenantreconcile.DefaultAITenantNamespace}, &survivingNamespace)).To(Succeed())
+
+	// The completion signal must be observable on the Deployment regardless of Config's fate.
+	var updatedDep appsv1.Deployment
+	g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: "maas-controller", Namespace: depNS}, &updatedDep)).To(Succeed())
+	g.Expect(updatedDep.Annotations[TeardownCompletedAnnotation]).To(Equal("true"))
+}
+
+func TestLifecycleReconciler_MarkTeardownCompletedIsIdempotent(t *testing.T) {
+	g := NewWithT(t)
+	s := lifecycleTestScheme(t)
+
+	const depNS = "opendatahub"
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "maas-controller",
+			Namespace: depNS,
+			Annotations: map[string]string{
+				TeardownCompletedAnnotation: "true",
+			},
+			ResourceVersion: "1",
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&maasv1alpha1.Config{}).WithObjects(dep).Build()
+	r := &LifecycleReconciler{Client: cl, Scheme: s}
+
+	g.Expect(r.markTeardownCompleted(context.Background(), dep)).To(Succeed())
+
+	var updated appsv1.Deployment
+	g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: "maas-controller", Namespace: depNS}, &updated)).To(Succeed())
+	g.Expect(updated.ResourceVersion).To(Equal("1"), "already-annotated Deployment should not be patched again")
+}
+
+func TestLifecycleReconciler_TeardownRequestedWithoutConfigRequestsOrphanCleanup(t *testing.T) {
+	g := NewWithT(t)
+	s := lifecycleTestScheme(t)
+
+	const depNS = "opendatahub"
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "maas-controller",
+			Namespace: depNS,
+			Annotations: map[string]string{
+				TeardownRequestedAnnotation: "true",
+			},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "maas-controller"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "maas-controller"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "manager", Image: "test"}}},
+			},
+		},
+	}
+	aitenant := lifecycleTestUnstructured(
+		schema.GroupVersionKind{Group: "maas.opendatahub.io", Version: "v1alpha1", Kind: "AITenant"},
+		tenantreconcile.DefaultAITenantNamespace,
+		tenantreconcile.DefaultAITenantName,
+		aitenantFinalizer,
+	)
+
+	cl := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&maasv1alpha1.Config{}).WithRuntimeObjects(dep, aitenant).Build()
+	r := &LifecycleReconciler{
+		Client:            cl,
+		Scheme:            s,
+		DeploymentName:    "maas-controller",
+		DeploymentNS:      depNS,
+		AITenantNamespace: tenantreconcile.DefaultAITenantNamespace,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "maas-controller", Namespace: depNS},
+	})
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(res.RequeueAfter).To(Equal(teardownRequeueAfter))
+
+	updated := &unstructured.Unstructured{}
+	updated.SetGroupVersionKind(aitenant.GroupVersionKind())
+	g.Expect(cl.Get(context.Background(), client.ObjectKey{
+		Name:      tenantreconcile.DefaultAITenantName,
+		Namespace: tenantreconcile.DefaultAITenantNamespace,
+	}, updated)).To(Succeed())
+	g.Expect(updated.GetDeletionTimestamp()).NotTo(BeNil())
+
+	// The completion annotation must not be set yet: AITenant deletion is still pending.
+	var updatedDep appsv1.Deployment
+	g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: "maas-controller", Namespace: depNS}, &updatedDep)).To(Succeed())
+	g.Expect(updatedDep.Annotations[TeardownCompletedAnnotation]).To(BeEmpty())
+}
+
+func TestLifecycleReconciler_TeardownClearsBootstrapMarkerBeforeAITenantCleanupCompletes(t *testing.T) {
+	g := NewWithT(t)
+	s := lifecycleTestScheme(t)
+
+	cfg := &maasv1alpha1.Config{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: maasv1alpha1.ConfigInstanceName,
+			Annotations: map[string]string{
+				DefaultAITenantBootstrappedAnnotation: "true",
+				"example.com/preserved":               "true",
+			},
+		},
+	}
+	aitenant := lifecycleTestUnstructured(
+		schema.GroupVersionKind{Group: "maas.opendatahub.io", Version: "v1alpha1", Kind: "AITenant"},
+		tenantreconcile.DefaultAITenantNamespace,
+		tenantreconcile.DefaultAITenantName,
+		aitenantFinalizer,
+	)
+
+	cl := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&maasv1alpha1.Config{}).WithRuntimeObjects(cfg, aitenant).Build()
+	r := &LifecycleReconciler{Client: cl, Scheme: s}
+
+	res, err := r.handleRequestedTeardown(context.Background(), nil, cfg)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(res.RequeueAfter).To(Equal(teardownRequeueAfter))
+
+	var updatedCfg maasv1alpha1.Config
+	g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: maasv1alpha1.ConfigInstanceName}, &updatedCfg)).To(Succeed())
+	g.Expect(updatedCfg.Annotations).NotTo(HaveKey(DefaultAITenantBootstrappedAnnotation))
+	g.Expect(updatedCfg.Annotations["example.com/preserved"]).To(Equal("true"))
+}
+
+func TestLifecycleReconciler_NormalReconcileDoesNotSetDeploymentOwnerReference(t *testing.T) {
+	g := NewWithT(t)
+	s := lifecycleTestScheme(t)
+
+	const depNS = "opendatahub"
 	dep := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "maas-controller",
@@ -102,27 +433,150 @@ func TestLifecycleReconciler_ConfigTerminatingRequeues(t *testing.T) {
 	}
 	cfg := &maasv1alpha1.Config{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:              maasv1alpha1.ConfigInstanceName,
-			UID:               types.UID("cfg-1"),
-			DeletionTimestamp: &now,
-			Finalizers:        []string{"test.finalizer"},
+			Name: maasv1alpha1.ConfigInstanceName,
+			UID:  types.UID("cfg-1"),
 		},
 	}
 
-	cl := fake.NewClientBuilder().WithScheme(s).WithObjects(dep, cfg).Build()
+	cl := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&maasv1alpha1.Config{}).WithObjects(dep, cfg).Build()
 	r := &LifecycleReconciler{
 		Client:                      cl,
 		Scheme:                      s,
 		DeploymentName:              "maas-controller",
 		DeploymentNS:                depNS,
 		TenantSubscriptionNamespace: "",
+		UsageLogsManifestPath:       lifecycleUsageLogsPath(t),
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "maas-controller", Namespace: depNS},
+	})
+	g.Expect(err).NotTo(HaveOccurred())
+
+	// Config must never own the Deployment: the Deployment carries the teardown
+	// annotations and must survive Config being deleted (accidentally, or during
+	// teardown), so it cannot be a GC dependent of Config.
+	var updated appsv1.Deployment
+	g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: "maas-controller", Namespace: depNS}, &updated)).To(Succeed())
+	g.Expect(updated.OwnerReferences).To(BeEmpty())
+}
+
+func TestLifecycleReconciler_StripsLegacyDeploymentConfigOwnerReferenceOnNormalReconcile(t *testing.T) {
+	g := NewWithT(t)
+	s := lifecycleTestScheme(t)
+
+	const depNS = "opendatahub"
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "maas-controller",
+			Namespace: depNS,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: maasv1alpha1.GroupVersion.String(),
+					Kind:       maasv1alpha1.ConfigKind,
+					Name:       maasv1alpha1.ConfigInstanceName,
+					UID:        types.UID("cfg-1"),
+				},
+				{
+					APIVersion: "v1",
+					Kind:       "Secret",
+					Name:       "unrelated",
+					UID:        types.UID("secret-1"),
+				},
+			},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "maas-controller"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "maas-controller"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "manager", Image: "test"}}},
+			},
+		},
+	}
+	cfg := &maasv1alpha1.Config{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: maasv1alpha1.ConfigInstanceName,
+			UID:  types.UID("cfg-1"),
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&maasv1alpha1.Config{}).WithObjects(dep, cfg).Build()
+	r := &LifecycleReconciler{
+		Client:                cl,
+		Scheme:                s,
+		DeploymentName:        "maas-controller",
+		DeploymentNS:          depNS,
+		UsageLogsManifestPath: lifecycleUsageLogsPath(t),
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "maas-controller", Namespace: depNS},
+	})
+	g.Expect(err).NotTo(HaveOccurred())
+
+	var updated appsv1.Deployment
+	g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: "maas-controller", Namespace: depNS}, &updated)).To(Succeed())
+	g.Expect(updated.OwnerReferences).To(HaveLen(1), "only the legacy Config ownerReference should be removed")
+	g.Expect(updated.OwnerReferences[0].Name).To(Equal("unrelated"))
+}
+
+func TestLifecycleReconciler_TeardownStripsLegacyOwnerReferenceBeforeDeletingConfig(t *testing.T) {
+	g := NewWithT(t)
+	s := lifecycleTestScheme(t)
+
+	const depNS = "opendatahub"
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "maas-controller",
+			Namespace: depNS,
+			Annotations: map[string]string{
+				TeardownRequestedAnnotation: "true",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: maasv1alpha1.GroupVersion.String(),
+					Kind:       maasv1alpha1.ConfigKind,
+					Name:       maasv1alpha1.ConfigInstanceName,
+					UID:        types.UID("cfg-legacy"),
+				},
+			},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "maas-controller"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "maas-controller"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "manager", Image: "test"}}},
+			},
+		},
+	}
+	cfg := &maasv1alpha1.Config{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: maasv1alpha1.ConfigInstanceName,
+			UID:  types.UID("cfg-legacy"),
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&maasv1alpha1.Config{}).WithObjects(dep, cfg).Build()
+	r := &LifecycleReconciler{
+		Client:         cl,
+		Scheme:         s,
+		DeploymentName: "maas-controller",
+		DeploymentNS:   depNS,
 	}
 
 	res, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "maas-controller", Namespace: depNS},
 	})
 	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(res.RequeueAfter).To(Equal(10 * time.Second))
+	g.Expect(res).To(Equal(ctrl.Result{}))
+
+	var updatedDep appsv1.Deployment
+	g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: "maas-controller", Namespace: depNS}, &updatedDep)).To(Succeed())
+	g.Expect(updatedDep.OwnerReferences).To(BeEmpty(), "legacy Config ownerReference must be gone before Config is deleted")
+	g.Expect(updatedDep.Annotations[TeardownCompletedAnnotation]).To(Equal("true"))
+
+	var updatedCfg maasv1alpha1.Config
+	g.Expect(apierrors.IsNotFound(cl.Get(context.Background(), client.ObjectKey{Name: maasv1alpha1.ConfigInstanceName}, &updatedCfg))).To(BeTrue())
 }
 
 func TestLifecycleReconciler_LinksDefaultTenantToConfig(t *testing.T) {
@@ -151,20 +605,37 @@ func TestLifecycleReconciler_LinksDefaultTenantToConfig(t *testing.T) {
 			UID:  types.UID("cfg-uid-tenant"),
 		},
 	}
-	tenant := &maasv1alpha1.Tenant{
+	tenant := &maasv1alpha1.MaasTenantConfig{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      maasv1alpha1.TenantInstanceName,
+			Name:      maasv1alpha1.MaasTenantConfigInstanceName,
 			Namespace: tenantNS,
 		},
 	}
 
-	cl := fake.NewClientBuilder().WithScheme(s).WithObjects(dep, cfg, tenant).Build()
+	// Build path to observability manifests relative to this test file
+	_, currentFile, _, ok := goruntime.Caller(0)
+	g.Expect(ok).To(BeTrue())
+	observabilityPath := filepath.Clean(filepath.Join(
+		filepath.Dir(currentFile),
+		"..", "..", "..", "..",
+		"deployment", "components", "observability", "observability", "dashboards",
+	))
+
+	// Compute absolute path to the usage-logs manifest from this test file's location.
+	_, testFile, _, ok := goruntime.Caller(0)
+	g.Expect(ok).To(BeTrue())
+	usageLogsPath := filepath.Join(filepath.Dir(testFile), "../../../../deployment/components/observability/usage-logs")
+
+	cl := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&maasv1alpha1.Config{}).WithObjects(dep, cfg, tenant).Build()
 	r := &LifecycleReconciler{
 		Client:                      cl,
 		Scheme:                      s,
 		DeploymentName:              "maas-controller",
 		DeploymentNS:                depNS,
 		TenantSubscriptionNamespace: tenantNS,
+		ObservabilityManifestsPath:  observabilityPath,
+		MonitoringNamespace:         depNS,
+		UsageLogsManifestPath:       usageLogsPath,
 	}
 
 	_, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -172,11 +643,1362 @@ func TestLifecycleReconciler_LinksDefaultTenantToConfig(t *testing.T) {
 	})
 	g.Expect(err).NotTo(HaveOccurred())
 
-	var updated maasv1alpha1.Tenant
-	g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: maasv1alpha1.TenantInstanceName, Namespace: tenantNS}, &updated)).To(Succeed())
+	var updated maasv1alpha1.MaasTenantConfig
+	g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: maasv1alpha1.MaasTenantConfigInstanceName, Namespace: tenantNS}, &updated)).To(Succeed())
 	g.Expect(updated.OwnerReferences).ToNot(BeEmpty())
 	ref := updated.OwnerReferences[0]
 	g.Expect(ref.UID).To(Equal(types.UID("cfg-uid-tenant")))
 	g.Expect(ref.Kind).To(Equal(maasv1alpha1.ConfigKind))
 	g.Expect(ref.Controller).To(BeNil())
+}
+
+func TestLifecycleReconciler_LinksDefaultAITenantToConfig(t *testing.T) {
+	g := NewWithT(t)
+	s := lifecycleTestScheme(t)
+
+	const depNS = "opendatahub"
+
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      tenantreconcile.MaaSControllerDeploymentName,
+			Namespace: depNS,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "maas-controller"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "maas-controller"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "manager", Image: "test"}}},
+			},
+		},
+	}
+	cfg := &maasv1alpha1.Config{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: maasv1alpha1.ConfigInstanceName,
+			UID:  types.UID("cfg-uid-aitenant"),
+		},
+	}
+	aitenant := &maasv1alpha1.AITenant{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      tenantreconcile.DefaultAITenantName,
+			Namespace: tenantreconcile.DefaultAITenantNamespace,
+		},
+	}
+
+	// Compute absolute path to the usage-logs manifest from this test file's location.
+	_, testFile, _, ok := goruntime.Caller(0)
+	g.Expect(ok).To(BeTrue())
+	usageLogsPath := filepath.Join(filepath.Dir(testFile), "../../../../deployment/components/observability/usage-logs")
+
+	cl := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&maasv1alpha1.Config{}).WithObjects(dep, cfg, aitenant).Build()
+	r := &LifecycleReconciler{
+		Client:                cl,
+		Scheme:                s,
+		DeploymentName:        tenantreconcile.MaaSControllerDeploymentName,
+		DeploymentNS:          depNS,
+		AITenantNamespace:     tenantreconcile.DefaultAITenantNamespace,
+		UsageLogsManifestPath: usageLogsPath,
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: tenantreconcile.MaaSControllerDeploymentName, Namespace: depNS},
+	})
+	g.Expect(err).NotTo(HaveOccurred())
+
+	var updated maasv1alpha1.AITenant
+	g.Expect(cl.Get(context.Background(), client.ObjectKey{
+		Name:      tenantreconcile.DefaultAITenantName,
+		Namespace: tenantreconcile.DefaultAITenantNamespace,
+	}, &updated)).To(Succeed())
+	g.Expect(updated.OwnerReferences).ToNot(BeEmpty())
+	ref, found := ownerReferenceToConfig(updated.OwnerReferences, types.UID("cfg-uid-aitenant"))
+	g.Expect(found).To(BeTrue())
+	g.Expect(ref.Controller).To(BeNil())
+}
+
+func TestLifecycleReconciler_SkipsConfigOwnerRefOnTerminatingDefaultAITenant(t *testing.T) {
+	g := NewWithT(t)
+	s := lifecycleTestScheme(t)
+
+	const depNS = "opendatahub"
+	now := metav1.Now()
+
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      tenantreconcile.MaaSControllerDeploymentName,
+			Namespace: depNS,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "maas-controller"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "maas-controller"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "manager", Image: "test"}}},
+			},
+		},
+	}
+	cfg := &maasv1alpha1.Config{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: maasv1alpha1.ConfigInstanceName,
+			UID:  types.UID("cfg-uid-new"),
+		},
+	}
+	aitenant := &maasv1alpha1.AITenant{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              tenantreconcile.DefaultAITenantName,
+			Namespace:         tenantreconcile.DefaultAITenantNamespace,
+			DeletionTimestamp: &now,
+			Finalizers:        []string{aitenantFinalizer},
+		},
+		Status: maasv1alpha1.AITenantStatus{Phase: "Terminating"},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&maasv1alpha1.Config{}, &maasv1alpha1.AITenant{}).WithObjects(dep, cfg, aitenant).Build()
+	r := &LifecycleReconciler{
+		Client:            cl,
+		Scheme:            s,
+		DeploymentName:    tenantreconcile.MaaSControllerDeploymentName,
+		DeploymentNS:      depNS,
+		AITenantNamespace: tenantreconcile.DefaultAITenantNamespace,
+	}
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: tenantreconcile.MaaSControllerDeploymentName, Namespace: depNS},
+	})
+	g.Expect(err).NotTo(HaveOccurred())
+
+	var updated maasv1alpha1.AITenant
+	g.Expect(cl.Get(context.Background(), client.ObjectKey{
+		Name:      tenantreconcile.DefaultAITenantName,
+		Namespace: tenantreconcile.DefaultAITenantNamespace,
+	}, &updated)).To(Succeed())
+	g.Expect(updated.OwnerReferences).To(BeEmpty())
+}
+
+func ownerReferenceToConfig(refs []metav1.OwnerReference, uid types.UID) (metav1.OwnerReference, bool) {
+	for _, ref := range refs {
+		if ref.APIVersion == maasv1alpha1.GroupVersion.String() &&
+			ref.Kind == maasv1alpha1.ConfigKind &&
+			ref.UID == uid {
+			return ref, true
+		}
+	}
+	return metav1.OwnerReference{}, false
+}
+
+func TestLifecycleReconciler_LimitadorServiceMonitorDefaultInterval(t *testing.T) {
+	g := NewWithT(t)
+	s := lifecycleTestScheme(t)
+
+	const monitoringNS = "opendatahub"
+
+	cfg := &maasv1alpha1.Config{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: maasv1alpha1.ConfigInstanceName,
+			UID:  types.UID("cfg-uid-limitador"),
+		},
+		Spec: maasv1alpha1.ConfigSpec{},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&maasv1alpha1.Config{}).WithObjects(cfg).Build()
+	r := &LifecycleReconciler{
+		Client:              cl,
+		Scheme:              s,
+		MonitoringNamespace: monitoringNS,
+	}
+
+	err := r.ensureLimitadorServiceMonitor(context.Background())
+	g.Expect(err).NotTo(HaveOccurred())
+
+	sm := &unstructured.Unstructured{}
+	sm.SetAPIVersion("monitoring.coreos.com/v1")
+	sm.SetKind("ServiceMonitor")
+	g.Expect(cl.Get(context.Background(), client.ObjectKey{
+		Name:      "limitador-metrics",
+		Namespace: monitoringNS,
+	}, sm)).To(Succeed())
+
+	spec, found, err := unstructured.NestedMap(sm.Object, "spec")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(found).To(BeTrue())
+
+	endpoints, found, err := unstructured.NestedSlice(spec, "endpoints")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(found).To(BeTrue())
+	g.Expect(endpoints).To(HaveLen(1))
+
+	endpoint, ok := endpoints[0].(map[string]any)
+	g.Expect(ok).To(BeTrue())
+	g.Expect(endpoint["interval"]).To(Equal("30s"))
+}
+
+func TestLifecycleReconciler_LimitadorServiceMonitorCustomInterval(t *testing.T) {
+	g := NewWithT(t)
+	s := lifecycleTestScheme(t)
+
+	const monitoringNS = "opendatahub"
+
+	cfg := &maasv1alpha1.Config{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: maasv1alpha1.ConfigInstanceName,
+			UID:  types.UID("cfg-uid-limitador-custom"),
+		},
+		Spec: maasv1alpha1.ConfigSpec{
+			LimitadorScrapeInterval: "1m",
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&maasv1alpha1.Config{}).WithObjects(cfg).Build()
+	r := &LifecycleReconciler{
+		Client:              cl,
+		Scheme:              s,
+		MonitoringNamespace: monitoringNS,
+	}
+
+	err := r.ensureLimitadorServiceMonitor(context.Background())
+	g.Expect(err).NotTo(HaveOccurred())
+
+	sm := &unstructured.Unstructured{}
+	sm.SetAPIVersion("monitoring.coreos.com/v1")
+	sm.SetKind("ServiceMonitor")
+	g.Expect(cl.Get(context.Background(), client.ObjectKey{
+		Name:      "limitador-metrics",
+		Namespace: monitoringNS,
+	}, sm)).To(Succeed())
+
+	spec, found, err := unstructured.NestedMap(sm.Object, "spec")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(found).To(BeTrue())
+
+	endpoints, found, err := unstructured.NestedSlice(spec, "endpoints")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(found).To(BeTrue())
+	g.Expect(endpoints).To(HaveLen(1))
+
+	endpoint, ok := endpoints[0].(map[string]any)
+	g.Expect(ok).To(BeTrue())
+	g.Expect(endpoint["interval"]).To(Equal("1m"))
+}
+
+func TestEnsureUsageLogs(t *testing.T) {
+	const monitoringNS = "redhat-ods-monitoring"
+
+	gvkOpenTelemetryCollector := schema.GroupVersionKind{
+		Group: "opentelemetry.io", Version: "v1beta1", Kind: "OpenTelemetryCollector",
+	}
+	gvkClusterRoleBinding := schema.GroupVersionKind{
+		Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRoleBinding",
+	}
+	gvkNetworkPolicy := schema.GroupVersionKind{
+		Group: "networking.k8s.io", Version: "v1", Kind: "NetworkPolicy",
+	}
+
+	usageLogsPath := lifecycleUsageLogsPath(t)
+
+	cases := []struct {
+		name             string
+		spec             maasv1alpha1.ConfigSpec
+		wantCollector    bool
+		wantLokiInstance string
+	}{
+		{name: "usageLogging unset uses dsci-managed", spec: maasv1alpha1.ConfigSpec{}, wantCollector: false, wantLokiInstance: "data-science-usage-logs-lokistack"},
+		{name: "usageLogging false uses dsci-managed", spec: maasv1alpha1.ConfigSpec{UsageLogging: ptr.To(false)}, wantCollector: false, wantLokiInstance: "data-science-usage-logs-lokistack"},
+		{name: "usageLogging true uses usage-logs", spec: maasv1alpha1.ConfigSpec{UsageLogging: ptr.To(true)}, wantCollector: true, wantLokiInstance: "usage"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			s := lifecycleTestScheme(t)
+
+			cfg := &maasv1alpha1.Config{
+				ObjectMeta: metav1.ObjectMeta{Name: maasv1alpha1.ConfigInstanceName, UID: types.UID("cfg-uid")},
+				Spec:       tc.spec,
+			}
+
+			cl := newSSAFakeClientBuilder(s).WithStatusSubresource(&maasv1alpha1.Config{}).WithObjects(cfg).Build()
+			r := &LifecycleReconciler{
+				Client:                cl,
+				Scheme:                s,
+				MonitoringNamespace:   monitoringNS,
+				UsageLogsManifestPath: usageLogsPath,
+			}
+
+			err := r.ensureUsageLogs(context.Background(), ctrl.Log)
+			g.Expect(err).NotTo(HaveOccurred())
+
+			collector := &unstructured.Unstructured{}
+			collector.SetGroupVersionKind(gvkOpenTelemetryCollector)
+			collectorErr := cl.Get(context.Background(), client.ObjectKey{Name: "usage-logs", Namespace: monitoringNS}, collector)
+
+			crb := &unstructured.Unstructured{}
+			crb.SetGroupVersionKind(gvkClusterRoleBinding)
+			crbErr := cl.Get(context.Background(), client.ObjectKey{Name: "usage-collector-application-logs-write"}, crb)
+
+			if tc.wantCollector {
+				g.Expect(collectorErr).NotTo(HaveOccurred(), "OpenTelemetryCollector should exist")
+				g.Expect(crbErr).NotTo(HaveOccurred(), "ClusterRoleBinding should exist")
+
+				subjects, found, err := unstructured.NestedSlice(crb.Object, "subjects")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(found).To(BeTrue())
+				g.Expect(subjects).NotTo(BeEmpty())
+				subj, ok := subjects[0].(map[string]any)
+				g.Expect(ok).To(BeTrue())
+				g.Expect(subj["namespace"]).To(Equal(monitoringNS))
+			} else {
+				g.Expect(apierrors.IsNotFound(collectorErr)).To(BeTrue(), "OpenTelemetryCollector should not be deployed")
+				g.Expect(apierrors.IsNotFound(crbErr)).To(BeTrue(), "collector ClusterRoleBinding should not be deployed")
+			}
+
+			dep := &appsv1.Deployment{}
+			g.Expect(cl.Get(context.Background(), client.ObjectKey{
+				Name: usageLogsTenancyProxyDeploymentName, Namespace: monitoringNS,
+			}, dep)).To(Succeed(), "tenancy proxy Deployment should exist")
+
+			np := &unstructured.Unstructured{}
+			np.SetGroupVersionKind(gvkNetworkPolicy)
+			g.Expect(cl.Get(context.Background(), client.ObjectKey{
+				Name: "usage-tenancy-proxy-egress-restrict", Namespace: monitoringNS,
+			}, np)).To(Succeed())
+			g.Expect(lokiStackInstanceLabel(np)).To(Equal(tc.wantLokiInstance))
+		})
+	}
+
+	t.Run("disabling usageLogging deletes controller-owned collector and binding", func(t *testing.T) {
+		g := NewWithT(t)
+		s := lifecycleTestScheme(t)
+
+		cfg := &maasv1alpha1.Config{
+			ObjectMeta: metav1.ObjectMeta{Name: maasv1alpha1.ConfigInstanceName, UID: types.UID("cfg-uid")},
+			Spec:       maasv1alpha1.ConfigSpec{UsageLogging: ptr.To(true)},
+		}
+		cl := newSSAFakeClientBuilder(s).WithStatusSubresource(&maasv1alpha1.Config{}).WithObjects(cfg).Build()
+		r := &LifecycleReconciler{
+			Client:                cl,
+			Scheme:                s,
+			MonitoringNamespace:   monitoringNS,
+			UsageLogsManifestPath: usageLogsPath,
+		}
+
+		g.Expect(r.ensureUsageLogs(context.Background(), ctrl.Log)).To(Succeed())
+
+		collector := &unstructured.Unstructured{}
+		collector.SetGroupVersionKind(gvkOpenTelemetryCollector)
+		g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: "usage-logs", Namespace: monitoringNS}, collector)).To(Succeed())
+		g.Expect(isOwnedByConfigOrController(collector, cfg.UID)).To(BeTrue())
+
+		crb := &unstructured.Unstructured{}
+		crb.SetGroupVersionKind(gvkClusterRoleBinding)
+		g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: "usage-collector-application-logs-write"}, crb)).To(Succeed())
+		g.Expect(isOwnedByConfigOrController(crb, cfg.UID)).To(BeTrue())
+
+		stored := &maasv1alpha1.Config{}
+		g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: maasv1alpha1.ConfigInstanceName}, stored)).To(Succeed())
+		stored.Spec.UsageLogging = ptr.To(false)
+		g.Expect(cl.Update(context.Background(), stored)).To(Succeed())
+
+		g.Expect(r.ensureUsageLogs(context.Background(), ctrl.Log)).To(Succeed())
+
+		expectUsageLogsOnlyResources(t, g, cl, monitoringNS, false)
+
+		dep := &appsv1.Deployment{}
+		g.Expect(cl.Get(context.Background(), client.ObjectKey{
+			Name: usageLogsTenancyProxyDeploymentName, Namespace: monitoringNS,
+		}, dep)).To(Succeed(), "tenancy proxy Deployment should remain")
+
+		np := &unstructured.Unstructured{}
+		np.SetGroupVersionKind(gvkNetworkPolicy)
+		g.Expect(cl.Get(context.Background(), client.ObjectKey{
+			Name: "usage-tenancy-proxy-egress-restrict", Namespace: monitoringNS,
+		}, np)).To(Succeed())
+		g.Expect(lokiStackInstanceLabel(np)).To(Equal("data-science-usage-logs-lokistack"))
+	})
+
+	t.Run("enabling usageLogging creates usage-logs resources and keeps shared ones", func(t *testing.T) {
+		g := NewWithT(t)
+		s := lifecycleTestScheme(t)
+
+		cfg := &maasv1alpha1.Config{
+			ObjectMeta: metav1.ObjectMeta{Name: maasv1alpha1.ConfigInstanceName, UID: types.UID("cfg-uid")},
+			Spec:       maasv1alpha1.ConfigSpec{UsageLogging: ptr.To(false)},
+		}
+		cl := newSSAFakeClientBuilder(s).WithStatusSubresource(&maasv1alpha1.Config{}).WithObjects(cfg).Build()
+		r := &LifecycleReconciler{
+			Client:                cl,
+			Scheme:                s,
+			MonitoringNamespace:   monitoringNS,
+			UsageLogsManifestPath: usageLogsPath,
+		}
+
+		g.Expect(r.ensureUsageLogs(context.Background(), ctrl.Log)).To(Succeed())
+		expectUsageLogsOnlyResources(t, g, cl, monitoringNS, false)
+
+		stored := &maasv1alpha1.Config{}
+		g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: maasv1alpha1.ConfigInstanceName}, stored)).To(Succeed())
+		stored.Spec.UsageLogging = ptr.To(true)
+		g.Expect(cl.Update(context.Background(), stored)).To(Succeed())
+
+		g.Expect(r.ensureUsageLogs(context.Background(), ctrl.Log)).To(Succeed())
+		expectUsageLogsOnlyResources(t, g, cl, monitoringNS, true)
+
+		dep := &appsv1.Deployment{}
+		g.Expect(cl.Get(context.Background(), client.ObjectKey{
+			Name: usageLogsTenancyProxyDeploymentName, Namespace: monitoringNS,
+		}, dep)).To(Succeed(), "tenancy proxy Deployment should remain")
+
+		np := &unstructured.Unstructured{}
+		np.SetGroupVersionKind(gvkNetworkPolicy)
+		g.Expect(cl.Get(context.Background(), client.ObjectKey{
+			Name: "usage-tenancy-proxy-egress-restrict", Namespace: monitoringNS,
+		}, np)).To(Succeed())
+		g.Expect(lokiStackInstanceLabel(np)).To(Equal("usage"))
+
+		g.Expect(r.ensureUsageLogs(context.Background(), ctrl.Log)).To(Succeed())
+		g.Expect(cl.Get(context.Background(), client.ObjectKey{
+			Name: usageLogsTenancyProxyDeploymentName, Namespace: monitoringNS,
+		}, dep)).To(Succeed(), "shared resources should survive another reconcile")
+		expectUsageLogsOnlyResources(t, g, cl, monitoringNS, true)
+	})
+
+	t.Run("disabling usageLogging preserves unowned collector and binding", func(t *testing.T) {
+		g := NewWithT(t)
+		s := lifecycleTestScheme(t)
+
+		cfg := &maasv1alpha1.Config{
+			ObjectMeta: metav1.ObjectMeta{Name: maasv1alpha1.ConfigInstanceName, UID: types.UID("cfg-uid")},
+			Spec:       maasv1alpha1.ConfigSpec{UsageLogging: ptr.To(false)},
+		}
+
+		collector := &unstructured.Unstructured{}
+		collector.SetGroupVersionKind(gvkOpenTelemetryCollector)
+		collector.SetName("usage-logs")
+		collector.SetNamespace(monitoringNS)
+		collector.SetLabels(map[string]string{"app.kubernetes.io/managed-by": "someone-else"})
+
+		crb := &unstructured.Unstructured{}
+		crb.SetGroupVersionKind(gvkClusterRoleBinding)
+		crb.SetName("usage-collector-application-logs-write")
+		crb.SetLabels(map[string]string{"app.kubernetes.io/managed-by": "someone-else"})
+
+		cl := newSSAFakeClientBuilder(s).WithStatusSubresource(&maasv1alpha1.Config{}).WithObjects(cfg, collector, crb).Build()
+		r := &LifecycleReconciler{
+			Client:                cl,
+			Scheme:                s,
+			MonitoringNamespace:   monitoringNS,
+			UsageLogsManifestPath: usageLogsPath,
+		}
+
+		g.Expect(r.ensureUsageLogs(context.Background(), ctrl.Log)).To(Succeed())
+
+		gotCollector := &unstructured.Unstructured{}
+		gotCollector.SetGroupVersionKind(gvkOpenTelemetryCollector)
+		g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: "usage-logs", Namespace: monitoringNS}, gotCollector)).To(Succeed())
+		g.Expect(gotCollector.GetOwnerReferences()).To(BeEmpty())
+
+		gotCRB := &unstructured.Unstructured{}
+		gotCRB.SetGroupVersionKind(gvkClusterRoleBinding)
+		g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: "usage-collector-application-logs-write"}, gotCRB)).To(Succeed())
+		g.Expect(gotCRB.GetOwnerReferences()).To(BeEmpty())
+	})
+
+	t.Run("tenancy proxy serves TLS 1.3 with hybrid post-quantum key exchange", func(t *testing.T) {
+		g := NewWithT(t)
+		s := lifecycleTestScheme(t)
+
+		cfg := &maasv1alpha1.Config{
+			ObjectMeta: metav1.ObjectMeta{Name: maasv1alpha1.ConfigInstanceName, UID: types.UID("cfg-uid")},
+			Spec:       maasv1alpha1.ConfigSpec{UsageLogging: ptr.To(false)},
+		}
+		cl := newSSAFakeClientBuilder(s).WithStatusSubresource(&maasv1alpha1.Config{}).WithObjects(cfg).Build()
+		r := &LifecycleReconciler{
+			Client:                cl,
+			Scheme:                s,
+			MonitoringNamespace:   monitoringNS,
+			UsageLogsManifestPath: usageLogsPath,
+		}
+
+		g.Expect(r.ensureUsageLogs(context.Background(), ctrl.Log)).To(Succeed())
+
+		dep := &appsv1.Deployment{}
+		g.Expect(cl.Get(context.Background(), client.ObjectKey{
+			Name: usageLogsTenancyProxyDeploymentName, Namespace: monitoringNS,
+		}, dep)).To(Succeed())
+
+		var proxy *corev1.Container
+		for i := range dep.Spec.Template.Spec.Containers {
+			if dep.Spec.Template.Spec.Containers[i].Name == usageLogsTenancyProxyContainerName {
+				proxy = &dep.Spec.Template.Spec.Containers[i]
+			}
+		}
+		g.Expect(proxy).NotTo(BeNil(), "proxy container should exist")
+
+		openSSLConf := ""
+		for _, env := range proxy.Env {
+			if env.Name == "OPENSSL_CONF" {
+				openSSLConf = env.Value
+			}
+		}
+		g.Expect(openSSLConf).To(Equal("/opt/app-root/src/proxy/openssl.conf"))
+
+		cm := &corev1.ConfigMap{}
+		g.Expect(cl.Get(context.Background(), client.ObjectKey{
+			Name: "usage-tenancy-proxy-source", Namespace: monitoringNS,
+		}, cm)).To(Succeed())
+		g.Expect(cm.Data).To(HaveKey("openssl.conf"))
+		g.Expect(cm.Data["openssl.conf"]).To(ContainSubstring("X25519MLKEM768"))
+		g.Expect(cm.Data["main.py"]).To(ContainSubstring("TLSVersion.TLSv1_3"))
+	})
+}
+
+func expectUsageLogsOnlyResources(t *testing.T, g *WithT, cl client.Client, namespace string, want bool) {
+	t.Helper()
+	objs := []struct {
+		gvk  schema.GroupVersionKind
+		name string
+		ns   string
+	}{
+		{schema.GroupVersionKind{Group: "opentelemetry.io", Version: "v1beta1", Kind: "OpenTelemetryCollector"}, "usage-logs", namespace},
+		{schema.GroupVersionKind{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRole"}, "usage-collector-application-logs-write", ""},
+		{schema.GroupVersionKind{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRoleBinding"}, "usage-collector-application-logs-write", ""},
+		{schema.GroupVersionKind{Group: "networking.k8s.io", Version: "v1", Kind: "NetworkPolicy"}, "usage-logs-collector-allow-gateway", namespace},
+		{schema.GroupVersionKind{Group: "networking.k8s.io", Version: "v1", Kind: "NetworkPolicy"}, "usage-logs-collector-egress-restrict", namespace},
+		{schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"}, "usage-logs-service-ca", namespace},
+	}
+	for _, obj := range objs {
+		got := &unstructured.Unstructured{}
+		got.SetGroupVersionKind(obj.gvk)
+		err := cl.Get(context.Background(), client.ObjectKey{Name: obj.name, Namespace: obj.ns}, got)
+		if want {
+			g.Expect(err).NotTo(HaveOccurred(), "%s %s should exist", obj.gvk.Kind, obj.name)
+			continue
+		}
+		g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "%s %s should be absent", obj.gvk.Kind, obj.name)
+	}
+}
+
+func TestResourcesAbsentFrom(t *testing.T) {
+	g := NewWithT(t)
+	shared := unstructuredResource("v1", "ConfigMap", "ns", "shared")
+	onlyHave := unstructuredResource("v1", "ConfigMap", "ns", "only-have")
+	onlyKeep := unstructuredResource("v1", "ConfigMap", "ns", "only-keep")
+
+	stale := resourcesAbsentFrom(
+		[]unstructured.Unstructured{shared, onlyHave},
+		[]unstructured.Unstructured{shared, onlyKeep},
+	)
+	g.Expect(stale).To(HaveLen(1))
+	g.Expect(stale[0].GetName()).To(Equal("only-have"))
+
+	g.Expect(resourcesAbsentFrom(
+		[]unstructured.Unstructured{shared},
+		[]unstructured.Unstructured{shared},
+	)).To(BeEmpty())
+}
+
+func unstructuredResource(apiVersion, kind, namespace, name string) unstructured.Unstructured {
+	obj := unstructured.Unstructured{}
+	obj.SetAPIVersion(apiVersion)
+	obj.SetKind(kind)
+	obj.SetNamespace(namespace)
+	obj.SetName(name)
+	return obj
+}
+
+func lokiStackInstanceLabel(np *unstructured.Unstructured) string {
+	egress, found, err := unstructured.NestedSlice(np.Object, "spec", "egress")
+	if err != nil || !found {
+		return ""
+	}
+	for _, rule := range egress {
+		ruleMap, ok := rule.(map[string]any)
+		if !ok {
+			continue
+		}
+		peers, ok := ruleMap["to"].([]any)
+		if !ok {
+			continue
+		}
+		for _, peer := range peers {
+			peerMap, ok := peer.(map[string]any)
+			if !ok {
+				continue
+			}
+			selector, ok := peerMap["podSelector"].(map[string]any)
+			if !ok {
+				continue
+			}
+			labels, ok := selector["matchLabels"].(map[string]any)
+			if !ok || labels["app.kubernetes.io/name"] != "lokistack" {
+				continue
+			}
+			instance, _ := labels["app.kubernetes.io/instance"].(string)
+			return instance
+		}
+	}
+	return ""
+}
+
+func TestEnsureUsageDashboard(t *testing.T) {
+	const (
+		monitoringNS  = "redhat-ods-monitoring"
+		dashboardName = "dashboard-3-maas-usage-admin"
+	)
+
+	gvkPersesDashboard := schema.GroupVersionKind{
+		Group: "perses.dev", Version: "v1alpha1", Kind: "PersesDashboard",
+	}
+	dashboardsPath := lifecycleObservabilityDashboardsPath(t)
+
+	t.Run("disabled deletes controller-owned dashboard", func(t *testing.T) {
+		g := NewWithT(t)
+		s := lifecycleTestScheme(t)
+
+		cfg := &maasv1alpha1.Config{
+			ObjectMeta: metav1.ObjectMeta{Name: maasv1alpha1.ConfigInstanceName, UID: types.UID("cfg-uid")},
+			Spec:       maasv1alpha1.ConfigSpec{UsageMetricsDashboard: ptr.To(false)},
+		}
+
+		dashboard := &unstructured.Unstructured{}
+		dashboard.SetGroupVersionKind(gvkPersesDashboard)
+		dashboard.SetName(dashboardName)
+		dashboard.SetNamespace(monitoringNS)
+		dashboard.SetOwnerReferences([]metav1.OwnerReference{{
+			APIVersion: "maas.opendatahub.io/v1alpha1",
+			Kind:       "Config",
+			Name:       maasv1alpha1.ConfigInstanceName,
+			UID:        cfg.UID,
+			Controller: ptr.To(true),
+		}})
+
+		cl := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&maasv1alpha1.Config{}).WithObjects(cfg, dashboard).Build()
+		r := &LifecycleReconciler{
+			Client:                     cl,
+			Scheme:                     s,
+			MonitoringNamespace:        monitoringNS,
+			ObservabilityManifestsPath: dashboardsPath,
+		}
+
+		err := r.ensureUsageDashboard(context.Background(), ctrl.Log)
+		g.Expect(err).NotTo(HaveOccurred())
+
+		got := &unstructured.Unstructured{}
+		got.SetGroupVersionKind(gvkPersesDashboard)
+		err = cl.Get(context.Background(), client.ObjectKey{Name: dashboardName, Namespace: monitoringNS}, got)
+		g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "controller-owned PersesDashboard should be deleted")
+	})
+
+	t.Run("omitted defaults to disabled and deletes controller-owned dashboard", func(t *testing.T) {
+		g := NewWithT(t)
+		s := lifecycleTestScheme(t)
+
+		cfg := &maasv1alpha1.Config{
+			ObjectMeta: metav1.ObjectMeta{Name: maasv1alpha1.ConfigInstanceName, UID: types.UID("cfg-uid")},
+		}
+
+		dashboard := &unstructured.Unstructured{}
+		dashboard.SetGroupVersionKind(gvkPersesDashboard)
+		dashboard.SetName(dashboardName)
+		dashboard.SetNamespace(monitoringNS)
+		dashboard.SetOwnerReferences([]metav1.OwnerReference{{
+			APIVersion: "maas.opendatahub.io/v1alpha1",
+			Kind:       "Config",
+			Name:       maasv1alpha1.ConfigInstanceName,
+			UID:        cfg.UID,
+			Controller: ptr.To(true),
+		}})
+
+		cl := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&maasv1alpha1.Config{}).WithObjects(cfg, dashboard).Build()
+		r := &LifecycleReconciler{
+			Client:                     cl,
+			Scheme:                     s,
+			MonitoringNamespace:        monitoringNS,
+			ObservabilityManifestsPath: dashboardsPath,
+		}
+
+		err := r.ensureUsageDashboard(context.Background(), ctrl.Log)
+		g.Expect(err).NotTo(HaveOccurred())
+
+		got := &unstructured.Unstructured{}
+		got.SetGroupVersionKind(gvkPersesDashboard)
+		err = cl.Get(context.Background(), client.ObjectKey{Name: dashboardName, Namespace: monitoringNS}, got)
+		g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "controller-owned PersesDashboard should be deleted when usageMetricsDashboard is omitted")
+	})
+
+	t.Run("disabled preserves unowned dashboard", func(t *testing.T) {
+		g := NewWithT(t)
+		s := lifecycleTestScheme(t)
+
+		cfg := &maasv1alpha1.Config{
+			ObjectMeta: metav1.ObjectMeta{Name: maasv1alpha1.ConfigInstanceName, UID: types.UID("cfg-uid")},
+			Spec:       maasv1alpha1.ConfigSpec{UsageMetricsDashboard: ptr.To(false)},
+		}
+
+		foreignDashboard := &unstructured.Unstructured{}
+		foreignDashboard.SetGroupVersionKind(gvkPersesDashboard)
+		foreignDashboard.SetName(dashboardName)
+		foreignDashboard.SetNamespace(monitoringNS)
+		foreignDashboard.SetLabels(map[string]string{
+			"app.kubernetes.io/managed-by": "maas-observability",
+		})
+
+		cl := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&maasv1alpha1.Config{}).WithObjects(cfg, foreignDashboard).Build()
+		r := &LifecycleReconciler{
+			Client:                     cl,
+			Scheme:                     s,
+			MonitoringNamespace:        monitoringNS,
+			ObservabilityManifestsPath: dashboardsPath,
+		}
+
+		err := r.ensureUsageDashboard(context.Background(), ctrl.Log)
+		g.Expect(err).NotTo(HaveOccurred())
+
+		got := &unstructured.Unstructured{}
+		got.SetGroupVersionKind(gvkPersesDashboard)
+		err = cl.Get(context.Background(), client.ObjectKey{Name: dashboardName, Namespace: monitoringNS}, got)
+		g.Expect(err).NotTo(HaveOccurred(), "kustomize-applied PersesDashboard should be preserved (CWE-284)")
+		g.Expect(got.GetOwnerReferences()).To(BeEmpty(),
+			"foreign resource should not have OwnerReferences")
+	})
+
+	t.Run("enabled applies dashboard with monitoring namespace", func(t *testing.T) {
+		g := NewWithT(t)
+		s := lifecycleTestScheme(t)
+
+		cfg := &maasv1alpha1.Config{
+			ObjectMeta: metav1.ObjectMeta{Name: maasv1alpha1.ConfigInstanceName, UID: types.UID("cfg-uid")},
+			Spec:       maasv1alpha1.ConfigSpec{UsageMetricsDashboard: ptr.To(true)},
+		}
+
+		cl := newSSAFakeClientBuilder(s).WithStatusSubresource(&maasv1alpha1.Config{}).WithObjects(cfg).Build()
+		r := &LifecycleReconciler{
+			Client:                     cl,
+			Scheme:                     s,
+			MonitoringNamespace:        monitoringNS,
+			ObservabilityManifestsPath: dashboardsPath,
+		}
+
+		err := r.ensureUsageDashboard(context.Background(), ctrl.Log)
+		g.Expect(err).NotTo(HaveOccurred())
+
+		got := &unstructured.Unstructured{}
+		got.SetGroupVersionKind(gvkPersesDashboard)
+		g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: dashboardName, Namespace: monitoringNS}, got)).
+			To(Succeed(), "PersesDashboard should exist when usageMetricsDashboard is enabled")
+		g.Expect(got.GetNamespace()).To(Equal(monitoringNS))
+	})
+}
+
+func TestEnsureObservability_EmptyMonitoringNamespace(t *testing.T) {
+	t.Run("skips when monitoring namespace is empty", func(t *testing.T) {
+		g := NewWithT(t)
+		s := lifecycleTestScheme(t)
+
+		cl := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&maasv1alpha1.Config{}).Build()
+		r := &LifecycleReconciler{
+			Client:              cl,
+			Scheme:              s,
+			MonitoringNamespace: "",
+		}
+
+		err := r.ensureObservability(context.Background(), ctrl.Log)
+		g.Expect(err).NotTo(HaveOccurred())
+	})
+
+	t.Run("skips when monitoring namespace does not exist", func(t *testing.T) {
+		g := NewWithT(t)
+		s := lifecycleTestScheme(t)
+
+		cl := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&maasv1alpha1.Config{}).Build()
+		r := &LifecycleReconciler{
+			Client:              cl,
+			Scheme:              s,
+			MonitoringNamespace: "nonexistent-ns",
+		}
+
+		err := r.ensureObservability(context.Background(), ctrl.Log)
+		g.Expect(err).NotTo(HaveOccurred())
+	})
+}
+
+func TestPatchTenancyProxyImage(t *testing.T) {
+	t.Run("patches proxy container image when RELATED_IMAGE set", func(t *testing.T) {
+		g := NewWithT(t)
+		t.Setenv("RELATED_IMAGE_ODH_PYTHON_312_IMAGE", "quay.io/example/tenancy-proxy:test")
+
+		deployment := &unstructured.Unstructured{
+			Object: map[string]any{
+				"apiVersion": "apps/v1",
+				"kind":       "Deployment",
+				"metadata": map[string]any{
+					"name": "usage-logs-tenancy-proxy",
+				},
+				"spec": map[string]any{
+					"template": map[string]any{
+						"spec": map[string]any{
+							"containers": []any{
+								map[string]any{
+									"name":  "proxy",
+									"image": "registry.redhat.io/ubi9/python-312@sha256:f6713d327d37e654a443752e6654b5aab88f31690e1161eed9c34dd837870172",
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		err := patchTenancyProxyImage(deployment)
+		g.Expect(err).NotTo(HaveOccurred())
+
+		containers, found, err := unstructured.NestedSlice(deployment.Object, "spec", "template", "spec", "containers")
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(found).To(BeTrue())
+		g.Expect(containers).To(HaveLen(1))
+
+		container, ok := containers[0].(map[string]any)
+		g.Expect(ok).To(BeTrue())
+		g.Expect(container["image"]).To(Equal("quay.io/example/tenancy-proxy:test"))
+	})
+
+	t.Run("uses default image when RELATED_IMAGE not set", func(t *testing.T) {
+		g := NewWithT(t)
+
+		deployment := &unstructured.Unstructured{
+			Object: map[string]any{
+				"apiVersion": "apps/v1",
+				"kind":       "Deployment",
+				"metadata": map[string]any{
+					"name": "usage-logs-tenancy-proxy",
+				},
+				"spec": map[string]any{
+					"template": map[string]any{
+						"spec": map[string]any{
+							"containers": []any{
+								map[string]any{
+									"name": "proxy",
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		err := patchTenancyProxyImage(deployment)
+		g.Expect(err).NotTo(HaveOccurred())
+
+		containers, found, err := unstructured.NestedSlice(deployment.Object, "spec", "template", "spec", "containers")
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(found).To(BeTrue())
+
+		container, ok := containers[0].(map[string]any)
+		g.Expect(ok).To(BeTrue())
+		g.Expect(container["image"]).To(Equal(DefaultUsageLogsTenancyProxyImage))
+	})
+
+	t.Run("ignores non-matching deployment", func(t *testing.T) {
+		g := NewWithT(t)
+		t.Setenv("RELATED_IMAGE_ODH_PYTHON_312_IMAGE", "quay.io/example/tenancy-proxy:test")
+
+		deployment := &unstructured.Unstructured{
+			Object: map[string]any{
+				"apiVersion": "apps/v1",
+				"kind":       "Deployment",
+				"metadata": map[string]any{
+					"name": "some-other-deployment",
+				},
+				"spec": map[string]any{
+					"template": map[string]any{
+						"spec": map[string]any{
+							"containers": []any{
+								map[string]any{
+									"name":  "proxy",
+									"image": "registry.redhat.io/ubi9/python-312@sha256:f6713d327d37e654a443752e6654b5aab88f31690e1161eed9c34dd837870172",
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		err := patchTenancyProxyImage(deployment)
+		g.Expect(err).NotTo(HaveOccurred())
+
+		containers, found, err := unstructured.NestedSlice(deployment.Object, "spec", "template", "spec", "containers")
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(found).To(BeTrue())
+
+		container, ok := containers[0].(map[string]any)
+		g.Expect(ok).To(BeTrue())
+		g.Expect(container["image"]).To(Equal("registry.redhat.io/ubi9/python-312@sha256:f6713d327d37e654a443752e6654b5aab88f31690e1161eed9c34dd837870172"))
+	})
+}
+
+func TestPatchPersesDatasourceURL(t *testing.T) {
+	t.Run("expands short service reference to FQDN", func(t *testing.T) {
+		g := NewWithT(t)
+
+		datasource := &unstructured.Unstructured{
+			Object: map[string]any{
+				"apiVersion": "perses.dev/v1alpha1",
+				"kind":       "PersesDatasource",
+				"metadata": map[string]any{
+					"name":      "usage-logs",
+					"namespace": "redhat-ods-monitoring",
+				},
+				"spec": map[string]any{
+					"config": map[string]any{
+						"plugin": map[string]any{
+							"spec": map[string]any{
+								"proxy": map[string]any{
+									"spec": map[string]any{
+										"url": "https://usage-logs-tenancy-proxy:8443",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		err := patchPersesDatasourceURL(datasource)
+		g.Expect(err).NotTo(HaveOccurred())
+
+		url, found, err := unstructured.NestedString(datasource.Object,
+			"spec", "config", "plugin", "spec", "proxy", "spec", "url")
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(found).To(BeTrue())
+		g.Expect(url).To(Equal("https://usage-logs-tenancy-proxy.redhat-ods-monitoring.svc:8443"))
+	})
+
+	t.Run("expands service reference with path", func(t *testing.T) {
+		g := NewWithT(t)
+
+		datasource := &unstructured.Unstructured{
+			Object: map[string]any{
+				"apiVersion": "perses.dev/v1alpha1",
+				"kind":       "PersesDatasource",
+				"metadata": map[string]any{
+					"name":      "usage-logs-admin",
+					"namespace": "opendatahub",
+				},
+				"spec": map[string]any{
+					"config": map[string]any{
+						"plugin": map[string]any{
+							"spec": map[string]any{
+								"proxy": map[string]any{
+									"spec": map[string]any{
+										"url": "https://usage-gateway-http:8080/api/logs/v1/application",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		err := patchPersesDatasourceURL(datasource)
+		g.Expect(err).NotTo(HaveOccurred())
+
+		url, found, err := unstructured.NestedString(datasource.Object,
+			"spec", "config", "plugin", "spec", "proxy", "spec", "url")
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(found).To(BeTrue())
+		g.Expect(url).To(Equal("https://usage-gateway-http.opendatahub.svc:8080/api/logs/v1/application"))
+	})
+
+	t.Run("skips already-qualified URLs", func(t *testing.T) {
+		g := NewWithT(t)
+
+		datasource := &unstructured.Unstructured{
+			Object: map[string]any{
+				"apiVersion": "perses.dev/v1alpha1",
+				"kind":       "PersesDatasource",
+				"metadata": map[string]any{
+					"name":      "usage-logs",
+					"namespace": "opendatahub",
+				},
+				"spec": map[string]any{
+					"config": map[string]any{
+						"plugin": map[string]any{
+							"spec": map[string]any{
+								"proxy": map[string]any{
+									"spec": map[string]any{
+										"url": "https://usage-logs-tenancy-proxy.opendatahub.svc:8443",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		err := patchPersesDatasourceURL(datasource)
+		g.Expect(err).NotTo(HaveOccurred())
+
+		url, found, err := unstructured.NestedString(datasource.Object,
+			"spec", "config", "plugin", "spec", "proxy", "spec", "url")
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(found).To(BeTrue())
+		g.Expect(url).To(Equal("https://usage-logs-tenancy-proxy.opendatahub.svc:8443"),
+			"should not modify already-qualified URL")
+	})
+
+	t.Run("ignores non-PersesDatasource resources", func(t *testing.T) {
+		g := NewWithT(t)
+
+		configMap := &unstructured.Unstructured{
+			Object: map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata": map[string]any{
+					"name":      "test",
+					"namespace": "opendatahub",
+				},
+			},
+		}
+
+		err := patchPersesDatasourceURL(configMap)
+		g.Expect(err).NotTo(HaveOccurred())
+	})
+}
+
+func TestSyncModuleStatus(t *testing.T) {
+	s := lifecycleTestScheme(t)
+	const (
+		depNS          = "opendatahub"
+		aitenantNS     = tenantreconcile.DefaultAITenantNamespace
+		subscriptionNS = "models-as-a-service"
+	)
+
+	makeCfg := func(uid types.UID) *maasv1alpha1.Config {
+		return &maasv1alpha1.Config{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: maasv1alpha1.ConfigInstanceName,
+				UID:  uid,
+			},
+		}
+	}
+	makeAITenant := func(readyStatus metav1.ConditionStatus, msg string) *maasv1alpha1.AITenant {
+		at := &maasv1alpha1.AITenant{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      tenantreconcile.DefaultAITenantName,
+				Namespace: aitenantNS,
+			},
+		}
+		if readyStatus != "" {
+			apimeta.SetStatusCondition(&at.Status.Conditions, metav1.Condition{
+				Type:    maasv1alpha1.AITenantConditionReady,
+				Status:  readyStatus,
+				Reason:  "TestReason",
+				Message: msg,
+			})
+		}
+		return at
+	}
+	makeTenantConfig := func(readyStatus metav1.ConditionStatus, msg string) *maasv1alpha1.MaasTenantConfig {
+		tc := &maasv1alpha1.MaasTenantConfig{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      maasv1alpha1.MaasTenantConfigInstanceName,
+				Namespace: subscriptionNS,
+			},
+		}
+		if readyStatus != "" {
+			apimeta.SetStatusCondition(&tc.Status.Conditions, metav1.Condition{
+				Type:    tenantreconcile.ReadyConditionType,
+				Status:  readyStatus,
+				Reason:  "TestReason",
+				Message: msg,
+			})
+		}
+		return tc
+	}
+
+	t.Run("Ready=True when both operands are ready", func(t *testing.T) {
+		g := NewWithT(t)
+		cfg := makeCfg("uid-1")
+		at := makeAITenant(metav1.ConditionTrue, "")
+		tc := makeTenantConfig(metav1.ConditionTrue, "")
+		cl := fake.NewClientBuilder().WithScheme(s).
+			WithStatusSubresource(&maasv1alpha1.Config{}).
+			WithObjects(cfg, at, tc).Build()
+		r := &LifecycleReconciler{
+			Client:                      cl,
+			Scheme:                      s,
+			AITenantNamespace:           aitenantNS,
+			TenantSubscriptionNamespace: subscriptionNS,
+		}
+		g.Expect(r.syncModuleStatus(context.Background(), cfg)).To(Succeed())
+		var updated maasv1alpha1.Config
+		g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: maasv1alpha1.ConfigInstanceName}, &updated)).To(Succeed())
+		cond := apimeta.FindStatusCondition(updated.Status.Conditions, tenantreconcile.ReadyConditionType)
+		g.Expect(cond).NotTo(BeNil())
+		g.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+	})
+
+	t.Run("Ready=False when AITenant is not ready", func(t *testing.T) {
+		g := NewWithT(t)
+		cfg := makeCfg("uid-2")
+		at := makeAITenant(metav1.ConditionFalse, "gateway not found")
+		tc := makeTenantConfig(metav1.ConditionTrue, "")
+		cl := fake.NewClientBuilder().WithScheme(s).
+			WithStatusSubresource(&maasv1alpha1.Config{}).
+			WithObjects(cfg, at, tc).Build()
+		r := &LifecycleReconciler{
+			Client:                      cl,
+			Scheme:                      s,
+			AITenantNamespace:           aitenantNS,
+			TenantSubscriptionNamespace: subscriptionNS,
+		}
+		g.Expect(r.syncModuleStatus(context.Background(), cfg)).To(Succeed())
+		var updated maasv1alpha1.Config
+		g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: maasv1alpha1.ConfigInstanceName}, &updated)).To(Succeed())
+		cond := apimeta.FindStatusCondition(updated.Status.Conditions, tenantreconcile.ReadyConditionType)
+		g.Expect(cond).NotTo(BeNil())
+		g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		g.Expect(cond.Message).To(ContainSubstring("gateway not found"))
+	})
+
+	t.Run("Ready=False when MaasTenantConfig is not ready", func(t *testing.T) {
+		g := NewWithT(t)
+		cfg := makeCfg("uid-3")
+		at := makeAITenant(metav1.ConditionTrue, "")
+		tc := makeTenantConfig(metav1.ConditionFalse, "postgres secret missing")
+		cl := fake.NewClientBuilder().WithScheme(s).
+			WithStatusSubresource(&maasv1alpha1.Config{}).
+			WithObjects(cfg, at, tc).Build()
+		r := &LifecycleReconciler{
+			Client:                      cl,
+			Scheme:                      s,
+			AITenantNamespace:           aitenantNS,
+			TenantSubscriptionNamespace: subscriptionNS,
+		}
+		g.Expect(r.syncModuleStatus(context.Background(), cfg)).To(Succeed())
+		var updated maasv1alpha1.Config
+		g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: maasv1alpha1.ConfigInstanceName}, &updated)).To(Succeed())
+		cond := apimeta.FindStatusCondition(updated.Status.Conditions, tenantreconcile.ReadyConditionType)
+		g.Expect(cond).NotTo(BeNil())
+		g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		g.Expect(cond.Message).To(ContainSubstring("postgres secret missing"))
+	})
+
+	t.Run("message truncated when both operand messages are very long", func(t *testing.T) {
+		g := NewWithT(t)
+		longMsg := strings.Repeat("x", 20000)
+		cfg := makeCfg("uid-long")
+		at := makeAITenant(metav1.ConditionFalse, longMsg)
+		tc := makeTenantConfig(metav1.ConditionFalse, longMsg)
+		cl := fake.NewClientBuilder().WithScheme(s).
+			WithStatusSubresource(&maasv1alpha1.Config{}).
+			WithObjects(cfg, at, tc).Build()
+		r := &LifecycleReconciler{
+			Client:                      cl,
+			Scheme:                      s,
+			AITenantNamespace:           aitenantNS,
+			TenantSubscriptionNamespace: subscriptionNS,
+		}
+		g.Expect(r.syncModuleStatus(context.Background(), cfg)).To(Succeed())
+		var updated maasv1alpha1.Config
+		g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: maasv1alpha1.ConfigInstanceName}, &updated)).To(Succeed())
+		cond := apimeta.FindStatusCondition(updated.Status.Conditions, tenantreconcile.ReadyConditionType)
+		g.Expect(cond).NotTo(BeNil())
+		g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		g.Expect(len(cond.Message)).To(BeNumerically("<=", conditionMessageMaxLen),
+			"condition message must not exceed Kubernetes 32768-char limit")
+	})
+
+	t.Run("truncated message is valid UTF-8 when multibyte rune crosses limit", func(t *testing.T) {
+		g := NewWithT(t)
+		// Build a message whose truncation boundary (conditionMessageMaxLen - len("…"))
+		// falls in the middle of a 3-byte UTF-8 rune (e.g. '€' = 0xE2 0x82 0xAC).
+		// Fill up to just before the boundary with ASCII, then append multibyte runes
+		// so that the leading byte of one rune lands exactly at the cut point.
+		const suffix = "…" // 3 bytes
+		limit := conditionMessageMaxLen - len(suffix)
+		// Place a 3-byte rune (€) straddling position limit-1 / limit / limit+1.
+		base := strings.Repeat("a", limit-1) // limit-1 ASCII bytes
+		msg := base + "€" + strings.Repeat("b", 100)
+		result := truncateConditionMessage(msg)
+		g.Expect(len(result)).To(BeNumerically("<=", conditionMessageMaxLen),
+			"truncated message must not exceed 32768 chars")
+		g.Expect(utf8.ValidString(result)).To(BeTrue(),
+			"truncated message must be valid UTF-8 (no incomplete multibyte leading byte)")
+	})
+
+	t.Run("Ready=False when AITenant not yet created", func(t *testing.T) {
+		g := NewWithT(t)
+		cfg := makeCfg("uid-4")
+		tc := makeTenantConfig(metav1.ConditionTrue, "")
+		cl := fake.NewClientBuilder().WithScheme(s).
+			WithStatusSubresource(&maasv1alpha1.Config{}).
+			WithObjects(cfg, tc).Build()
+		r := &LifecycleReconciler{
+			Client:                      cl,
+			Scheme:                      s,
+			AITenantNamespace:           aitenantNS,
+			TenantSubscriptionNamespace: subscriptionNS,
+		}
+		g.Expect(r.syncModuleStatus(context.Background(), cfg)).To(Succeed())
+		var updated maasv1alpha1.Config
+		g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: maasv1alpha1.ConfigInstanceName}, &updated)).To(Succeed())
+		cond := apimeta.FindStatusCondition(updated.Status.Conditions, tenantreconcile.ReadyConditionType)
+		g.Expect(cond).NotTo(BeNil())
+		g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		g.Expect(cond.Message).To(ContainSubstring("not yet created"))
+	})
+}
+
+func TestSyncTenantsHealth(t *testing.T) {
+	s := lifecycleTestScheme(t)
+
+	makeCfg := func(uid types.UID) *maasv1alpha1.Config {
+		return &maasv1alpha1.Config{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: maasv1alpha1.ConfigInstanceName,
+				UID:  uid,
+			},
+		}
+	}
+	makeAITenantInNS := func(name, ns string, readyStatus metav1.ConditionStatus) *maasv1alpha1.AITenant {
+		at := &maasv1alpha1.AITenant{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: ns,
+			},
+		}
+		if readyStatus != "" {
+			apimeta.SetStatusCondition(&at.Status.Conditions, metav1.Condition{
+				Type:    maasv1alpha1.AITenantConditionReady,
+				Status:  readyStatus,
+				Reason:  "TestReason",
+				Message: "test",
+			})
+		}
+		return at
+	}
+
+	t.Run("TenantsHealthy=True with NoTenantsFound when no AITenants exist", func(t *testing.T) {
+		g := NewWithT(t)
+		cfg := makeCfg("uid-none")
+		cl := fake.NewClientBuilder().WithScheme(s).
+			WithStatusSubresource(&maasv1alpha1.Config{}).
+			WithObjects(cfg).Build()
+		r := &LifecycleReconciler{Client: cl, Scheme: s}
+		g.Expect(r.syncTenantsHealth(context.Background(), cfg)).To(Succeed())
+		var updated maasv1alpha1.Config
+		g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: maasv1alpha1.ConfigInstanceName}, &updated)).To(Succeed())
+		cond := apimeta.FindStatusCondition(updated.Status.Conditions, maasv1alpha1.ConfigConditionTenantsHealthy)
+		g.Expect(cond).NotTo(BeNil())
+		g.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+		g.Expect(cond.Reason).To(Equal(string(tenantsHealthReasonNoTenantsFound)))
+	})
+
+	t.Run("TenantsHealthy=True when all tenants are ready", func(t *testing.T) {
+		g := NewWithT(t)
+		cfg := makeCfg("uid-healthy")
+		at1 := makeAITenantInNS("default", "ns-a", metav1.ConditionTrue)
+		at2 := makeAITenantInNS("team-b", "ns-b", metav1.ConditionTrue)
+		cl := fake.NewClientBuilder().WithScheme(s).
+			WithStatusSubresource(&maasv1alpha1.Config{}).
+			WithObjects(cfg, at1, at2).Build()
+		r := &LifecycleReconciler{Client: cl, Scheme: s}
+		g.Expect(r.syncTenantsHealth(context.Background(), cfg)).To(Succeed())
+		var updated maasv1alpha1.Config
+		g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: maasv1alpha1.ConfigInstanceName}, &updated)).To(Succeed())
+		cond := apimeta.FindStatusCondition(updated.Status.Conditions, maasv1alpha1.ConfigConditionTenantsHealthy)
+		g.Expect(cond).NotTo(BeNil())
+		g.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+		g.Expect(cond.Reason).To(Equal(string(tenantsHealthReasonAllTenantsHealthy)))
+		g.Expect(cond.Message).To(ContainSubstring("2 tenant(s) healthy"))
+	})
+
+	t.Run("Degraded when some tenants are not ready", func(t *testing.T) {
+		g := NewWithT(t)
+		cfg := makeCfg("uid-degraded")
+		at1 := makeAITenantInNS("default", "ns-a", metav1.ConditionTrue)
+		at2 := makeAITenantInNS("team-b", "ns-b", metav1.ConditionFalse)
+		cl := fake.NewClientBuilder().WithScheme(s).
+			WithStatusSubresource(&maasv1alpha1.Config{}).
+			WithObjects(cfg, at1, at2).Build()
+		r := &LifecycleReconciler{Client: cl, Scheme: s}
+		g.Expect(r.syncTenantsHealth(context.Background(), cfg)).To(Succeed())
+		var updated maasv1alpha1.Config
+		g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: maasv1alpha1.ConfigInstanceName}, &updated)).To(Succeed())
+		cond := apimeta.FindStatusCondition(updated.Status.Conditions, maasv1alpha1.ConfigConditionTenantsHealthy)
+		g.Expect(cond).NotTo(BeNil())
+		g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		g.Expect(cond.Reason).To(Equal(string(tenantsHealthReasonTenantsDegraded)))
+		g.Expect(cond.Message).To(ContainSubstring("1 of 2"))
+		g.Expect(cond.Message).To(ContainSubstring("ns-b/team-b"))
+	})
+
+	t.Run("Blocked when all tenants are not ready", func(t *testing.T) {
+		g := NewWithT(t)
+		cfg := makeCfg("uid-blocked")
+		at1 := makeAITenantInNS("default", "ns-a", metav1.ConditionFalse)
+		at2 := makeAITenantInNS("team-b", "ns-b", metav1.ConditionFalse)
+		cl := fake.NewClientBuilder().WithScheme(s).
+			WithStatusSubresource(&maasv1alpha1.Config{}).
+			WithObjects(cfg, at1, at2).Build()
+		r := &LifecycleReconciler{Client: cl, Scheme: s}
+		g.Expect(r.syncTenantsHealth(context.Background(), cfg)).To(Succeed())
+		var updated maasv1alpha1.Config
+		g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: maasv1alpha1.ConfigInstanceName}, &updated)).To(Succeed())
+		cond := apimeta.FindStatusCondition(updated.Status.Conditions, maasv1alpha1.ConfigConditionTenantsHealthy)
+		g.Expect(cond).NotTo(BeNil())
+		g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		g.Expect(cond.Reason).To(Equal(string(tenantsHealthReasonTenantsBlocked)))
+		g.Expect(cond.Message).To(ContainSubstring("all 2"))
+	})
+
+	t.Run("tenant without Ready condition counts as unhealthy", func(t *testing.T) {
+		g := NewWithT(t)
+		cfg := makeCfg("uid-no-cond")
+		at := makeAITenantInNS("default", "ns-a", "")
+		cl := fake.NewClientBuilder().WithScheme(s).
+			WithStatusSubresource(&maasv1alpha1.Config{}).
+			WithObjects(cfg, at).Build()
+		r := &LifecycleReconciler{Client: cl, Scheme: s}
+		g.Expect(r.syncTenantsHealth(context.Background(), cfg)).To(Succeed())
+		var updated maasv1alpha1.Config
+		g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: maasv1alpha1.ConfigInstanceName}, &updated)).To(Succeed())
+		cond := apimeta.FindStatusCondition(updated.Status.Conditions, maasv1alpha1.ConfigConditionTenantsHealthy)
+		g.Expect(cond).NotTo(BeNil())
+		g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		g.Expect(cond.Reason).To(Equal(string(tenantsHealthReasonTenantsBlocked)))
+	})
+
+	t.Run("nil Config is a no-op", func(t *testing.T) {
+		g := NewWithT(t)
+		cl := fake.NewClientBuilder().WithScheme(s).Build()
+		r := &LifecycleReconciler{Client: cl, Scheme: s}
+		g.Expect(r.syncTenantsHealth(context.Background(), nil)).To(Succeed())
+	})
+
+	t.Run("Config without UID is a no-op", func(t *testing.T) {
+		g := NewWithT(t)
+		cfg := &maasv1alpha1.Config{
+			ObjectMeta: metav1.ObjectMeta{Name: maasv1alpha1.ConfigInstanceName},
+		}
+		cl := fake.NewClientBuilder().WithScheme(s).
+			WithStatusSubresource(&maasv1alpha1.Config{}).
+			WithObjects(cfg).Build()
+		r := &LifecycleReconciler{Client: cl, Scheme: s}
+		g.Expect(r.syncTenantsHealth(context.Background(), cfg)).To(Succeed())
+		var updated maasv1alpha1.Config
+		g.Expect(cl.Get(context.Background(), client.ObjectKey{Name: maasv1alpha1.ConfigInstanceName}, &updated)).To(Succeed())
+		g.Expect(updated.Status.Conditions).To(BeEmpty())
+	})
+}
+
+func TestFormatTenantList(t *testing.T) {
+	g := NewWithT(t)
+
+	g.Expect(formatTenantList([]string{"ns/a"}, 5)).To(Equal("ns/a"))
+	g.Expect(formatTenantList([]string{"ns/a", "ns/b", "ns/c"}, 5)).To(Equal("ns/a, ns/b, ns/c"))
+	g.Expect(formatTenantList([]string{"ns/a", "ns/b", "ns/c"}, 2)).To(Equal("ns/a, ns/b (and 1 more)"))
+	g.Expect(formatTenantList([]string{"a", "b", "c", "d", "e", "f"}, 3)).To(Equal("a, b, c (and 3 more)"))
 }

@@ -22,13 +22,26 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	maasv1alpha1 "github.com/opendatahub-io/models-as-a-service/maas-controller/api/maas/v1alpha1"
+	"github.com/opendatahub-io/models-as-a-service/maas-controller/pkg/platform/tenantreconcile"
 )
 
-func TestFetchOIDCConfig_NoTenant(t *testing.T) {
+func maasAuthPolicyOIDCTestScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
 	scheme := runtime.NewScheme()
+	assert.NoError(t, corev1.AddToScheme(scheme))
+	assert.NoError(t, maasv1alpha1.AddToScheme(scheme))
+	return scheme
+}
+
+func TestFetchOIDCConfig_NoTenant(t *testing.T) {
+	scheme := maasAuthPolicyOIDCTestScheme(t)
 	client := fake.NewClientBuilder().WithScheme(scheme).Build()
 
 	reconciler := &MaaSAuthPolicyReconciler{
@@ -37,25 +50,44 @@ func TestFetchOIDCConfig_NoTenant(t *testing.T) {
 		TenantNamespace: "models-as-a-service",
 	}
 
-	config := reconciler.fetchOIDCConfig(context.Background(), logr.Discard())
+	config := reconciler.fetchOIDCConfig(context.Background(), logr.Discard(), "models-as-a-service")
 	assert.Nil(t, config, "should return nil when Tenant doesn't exist")
 }
 
+func TestFetchTenantPlatformContext_DiscoveredTenantMissingBridgeFailsClosed(t *testing.T) {
+	scheme := maasAuthPolicyOIDCTestScheme(t)
+	namespace := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "ai-tenant-team-a",
+			Labels: map[string]string{tenantreconcile.LabelManagedByAITenant: "true"},
+		},
+	}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(namespace).Build()
+
+	reconciler := &MaaSAuthPolicyReconciler{
+		Client:                          client,
+		Scheme:                          scheme,
+		TenantNamespace:                 "models-as-a-service",
+		TenantNamespaceDiscoveryEnabled: true,
+		GatewayName:                     "maas-default-gateway",
+		GatewayNamespace:                "openshift-ingress",
+	}
+
+	platformContext, err := reconciler.fetchTenantPlatformContext(context.Background(), logr.Discard(), "ai-tenant-team-a")
+
+	assert.Nil(t, platformContext)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "refusing to use default platform context")
+}
+
 func TestFetchOIDCConfig_NoExternalOIDC(t *testing.T) {
-	scheme := runtime.NewScheme()
+	scheme := maasAuthPolicyOIDCTestScheme(t)
 
 	// Create Tenant without externalOIDC
-	tenant := &unstructured.Unstructured{
-		Object: map[string]any{
-			"apiVersion": "maas.opendatahub.io/v1alpha1",
-			"kind":       "Tenant",
-			"metadata": map[string]any{
-				"name":      "default-tenant",
-				"namespace": "models-as-a-service",
-			},
-			"spec": map[string]any{
-				"otherField": "value",
-			},
+	tenant := &maasv1alpha1.Tenant{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      maasv1alpha1.TenantInstanceName,
+			Namespace: "models-as-a-service",
 		},
 	}
 
@@ -70,27 +102,26 @@ func TestFetchOIDCConfig_NoExternalOIDC(t *testing.T) {
 		TenantNamespace: "models-as-a-service",
 	}
 
-	config := reconciler.fetchOIDCConfig(context.Background(), logr.Discard())
+	config := reconciler.fetchOIDCConfig(context.Background(), logr.Discard(), "models-as-a-service")
 	assert.Nil(t, config, "should return nil when externalOIDC is not configured")
 }
 
 func TestFetchOIDCConfig_WithExternalOIDC(t *testing.T) {
-	scheme := runtime.NewScheme()
+	scheme := maasAuthPolicyOIDCTestScheme(t)
 
 	// Create Tenant with externalOIDC
-	tenant := &unstructured.Unstructured{
-		Object: map[string]any{
-			"apiVersion": "maas.opendatahub.io/v1alpha1",
-			"kind":       "Tenant",
-			"metadata": map[string]any{
-				"name":      "default-tenant",
-				"namespace": "models-as-a-service",
-			},
-			"spec": map[string]any{
-				"externalOIDC": map[string]any{
-					"issuerUrl": "https://keycloak.example.com/realms/test",
-					"clientId":  "test-client",
-				},
+	tenant := &maasv1alpha1.Tenant{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      maasv1alpha1.TenantInstanceName,
+			Namespace: "models-as-a-service",
+		},
+		Spec: maasv1alpha1.TenantSpec{
+			ExternalOIDC: &maasv1alpha1.TenantExternalOIDCConfig{
+				IssuerURL:               "https://keycloak.example.com/realms/test",
+				ClientID:                "test-client",
+				Audience:                "maas-api",
+				AccessTokenPurposeClaim: "token_use",
+				AccessTokenPurpose:      "access",
 			},
 		},
 	}
@@ -106,29 +137,143 @@ func TestFetchOIDCConfig_WithExternalOIDC(t *testing.T) {
 		TenantNamespace: "models-as-a-service",
 	}
 
-	config := reconciler.fetchOIDCConfig(context.Background(), logr.Discard())
+	config := reconciler.fetchOIDCConfig(context.Background(), logr.Discard(), "models-as-a-service")
 	assert.NotNil(t, config, "should return config when externalOIDC is configured")
 	assert.Equal(t, "https://keycloak.example.com/realms/test", config.IssuerURL)
 	assert.Equal(t, "test-client", config.ClientID)
+	assert.Equal(t, "maas-api", config.Audience)
+	assert.Equal(t, "token_use", config.AccessTokenPurposeClaim)
+	assert.Equal(t, "access", config.AccessTokenPurpose)
+}
+
+func TestFetchOIDCConfig_WithAITenantOIDC(t *testing.T) {
+	scheme := maasAuthPolicyOIDCTestScheme(t)
+
+	tenant := &maasv1alpha1.Tenant{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      maasv1alpha1.TenantInstanceName,
+			Namespace: "ai-tenant-team-a",
+			Labels: map[string]string{
+				tenantreconcile.LabelManagedByAITenant: "true",
+				tenantreconcile.LabelTenantName:        "team-a",
+				tenantreconcile.LabelTenantNamespace:   "ai-tenant-team-a",
+			},
+			Annotations: map[string]string{
+				tenantreconcile.AnnotationAITenantName:      "team-a",
+				tenantreconcile.AnnotationAITenantNamespace: tenantreconcile.DefaultAITenantNamespace,
+			},
+		},
+		Spec: maasv1alpha1.TenantSpec{
+			ExternalOIDC: &maasv1alpha1.TenantExternalOIDCConfig{
+				IssuerURL: "https://stale.example.com",
+				ClientID:  "stale-client",
+			},
+		},
+	}
+	aitenant := &maasv1alpha1.AITenant{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "team-a",
+			Namespace: tenantreconcile.DefaultAITenantNamespace,
+		},
+		Spec: maasv1alpha1.AITenantSpec{
+			OIDC: &maasv1alpha1.TenantExternalOIDCConfig{
+				IssuerURL: "https://keycloak.example.com/realms/team-a",
+				ClientID:  "team-a-client",
+			},
+		},
+		Status: maasv1alpha1.AITenantStatus{
+			GatewayRef: maasv1alpha1.TenantGatewayRef{
+				Namespace: "openshift-ingress",
+				Name:      "team-a-gateway",
+			},
+		},
+	}
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(tenant, aitenant).
+		Build()
+
+	reconciler := &MaaSAuthPolicyReconciler{
+		Client:          client,
+		Scheme:          scheme,
+		TenantNamespace: "models-as-a-service",
+	}
+
+	config := reconciler.fetchOIDCConfig(context.Background(), logr.Discard(), "ai-tenant-team-a")
+	assert.NotNil(t, config, "should return config from AITenant")
+	assert.Equal(t, "https://keycloak.example.com/realms/team-a", config.IssuerURL)
+	assert.Equal(t, "team-a-client", config.ClientID)
+}
+
+func TestFetchOIDCConfig_WithMaasTenantConfigAITenantOIDC(t *testing.T) {
+	scheme := maasAuthPolicyOIDCTestScheme(t)
+
+	tenantConfig := &maasv1alpha1.MaasTenantConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      maasv1alpha1.MaasTenantConfigInstanceName,
+			Namespace: "ai-tenant-team-a",
+			Labels: map[string]string{
+				tenantreconcile.LabelManagedByAITenant: "true",
+				tenantreconcile.LabelTenantName:        "team-a",
+				tenantreconcile.LabelTenantNamespace:   "ai-tenant-team-a",
+			},
+			Annotations: map[string]string{
+				tenantreconcile.AnnotationAITenantName:      "team-a",
+				tenantreconcile.AnnotationAITenantNamespace: tenantreconcile.DefaultAITenantNamespace,
+			},
+		},
+	}
+	aitenant := &maasv1alpha1.AITenant{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "team-a",
+			Namespace: tenantreconcile.DefaultAITenantNamespace,
+		},
+		Spec: maasv1alpha1.AITenantSpec{
+			OIDC: &maasv1alpha1.TenantExternalOIDCConfig{
+				IssuerURL: "https://keycloak.example.com/realms/team-a",
+				ClientID:  "team-a-client",
+				TTL:       600,
+			},
+		},
+		Status: maasv1alpha1.AITenantStatus{
+			GatewayRef: maasv1alpha1.TenantGatewayRef{
+				Namespace: "openshift-ingress",
+				Name:      "team-a-gateway",
+			},
+		},
+	}
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(tenantConfig, aitenant).
+		Build()
+
+	reconciler := &MaaSAuthPolicyReconciler{
+		Client:          client,
+		Scheme:          scheme,
+		TenantNamespace: "models-as-a-service",
+	}
+
+	config := reconciler.fetchOIDCConfig(context.Background(), logr.Discard(), "ai-tenant-team-a")
+	assert.NotNil(t, config, "should return config from owning AITenant")
+	assert.Equal(t, "https://keycloak.example.com/realms/team-a", config.IssuerURL)
+	assert.Equal(t, "team-a-client", config.ClientID)
 }
 
 func TestFetchOIDCConfig_EmptyIssuerURL(t *testing.T) {
-	scheme := runtime.NewScheme()
+	scheme := maasAuthPolicyOIDCTestScheme(t)
 
 	// Create Tenant with empty issuerUrl
-	tenant := &unstructured.Unstructured{
-		Object: map[string]any{
-			"apiVersion": "maas.opendatahub.io/v1alpha1",
-			"kind":       "Tenant",
-			"metadata": map[string]any{
-				"name":      "default-tenant",
-				"namespace": "models-as-a-service",
-			},
-			"spec": map[string]any{
-				"externalOIDC": map[string]any{
-					"issuerUrl": "",
-					"clientId":  "test-client",
-				},
+	tenant := &maasv1alpha1.Tenant{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      maasv1alpha1.TenantInstanceName,
+			Namespace: "models-as-a-service",
+		},
+		Spec: maasv1alpha1.TenantSpec{
+			ExternalOIDC: &maasv1alpha1.TenantExternalOIDCConfig{
+				IssuerURL: "",
+				ClientID:  "test-client",
 			},
 		},
 	}
@@ -144,27 +289,23 @@ func TestFetchOIDCConfig_EmptyIssuerURL(t *testing.T) {
 		TenantNamespace: "models-as-a-service",
 	}
 
-	config := reconciler.fetchOIDCConfig(context.Background(), logr.Discard())
+	config := reconciler.fetchOIDCConfig(context.Background(), logr.Discard(), "models-as-a-service")
 	assert.Nil(t, config, "should return nil when issuerUrl is empty")
 }
 
 func TestFetchOIDCConfig_EmptyClientID(t *testing.T) {
-	scheme := runtime.NewScheme()
+	scheme := maasAuthPolicyOIDCTestScheme(t)
 
 	// Create Tenant with empty clientId
-	tenant := &unstructured.Unstructured{
-		Object: map[string]any{
-			"apiVersion": "maas.opendatahub.io/v1alpha1",
-			"kind":       "Tenant",
-			"metadata": map[string]any{
-				"name":      "default-tenant",
-				"namespace": "models-as-a-service",
-			},
-			"spec": map[string]any{
-				"externalOIDC": map[string]any{
-					"issuerUrl": "https://keycloak.example.com/realms/test",
-					"clientId":  "",
-				},
+	tenant := &maasv1alpha1.Tenant{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      maasv1alpha1.TenantInstanceName,
+			Namespace: "models-as-a-service",
+		},
+		Spec: maasv1alpha1.TenantSpec{
+			ExternalOIDC: &maasv1alpha1.TenantExternalOIDCConfig{
+				IssuerURL: "https://keycloak.example.com/realms/test",
+				ClientID:  "",
 			},
 		},
 	}
@@ -180,8 +321,38 @@ func TestFetchOIDCConfig_EmptyClientID(t *testing.T) {
 		TenantNamespace: "models-as-a-service",
 	}
 
-	config := reconciler.fetchOIDCConfig(context.Background(), logr.Discard())
+	config := reconciler.fetchOIDCConfig(context.Background(), logr.Discard(), "models-as-a-service")
 	assert.Nil(t, config, "should return nil when clientId is empty (audience validation required)")
+}
+
+func TestFetchOIDCConfig_AccessTokenPurposePair(t *testing.T) {
+	scheme := maasAuthPolicyOIDCTestScheme(t)
+	tenant := &maasv1alpha1.Tenant{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      maasv1alpha1.TenantInstanceName,
+			Namespace: "models-as-a-service",
+		},
+		Spec: maasv1alpha1.TenantSpec{
+			ExternalOIDC: &maasv1alpha1.TenantExternalOIDCConfig{
+				IssuerURL:               "https://keycloak.example.com/realms/test",
+				ClientID:                "test-client",
+				AccessTokenPurposeClaim: "token_use",
+			},
+		},
+	}
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(tenant).
+		Build()
+	reconciler := &MaaSAuthPolicyReconciler{
+		Client:          client,
+		Scheme:          scheme,
+		TenantNamespace: "models-as-a-service",
+	}
+
+	config := reconciler.fetchOIDCConfig(context.Background(), logr.Discard(), "models-as-a-service")
+	assert.Nil(t, config, "purpose claim and value must be configured together")
 }
 
 func TestCELExpressions_SupportOIDC(t *testing.T) {
@@ -204,6 +375,30 @@ func TestCELExpressions_SupportOIDC(t *testing.T) {
 		"celGroups should check for OIDC groups claim")
 	assert.Contains(t, celGroups, "auth.identity.user.groups",
 		"celGroups should fall back to K8s user.groups")
+	assert.Contains(t, celTokenGroupsHeaderJSON, "size("+celNonAPIKeyGroups+") > 0",
+		"X-MaaS-Group expression should handle empty token groups")
+	assert.Contains(t, celTokenGroupsHeaderJSON, `'["system:authenticated"]'`,
+		"X-MaaS-Group expression should preserve default subscription access for OIDC tokens with no groups")
+	assert.Contains(t, celTokenGroupsHeaderJSON, celNonAPIKeyGroups+`.join('","')`,
+		"X-MaaS-Group expression should serialize the same groups used for subscription selection")
+	assert.Contains(t, celTokenGroupsHeaderJSON, "auth.identity.groups.all",
+		"X-MaaS-Group expression should validate OIDC groups before JSON string construction")
+	assert.Contains(t, celTokenGroupsHeaderJSON, safeGroupNamePattern,
+		"X-MaaS-Group expression should use the safe group-name pattern")
+
+	// Security: group sources are selected by identity type, never by claim
+	// presence, so a JWT carrying a crafted "user" claim cannot reach the
+	// TokenReview branch — and both sources are gated on the pattern.
+	assert.Contains(t, celTokenGroupsHeaderJSON, "has(auth.identity.iss)",
+		"X-MaaS-Group expression must select the group source by identity type (iss), not claim presence")
+	assert.Contains(t, celTokenGroupsHeaderJSON, "auth.identity.user.groups.all(g, type(g) == string && g.matches(",
+		"X-MaaS-Group expression must validate TokenReview groups before JSON string construction")
+	assert.Contains(t, celGroups, "has(auth.identity.iss)",
+		"celGroups must select the group source by identity type (iss), not claim presence")
+	assert.Contains(t, celGroups, celOIDCGroupsSafe,
+		"celGroups must gate JWT groups on the safe group-name pattern")
+	assert.Contains(t, celGroups, "auth.identity.user.groups.all(g, type(g) == string && g.matches(",
+		"celGroups must validate TokenReview groups before subscription selection")
 }
 
 func TestCELExpressions_UserIDVsUsername(t *testing.T) {
@@ -243,6 +438,112 @@ func TestCELExpressions_OrderMatters(t *testing.T) {
 	assert.True(t, userGroupsIdx >= 0, "should check for auth.identity.user.groups")
 	assert.True(t, identityGroupsIdx < userGroupsIdx,
 		"should check auth.identity.groups (OIDC) before auth.identity.user.groups (K8s)")
+}
+
+func TestBuildGatewayAuthPolicySpec_OIDCClientBound(t *testing.T) {
+	oidc := &oidcConfig{
+		IssuerURL:               "https://keycloak.example.com/realms/test",
+		ClientID:                "my-maas-client",
+		Audience:                "maas-api",
+		AccessTokenPurposeClaim: "token_use",
+		AccessTokenPurpose:      "access",
+		TTL:                     300,
+	}
+	obj := gatewayAuthPolicySpecTestObject(t, oidc)
+
+	authz := nestedMapRequired(t, obj, "spec", "defaults", "rules", "authorization")
+
+	rule, exists := authz["oidc-client-bound"]
+	assert.True(t, exists, "oidc-client-bound rule should be present when OIDC config is provided")
+
+	ruleMap, ok := rule.(map[string]any)
+	assert.True(t, ok, "oidc-client-bound should be a map")
+
+	// Issuer, client, audience, and token-purpose checks all have to pass.
+	patterns, _, _ := unstructured.NestedSlice(ruleMap, "patternMatching", "patterns")
+	assert.Len(t, patterns, 4, "issuer, client, audience, and purpose patterns are required")
+	expectPattern(t, patterns[0], "auth.identity.iss", "eq", oidc.IssuerURL)
+	expectPattern(t, patterns[1], "auth.identity.azp", "eq", oidc.ClientID)
+	audiencePattern, ok := patterns[2].(map[string]any)
+	assert.True(t, ok)
+	assert.Equal(t,
+		`has(auth.identity.aud) && (auth.identity.aud == "maas-api" || "maas-api" in auth.identity.aud)`,
+		audiencePattern["predicate"],
+	)
+	expectPattern(t, patterns[3], "auth.identity.token_use", "eq", oidc.AccessTokenPurpose)
+
+	// TokenReview identities have no top-level iss claim and remain on their path.
+	whenSlice, _, _ := unstructured.NestedSlice(ruleMap, "when")
+	assert.Len(t, whenSlice, 1, "should have exactly one when predicate")
+	whenMap, ok := whenSlice[0].(map[string]any)
+	assert.True(t, ok)
+	predicate, _ := whenMap["predicate"].(string)
+	assert.Contains(t, predicate, "has(auth.identity.iss)",
+		"when predicate must select external OIDC identities")
+	assert.Contains(t, predicate, `Bearer [^.]+\\.[^.]+\\.[^.]+`,
+		"when predicate should match only JWT-shaped Bearer tokens")
+}
+
+func TestBuildGatewayAuthPolicySpec_DeniesNewClientIdentityHeaders(t *testing.T) {
+	obj := gatewayAuthPolicySpecTestObject(t, nil)
+	rule := nestedMapRequired(t, obj, "spec", "defaults", "rules", "authorization", "deny-client-identity-headers")
+	patterns, found, err := unstructured.NestedSlice(rule, "patternMatching", "patterns")
+	assert.NoError(t, err)
+	assert.True(t, found)
+
+	predicates := make(map[string]bool)
+	for _, pattern := range patterns {
+		patternMap, ok := pattern.(map[string]any)
+		assert.True(t, ok)
+		predicate, _ := patternMap["predicate"].(string)
+		predicates[predicate] = true
+	}
+	assert.True(t, predicates[`!("x-maas-identity" in request.headers)`])
+	assert.True(t, predicates[`!("x-maas-admin-scope" in request.headers)`])
+}
+
+func expectPattern(t *testing.T, pattern any, selector, operator, value string) {
+	t.Helper()
+	patternMap, ok := pattern.(map[string]any)
+	assert.True(t, ok, "pattern should be a map")
+	assert.Equal(t, selector, patternMap["selector"])
+	assert.Equal(t, operator, patternMap["operator"])
+	assert.Equal(t, value, patternMap["value"])
+}
+
+func TestBuildGatewayAuthPolicySpec_OIDCClientBound_AbsentWithoutOIDC(t *testing.T) {
+	obj := gatewayAuthPolicySpecTestObject(t, nil)
+	authz := nestedMapRequired(t, obj, "spec", "defaults", "rules", "authorization")
+	_, exists := authz["oidc-client-bound"]
+	assert.False(t, exists, "oidc-client-bound rule must not be present when OIDC is not configured")
+}
+
+func TestBuildGatewayAuthPolicySpec_OIDCTTLPropagated(t *testing.T) {
+	t.Run("custom TTL is emitted to AuthPolicy", func(t *testing.T) {
+		oidc := &oidcConfig{
+			IssuerURL: "https://keycloak.example.com/realms/test",
+			ClientID:  "maas-client",
+			TTL:       600,
+		}
+		obj := gatewayAuthPolicySpecTestObject(t, oidc)
+		ttl, found, err := unstructured.NestedInt64(obj.Object,
+			"spec", "defaults", "rules", "authentication", "oidc-identities", "jwt", "ttl")
+		assert.NoError(t, err)
+		assert.True(t, found, "jwt.ttl should be present")
+		assert.Equal(t, int64(600), ttl, "jwt.ttl should reflect the CRD TTL value")
+	})
+
+	t.Run("default TTL 300 is emitted when CRD TTL is 300", func(t *testing.T) {
+		oidc := &oidcConfig{
+			IssuerURL: "https://keycloak.example.com/realms/test",
+			ClientID:  "maas-client",
+			TTL:       300,
+		}
+		obj := gatewayAuthPolicySpecTestObject(t, oidc)
+		ttl, _, _ := unstructured.NestedInt64(obj.Object,
+			"spec", "defaults", "rules", "authentication", "oidc-identities", "jwt", "ttl")
+		assert.Equal(t, int64(300), ttl)
+	})
 }
 
 // Helper function to find substring index

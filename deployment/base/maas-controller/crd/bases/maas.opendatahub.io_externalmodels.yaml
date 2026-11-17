@@ -75,7 +75,7 @@ spec:
                 description: |-
                   Endpoint is the FQDN of the external provider (no scheme or path).
                   e.g. "api.openai.com".
-                  This field is metadata for downstream consumers (e.g. BBR provider-resolver plugin)
+                  This field is metadata for downstream consumers (e.g. IPP provider-resolver plugin)
                   and is not used by the controller for endpoint derivation.
                 maxLength: 253
                 minLength: 1
@@ -161,12 +161,19 @@ spec:
                   - type
                   type: object
                 type: array
+              message:
+                description: Message provides details about the current phase.
+                type: string
               phase:
-                description: Phase represents the current phase of the external model
+                description: |-
+                  Phase represents the current phase of the external model
+                  Migrated means networking is managed by the corresponding
+                  inference.opendatahub.io ExternalModel.
                 enum:
                 - Pending
                 - Ready
                 - Failed
+                - Migrated
                 type: string
             type: object
         required:

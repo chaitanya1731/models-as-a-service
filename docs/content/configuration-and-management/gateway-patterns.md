@@ -14,7 +14,7 @@ and troubleshooting guidance for common failure modes.
 
 | Pattern | Environment | One-line purpose |
 |---------|-------------|-----------------|
-| [ClusterIP + Route re-encrypt](#clusterip-gateway-with-openshift-route-re-encrypt) | Dev / Lab / Production | ClusterIP Gateway Service fronted by an OpenShift Route with re-encrypt TLS; no external LoadBalancer required |
+| [ClusterIP + Route re-encrypt](#clusterip-gateway-with-openshift-route-re-encrypt) (ocproute mode) | Dev / Lab / Production | ClusterIP Gateway Service fronted by an OpenShift Route with re-encrypt TLS; no external LoadBalancer required |
 
 ## Environment matrix
 
@@ -32,6 +32,20 @@ Use this table to decide which pattern fits your deployment:
 - **Authorino and maas-api TLS**: Configured separately. See [TLS Configuration](tls-configuration.md).
 
 ## ClusterIP Gateway with OpenShift Route (re-encrypt)
+
+!!! warning "Unsupported Configuration"
+    This pattern mixes incompatible routing paradigms by connecting OpenShift Routes 
+    (HAProxy-based) to Kubernetes Gateway API resources (Envoy-based).
+    
+    **Known limitations:**
+    
+    - The `/v1/tenants` endpoint cannot discover the external hostname (Gateway has no hostname 
+      in `spec.listeners`, returns error instead of internal service name)
+    - Not compliant with Gateway API specification
+    - May have unexpected behavior or compatibility issues
+    
+    **Recommended alternative:** Deploy Gateway with LoadBalancer service type and configure
+    `spec.listeners[].hostname` to follow the Gateway API standard pattern.
 
 This pattern deploys a Gateway API Gateway as a **ClusterIP** service (no external
 LoadBalancer) and uses an **OpenShift Route** with **re-encrypt** TLS termination
@@ -139,7 +153,10 @@ spec:
       protocol: HTTPS
       allowedRoutes:
         namespaces:
-          from: All
+          from: Selector
+          selector:
+            matchLabels:
+              maas.opendatahub.io/gateway-access: "true"
       tls:
         certificateRefs:
           - group: ""
@@ -165,8 +182,6 @@ kind: Route
 metadata:
   name: maas-gateway-route
   namespace: openshift-ingress
-  annotations:
-    router.openshift.io/service-ca-certificate: "true"
 spec:
   host: maas.<cluster-domain>   # Replace with your cluster domain
   to:
@@ -178,6 +193,13 @@ spec:
   tls:
     termination: reencrypt
     insecureEdgeTerminationPolicy: Redirect
+    # The router needs the service CA bundle to verify the backend certificate
+    # during reencrypt handshake. Fetch it with:
+    #   kubectl get configmap signing-cabundle -n openshift-service-ca -o jsonpath='{.data.ca-bundle\.crt}'
+    destinationCACertificate: |
+      -----BEGIN CERTIFICATE-----
+      ... (paste service CA bundle here) ...
+      -----END CERTIFICATE-----
 ```
 
 !!! warning "Service name"
@@ -199,7 +221,18 @@ spec:
 
 #### 5. HTTPRoute
 
-Attach workloads to the Gateway. This example routes all traffic to `maas-api`:
+Attach workloads to the Gateway. The Gateway `allowedRoutes` uses a label selector.
+The controller automatically labels the infrastructure namespace and each tenant
+namespace (see
+[Automatic infrastructure and tenant namespace labeling](#automatic-infrastructure-and-tenant-namespace-labeling)).
+Label any additional namespaces (e.g. model namespaces) manually:
+
+```bash
+# Label model namespaces that need to attach HTTPRoutes
+oc label namespace <model-namespace> maas.opendatahub.io/gateway-access=true --overwrite
+```
+
+This example routes all traffic to `maas-api`:
 
 ```yaml
 apiVersion: gateway.networking.k8s.io/v1
@@ -245,6 +278,9 @@ GW_SVC=$(kubectl get svc -n openshift-ingress \
   -l gateway.networking.k8s.io/gateway-name=maas-default-gateway \
   -o jsonpath='{.items[0].metadata.name}')
 
+# Fetch the service CA bundle for reencrypt termination
+SERVICE_CA=$(kubectl get configmap signing-cabundle -n openshift-service-ca -o jsonpath='{.data.ca-bundle\.crt}')
+
 # Create the Route (update host and service name in openshift-route.yaml, or apply inline)
 kubectl apply -f - <<EOF
 apiVersion: route.openshift.io/v1
@@ -252,8 +288,6 @@ kind: Route
 metadata:
   name: maas-gateway-route
   namespace: openshift-ingress
-  annotations:
-    router.openshift.io/service-ca-certificate: "true"
 spec:
   host: maas.${CLUSTER_DOMAIN}
   to:
@@ -265,6 +299,8 @@ spec:
   tls:
     termination: reencrypt
     insecureEdgeTerminationPolicy: Redirect
+    destinationCACertificate: |
+$(echo "$SERVICE_CA" | sed 's/^/      /')
 EOF
 ```
 
@@ -292,8 +328,74 @@ kubectl get secret maas-gw-service-tls -n openshift-ingress
 | Gateway stays `NotProgrammed` | GatewayClass not accepted, or `gw-options` ConfigMap missing | Check `kubectl get gatewayclass`; verify ConfigMap in `openshift-ingress` |
 | Route shows `HostAlreadyClaimed` | Another Route uses the same hostname | Change `spec.host` to a unique FQDN |
 | `503` from the Route | Gateway Service not ready or certificate not yet provisioned | Wait for `service-ca-operator` to provision `maas-gw-service-tls`; check `kubectl get secret -n openshift-ingress` |
-| TLS handshake failure (re-encrypt) | Service CA cert not trusted by the Router | Ensure `router.openshift.io/service-ca-certificate: "true"` annotation on the Route |
+| TLS handshake failure (re-encrypt) | Service CA cert not trusted by the Router | Ensure `tls.destinationCACertificate` contains the service CA bundle from `signing-cabundle` ConfigMap in `openshift-service-ca` namespace |
 | `certificateRefs` name mismatch | Secret name in Gateway does not match ConfigMap annotation | Verify both reference the same Secret name (`maas-gw-service-tls`) |
+
+## Automatic infrastructure and tenant namespace labeling
+
+When a Gateway uses `allowedRoutes.namespaces.from: Selector` with `matchLabels`,
+the MaaS controller automatically applies those labels to:
+
+- the infrastructure namespace, where the `maas-api-route` HTTPRoutes live;
+- the namespace of the AITenant that uses the Gateway (`ai-tenant-<name>`, or
+  `models-as-a-service` for the default tenant), where ai-gateway-controller
+  creates the HTTPRoutes of tenant-local ExternalModels.
+
+This ensures the Gateway accepts these routes without manual labeling. Other
+model namespaces still require manual labeling.
+
+### How it works
+
+Each time an AITenant is reconciled, the controller reads the Gateway's listener
+`matchLabels` and applies them to the infra namespace and to the tenant
+namespace. An annotation (`maas.opendatahub.io/gateway-selector-labels`) on
+each namespace tracks which gateway owns each label so that labels can be
+cleaned up when a tenant is deleted or a gateway's selector changes. Deleting an
+AITenant keeps its tenant namespace but removes the labels its Gateway owned
+there.
+
+When multiple gateways share the same label (e.g. both use
+`maas-gateway-access=true`), all are recorded as co-owners. Deleting one
+tenant does not remove a label that another tenant's gateway still requires.
+
+The controller also watches for Gateway spec changes and re-reconciles the
+affected AITenants automatically.
+
+### Conflict errors
+
+Two situations produce reconciliation errors visible in the AITenant status
+(condition `type: Degraded`, `reason: InfraNamespaceLabelFailed`, or
+`reason: TenantNamespaceLabelFailed` when only the tenant namespace is affected):
+
+**Intra-gateway conflict:** A single gateway has two listeners that disagree on a
+label value (e.g. listener `https` wants `env=prod` and listener `https-alt`
+wants `env=staging`). Fix the gateway so all listeners use the same value for
+each label key.
+
+**Cross-gateway conflict:** Two gateways want different values for the same label
+key. For example, gateway-a set `env=prod` and gateway-b wants `env=staging`.
+Use distinct label keys per gateway (e.g. `gateway-a-access=true` and
+`gateway-b-access=true`) or ensure both use the same value.
+
+A co-owner cannot change a shared label's value while other gateways still
+depend on the current value. The conflicting tenant's AITenant status reports
+which gateway owns the contested label.
+
+### Limitations
+
+- Only `matchLabels` is supported. Gateways using `matchExpressions` require
+  manual namespace configuration.
+- The controller does not label model namespaces — only the infrastructure
+  namespace and the tenant namespace.
+- Labels not selected by any managed Gateway are not tracked in the ownership
+  annotation. The controller does not manage or clean up those labels. Remove
+  them manually if they are no longer needed:
+  ```bash
+  oc label namespace <infra-namespace> <label-key>-
+  ```
+- If an existing label on the infrastructure or tenant namespace conflicts
+  with a gateway's desired value, the controller rejects the reconciliation
+  rather than overwriting it. Resolve the conflict manually before retrying.
 
 ## MaaS integration
 

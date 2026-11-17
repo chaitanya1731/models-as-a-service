@@ -1,17 +1,21 @@
 package subscription
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"sort"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
+	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/authpolicy"
 	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/constant"
 	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/logger"
 	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/models"
+	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/token"
 )
 
 // Phase constants for MaaSSubscription status.
@@ -28,24 +32,80 @@ type Lister interface {
 	List() ([]*unstructured.Unstructured, error)
 }
 
+// ModelAccessChecker determines whether a user has access to a specific model.
+type ModelAccessChecker interface {
+	AuthorizedModels(groups []string, username string) (map[authpolicy.ModelKey]bool, error)
+}
+
 // Selector handles subscription selection logic.
 type Selector struct {
-	lister      Lister
-	modelLister models.MaaSModelRefLister
-	logger      *logger.Logger
+	lister                Lister
+	modelLister           models.MaaSModelRefLister
+	accessChecker         ModelAccessChecker
+	subjectInventory      authpolicy.SubjectInventoryProvider
+	guardrailResolver     GuardrailPlanResolver
+	logger                *logger.Logger
+	tenantName            string
+	subscriptionNamespace string
+}
+
+// SelectorOption configures a Selector.
+type SelectorOption func(*Selector)
+
+// WithTenantName sets the tenant name returned as the fairness ID of selected subscriptions.
+func WithTenantName(name string) SelectorOption {
+	return func(s *Selector) { s.tenantName = name }
+}
+
+// WithSubscriptionNamespace restricts administrative resolution to the namespace
+// watched by this API instance. The informer is already namespace-scoped; this is
+// an additional guard for callers that provide a broader test lister.
+func WithSubscriptionNamespace(namespace string) SelectorOption {
+	return func(s *Selector) { s.subscriptionNamespace = namespace }
+}
+
+// WithGuardrailPlanResolver enables effective guardrail selection for
+// successful model selections.
+func WithGuardrailPlanResolver(resolver GuardrailPlanResolver) SelectorOption {
+	return func(s *Selector) { s.guardrailResolver = resolver }
 }
 
 // NewSelector creates a new subscription selector.
 // modelLister is optional; when provided, model refs in list responses are enriched with displayName and description.
-func NewSelector(log *logger.Logger, lister Lister, modelLister models.MaaSModelRefLister) *Selector {
+func NewSelector(log *logger.Logger, lister Lister, modelLister models.MaaSModelRefLister, accessChecker ModelAccessChecker, opts ...SelectorOption) *Selector {
 	if log == nil {
 		log = logger.Production()
 	}
-	return &Selector{
-		lister:      lister,
-		modelLister: modelLister,
-		logger:      log,
+	s := &Selector{
+		lister:        lister,
+		modelLister:   modelLister,
+		accessChecker: accessChecker,
+		logger:        log,
 	}
+	if provider, ok := accessChecker.(authpolicy.SubjectInventoryProvider); ok {
+		s.subjectInventory = provider
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
+}
+
+// authorizedModels evaluates MaaSAuthPolicy once for a request. A nil map with
+// no error means authorization filtering is not configured; a non-nil empty
+// map means the evaluation succeeded but authorized no models.
+func (s *Selector) authorizedModels(groups []string, username string) (map[authpolicy.ModelKey]bool, error) {
+	if s.accessChecker == nil {
+		return nil, nil
+	}
+	authorized, err := s.accessChecker.AuthorizedModels(groups, username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to determine authorized models: %w", err)
+	}
+	if authorized == nil {
+		return nil, errors.New("failed to determine authorized models: checker returned nil")
+	}
+	return authorized, nil
 }
 
 // buildModelIndex builds a lookup map keyed by "namespace/name" from the MaaSModelRef cache.
@@ -68,24 +128,67 @@ func (s *Selector) buildModelIndex() map[string]*unstructured.Unstructured {
 	return index
 }
 
+// resolveModelAlias maps a body-based-routing model identity (e.g. publisher ID
+// or targetModel) back to canonical "namespace/name" using MaaSModelRef
+// status.resolvedModelAlias. Returns the input unchanged when no alias matches,
+// or when several MaaSModelRefs carry the alias: a shared model has one
+// modelRef per tenant in the model's namespace, and distinct models may share
+// a client-facing name across namespaces — rewriting to an arbitrary carrier
+// would fail every other tenant's subscription matching. The raw name is left
+// for findModelRef to match against the caller's own subscription, which is
+// the tenant-scoped disambiguator.
+func (s *Selector) resolveModelAlias(requestedModel string) string {
+	if s.modelLister == nil || requestedModel == "" {
+		return requestedModel
+	}
+	items, err := s.modelLister.List()
+	if err != nil {
+		return requestedModel
+	}
+	resolved := ""
+	for _, u := range items {
+		alias, found, _ := unstructured.NestedString(u.Object, "status", "resolvedModelAlias")
+		if !found || alias != requestedModel {
+			continue
+		}
+		if resolved != "" {
+			// The alias is shared by several MaaSModelRefs (per-tenant
+			// modelRefs for one shared model, or distinct models with one
+			// client-facing name): leave the raw name so findModelRef
+			// matches it against the caller's own subscription.
+			return requestedModel
+		}
+		resolved = u.GetNamespace() + "/" + u.GetName()
+	}
+	if resolved != "" {
+		return resolved
+	}
+	return requestedModel
+}
+
 // subscription represents a parsed MaaSSubscription for selection.
 type subscription struct {
-	Name                   string
-	Namespace              string
-	DisplayName            string
-	Description            string
-	Groups                 []string
-	Users                  []string
-	Priority               int32
-	MaxLimit               int64
-	OrganizationID         string
-	CostCenter             string
-	Labels                 map[string]string
-	ModelRefs              []ModelRefInfo
-	Phase                  string                 // status.phase: "Active", "Failed", "Pending", or ""
-	Ready                  bool                   // computed from status.conditions Ready condition
-	DeletionTimestamp      *string                // metadata.deletionTimestamp (set when being deleted)
-	TokenRateLimitStatuses []TokenRateLimitStatus // per-model TRLP status from status.tokenRateLimitStatuses
+	Object                   *unstructured.Unstructured
+	Name                     string
+	Namespace                string
+	DisplayName              string
+	Description              string
+	Groups                   []string
+	Users                    []string
+	Priority                 int32
+	MaxLimit                 int64
+	AssociatedOrganizationID string
+	OrganizationID           string
+	CostCenter               string
+	Labels                   map[string]string
+	Headers                  map[string][]string
+	ModelRefs                []ModelRefInfo
+	Phase                    string                 // status.phase: "Active", "Failed", "Pending", or ""
+	Ready                    bool                   // computed from status.conditions Ready condition
+	DeletionTimestamp        *string                // metadata.deletionTimestamp (set when being deleted)
+	TokenRateLimitStatuses   []TokenRateLimitStatus // per-model TRLP status from status.tokenRateLimitStatuses
+	UseShortRateLimitID      bool                   // status.rateLimitIdentity=short
+	Objectives               map[string]string      // "namespace/name" of a model -> InferenceObjective name, from status.flowControlStatuses
 }
 
 // GetAllAccessible returns all subscriptions the user has access to.
@@ -113,11 +216,26 @@ func (s *Selector) GetAllAccessible(groups []string, username string) ([]*Select
 		}
 
 		// Exclude subscriptions being deleted
-		if sub.DeletionTimestamp != nil {
+		if subscriptionIsDeleting(&sub) {
 			continue
 		}
 
 		accessible = append(accessible, toResponse(&sub))
+	}
+
+	if s.accessChecker != nil {
+		authorizedSet, err := s.authorizedModels(groups, username)
+		if err != nil {
+			return nil, err
+		}
+		filtered := accessible[:0]
+		for _, sub := range accessible {
+			sub.ModelRefs = filterAuthorizedModels(sub.ModelRefs, authorizedSet)
+			if len(sub.ModelRefs) > 0 {
+				filtered = append(filtered, sub)
+			}
+		}
+		accessible = filtered
 	}
 
 	// Sort for deterministic ordering
@@ -128,13 +246,430 @@ func (s *Selector) GetAllAccessible(groups []string, username string) ([]*Select
 	return accessible, nil
 }
 
+func isResolvedModelAuthorized(sub *subscription, requestedModel string, authorizedSet map[authpolicy.ModelKey]bool) bool {
+	if requestedModel == "" {
+		return true
+	}
+	if authorizedSet == nil {
+		return false
+	}
+	// An exact namespace/name pair identifies the routed model — the same
+	// precedence findModelRef documents. Never substitute an alias carrier
+	// for it, even when the exact ref is unauthorized.
+	if ns, name, ok := strings.Cut(requestedModel, "/"); ok {
+		for i := range sub.ModelRefs {
+			if sub.ModelRefs[i].Namespace == ns && sub.ModelRefs[i].Name == name {
+				return authorizedSet[authpolicy.ModelKey{Namespace: ns, Name: name}]
+			}
+		}
+	}
+	sub = authorizedSelectionSubscription(sub, authorizedSet)
+	ref := findModelRef(sub, requestedModel)
+	if ref == nil {
+		return false
+	}
+	return authorizedSet[authpolicy.ModelKey{Namespace: ref.Namespace, Name: ref.Name}]
+}
+
+func (s *Selector) buildAuthorizedResponse(sub *subscription, requestedModel string, authorizedSet map[authpolicy.ModelKey]bool) (*SelectResponse, error) {
+	// Response construction and health checks resolve within the authorized
+	// subset, but the authorization decision itself must see the full
+	// subscription: filtering first would let an authorized alias carrier
+	// substitute for an unauthorized exact namespace/name reference.
+	selectionSub := authorizedSelectionSubscription(sub, authorizedSet)
+	resp := s.toResponseWithResolvedModel(selectionSub, requestedModel)
+	resp.AccessAllowed = isResolvedModelAuthorized(sub, requestedModel, authorizedSet)
+	if authorizedSet != nil {
+		resp.ModelRefs = filterAuthorizedModels(resp.ModelRefs, authorizedSet)
+	}
+	if authorizedSet == nil || resp.AccessAllowed || requestedModel == "" {
+		if err := checkModelHealth(selectionSub, requestedModel); err != nil {
+			return nil, err
+		}
+	}
+	return resp, nil
+}
+
+// ListInventory returns the owner-visible and organization-admin inventory.
+// Owner-only output preserves inference filtering; admin-only output uses the
+// complete configured model refs and never consults inference authorization.
+func (s *Selector) ListInventory(
+	groups []string,
+	username string,
+	identity *token.VerifiedIdentity,
+) ([]SubscriptionInfo, error) {
+	if identity == nil {
+		return s.listOwnerInventory(groups, username)
+	}
+
+	subscriptions, err := s.loadInventorySubscriptions()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load subscriptions for inventory: %w", err)
+	}
+
+	adminOrganizationIDs := administeredOrganizationIDs(subscriptions, identity)
+
+	var authorizedModels map[authpolicy.ModelKey]bool
+	if hasOwnerInventoryCandidates(subscriptions, username, groups, identity) {
+		authorizedModels, err = s.authorizedModels(groups, username)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	adminInventories, err := s.buildAdminInventories(subscriptions, adminOrganizationIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	return s.buildInventoryResponse(subscriptions, username, groups, identity, adminInventories, authorizedModels), nil
+}
+
+func (s *Selector) listOwnerInventory(groups []string, username string) ([]SubscriptionInfo, error) {
+	accessible, err := s.GetAllAccessible(groups, username)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]SubscriptionInfo, len(accessible))
+	for index, sub := range accessible {
+		result[index] = ResponseToSubscriptionInfo(sub)
+	}
+	return result, nil
+}
+
+func administeredOrganizationIDs(
+	subscriptions []subscription,
+	identity *token.VerifiedIdentity,
+) map[string]struct{} {
+	adminOrganizationIDs := make(map[string]struct{})
+	for index := range subscriptions {
+		organizationID := administeredOrganizationID(&subscriptions[index], identity)
+		if organizationID != "" {
+			adminOrganizationIDs[organizationID] = struct{}{}
+		}
+	}
+	return adminOrganizationIDs
+}
+
+func administeredOrganizationID(sub *subscription, identity *token.VerifiedIdentity) string {
+	if sub.AssociatedOrganizationID == "" {
+		return ""
+	}
+	organizationID, err := canonicalOrganizationID(sub.AssociatedOrganizationID)
+	if err != nil || !identityHasOrganizationAdmin(identity, organizationID) {
+		return ""
+	}
+	return organizationID
+}
+
+func hasOwnerInventoryCandidates(
+	subscriptions []subscription,
+	username string,
+	groups []string,
+	identity *token.VerifiedIdentity,
+) bool {
+	for index := range subscriptions {
+		sub := &subscriptions[index]
+		if userHasAccess(sub, username, groups) &&
+			administeredOrganizationID(sub, identity) == "" &&
+			ownerInventoryVisible(sub) {
+			return true
+		}
+	}
+	return false
+}
+
+func ownerInventoryVisible(sub *subscription) bool {
+	return (sub.Phase == PhaseActive || sub.Phase == PhaseDegraded) && !subscriptionIsDeleting(sub)
+}
+
+func (s *Selector) buildInventoryResponse(
+	subscriptions []subscription,
+	username string,
+	groups []string,
+	identity *token.VerifiedIdentity,
+	adminInventories map[string]map[authpolicy.ModelKey]authpolicy.ModelAccessSubjects,
+	authorizedModels map[authpolicy.ModelKey]bool,
+) []SubscriptionInfo {
+	result := make([]SubscriptionInfo, 0, len(subscriptions))
+	seen := make(map[string]struct{}, len(subscriptions))
+	for index := range subscriptions {
+		sub := &subscriptions[index]
+		key := sub.Namespace + "\x00" + sub.Name
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+
+		owner := userHasAccess(sub, username, groups)
+		ownerVisible := owner && ownerInventoryVisible(sub)
+		adminOrganizationID := administeredOrganizationID(sub, identity)
+		if !ownerVisible && adminOrganizationID == "" {
+			continue
+		}
+
+		info := ResponseToSubscriptionInfo(toResponse(sub))
+		info.Namespace = sub.Namespace
+		if owner && adminOrganizationID != "" {
+			info.Roles = []string{"owner", "admin"}
+		} else if adminOrganizationID != "" {
+			info.Roles = []string{"admin"}
+		}
+
+		if adminOrganizationID != "" {
+			info.OrganizationID = adminOrganizationID
+			info.ModelRefs = modelRefSubjects(sub, adminInventories[adminOrganizationID])
+			info.Owner = ownerInventory(info.ModelRefs)
+		} else if s.accessChecker != nil {
+			info.ModelRefs = filterAuthorizedModels(sub.ModelRefs, authorizedModels)
+			if len(info.ModelRefs) == 0 {
+				continue
+			}
+		}
+
+		seen[key] = struct{}{}
+		result = append(result, info)
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Namespace != result[j].Namespace {
+			return result[i].Namespace < result[j].Namespace
+		}
+		return result[i].SubscriptionIDHeader < result[j].SubscriptionIDHeader
+	})
+	return result
+}
+
+func (s *Selector) loadInventorySubscriptions() ([]subscription, error) {
+	objects, err := s.lister.List()
+	if err != nil {
+		return nil, err
+	}
+
+	modelIndex := s.buildModelIndex()
+	subscriptions := make([]subscription, 0, len(objects))
+	for _, object := range objects {
+		if s.subscriptionNamespace != "" && object.GetNamespace() != s.subscriptionNamespace {
+			continue
+		}
+		parsed, err := parseSubscription(object)
+		if err != nil {
+			s.logger.Warn("Failed to parse subscription for inventory, skipping",
+				"name", object.GetName(),
+				"namespace", object.GetNamespace(),
+				"error", err,
+			)
+			continue
+		}
+		s.enrichModelRefs(parsed.ModelRefs, modelIndex)
+		subscriptions = append(subscriptions, parsed)
+	}
+	return subscriptions, nil
+}
+
+func (s *Selector) buildAdminInventories(
+	subscriptions []subscription,
+	adminOrganizationIDs map[string]struct{},
+) (map[string]map[authpolicy.ModelKey]authpolicy.ModelAccessSubjects, error) {
+	inventories := make(map[string]map[authpolicy.ModelKey]authpolicy.ModelAccessSubjects, len(adminOrganizationIDs))
+	if len(adminOrganizationIDs) == 0 {
+		return inventories, nil
+	}
+	if s.subjectInventory == nil {
+		return nil, errors.New("model-access subject inventory is unavailable")
+	}
+
+	modelRefsByOrganization := make(map[string][]authpolicy.ModelKey, len(adminOrganizationIDs))
+	for index := range subscriptions {
+		organizationID, err := canonicalOrganizationID(subscriptions[index].AssociatedOrganizationID)
+		if err != nil {
+			continue
+		}
+		if _, admin := adminOrganizationIDs[organizationID]; !admin {
+			continue
+		}
+		for _, ref := range subscriptions[index].ModelRefs {
+			if ref.Namespace == "" || ref.Name == "" {
+				continue
+			}
+			modelRefsByOrganization[organizationID] = append(
+				modelRefsByOrganization[organizationID],
+				authpolicy.ModelKey{Namespace: ref.Namespace, Name: ref.Name},
+			)
+		}
+	}
+
+	for organizationID := range adminOrganizationIDs {
+		inventory, err := s.subjectInventory.ModelAccessSubjects(modelRefsByOrganization[organizationID], organizationID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build model-access subject inventory: %w", err)
+		}
+		inventories[organizationID] = inventory
+	}
+	return inventories, nil
+}
+
+func modelRefSubjects(
+	sub *subscription,
+	inventory map[authpolicy.ModelKey]authpolicy.ModelAccessSubjects,
+) []ModelRefInfo {
+	ownerGroups := make(map[string]struct{}, len(sub.Groups))
+	for _, group := range sub.Groups {
+		ownerGroups[group] = struct{}{}
+	}
+	ownerUsers := make(map[string]struct{}, len(sub.Users))
+	for _, user := range sub.Users {
+		ownerUsers[user] = struct{}{}
+	}
+
+	result := make([]ModelRefInfo, len(sub.ModelRefs))
+	for index, ref := range sub.ModelRefs {
+		result[index] = ref
+		subjects := inventory[authpolicy.ModelKey{Namespace: ref.Namespace, Name: ref.Name}]
+
+		groups := make([]authpolicy.GroupReference, 0, len(subjects.Groups))
+		for _, group := range subjects.Groups {
+			if _, owner := ownerGroups[group.Name]; owner {
+				groups = append(groups, group)
+			}
+		}
+		users := make([]string, 0, len(subjects.Users))
+		for _, user := range subjects.Users {
+			if _, owner := ownerUsers[user]; owner {
+				users = append(users, user)
+			}
+		}
+		if len(groups) == 0 && len(users) == 0 {
+			continue
+		}
+
+		sort.Slice(groups, func(i, j int) bool {
+			return groups[i].Name < groups[j].Name
+		})
+		sort.Strings(users)
+		result[index].Subjects = &SubjectInventory{Groups: groups, Users: users}
+	}
+	return result
+}
+
+func ownerInventory(
+	refs []ModelRefInfo,
+) *SubjectInventory {
+	var groups []authpolicy.GroupReference
+	var users []string
+	for _, ref := range refs {
+		if ref.Subjects == nil {
+			continue
+		}
+		for _, group := range ref.Subjects.Groups {
+			if !slices.ContainsFunc(groups, func(existing authpolicy.GroupReference) bool {
+				return existing.Name == group.Name
+			}) {
+				groups = append(groups, group)
+			}
+		}
+		for _, user := range ref.Subjects.Users {
+			if !slices.Contains(users, user) {
+				users = append(users, user)
+			}
+		}
+	}
+	if len(groups) == 0 && len(users) == 0 {
+		return nil
+	}
+
+	sort.Slice(groups, func(i, j int) bool {
+		return groups[i].Name < groups[j].Name
+	})
+	sort.Strings(users)
+	return &SubjectInventory{Groups: groups, Users: users}
+}
+
+func filterAuthorizedModels(refs []ModelRefInfo, authorizedSet map[authpolicy.ModelKey]bool) []ModelRefInfo {
+	out := make([]ModelRefInfo, 0, len(refs))
+	for _, ref := range refs {
+		if authorizedSet[authpolicy.ModelKey{Namespace: ref.Namespace, Name: ref.Name}] {
+			out = append(out, ref)
+		}
+	}
+	return out
+}
+
+// authorizedSelectionSubscription returns a shallow copy of sub whose
+// ModelRefs are restricted to the authorized set, so alias resolution —
+// findModelRef returns the first alias match — can only select refs the
+// caller is authorized for. Without this filter, an unauthorized ref listed
+// before an authorized one sharing the same client-facing name would falsely
+// deny the request. Returns sub unchanged when authorization is
+// unrestricted (nil set).
+func authorizedSelectionSubscription(sub *subscription, authorizedSet map[authpolicy.ModelKey]bool) *subscription {
+	if authorizedSet == nil {
+		return sub
+	}
+	filtered := *sub
+	filtered.ModelRefs = filterAuthorizedModels(sub.ModelRefs, authorizedSet)
+	return &filtered
+}
+
+// selectExplicit handles the explicit subscription selection branch of Select.
+// It supports both "namespace/name" and bare "name" formats.
+func (s *Selector) selectExplicit(
+	ctx context.Context,
+	subscriptions []subscription,
+	requestedSubscription, requestedModel, username string,
+	groups []string,
+	authorizedSet map[authpolicy.ModelKey]bool,
+) (*SelectResponse, error) {
+	for _, sub := range subscriptions {
+		qualifiedName := fmt.Sprintf("%s/%s", sub.Namespace, sub.Name)
+		if qualifiedName == requestedSubscription {
+			if subscriptionIsDeleting(&sub) {
+				continue
+			}
+			if !userHasAccess(&sub, username, groups) {
+				return nil, &AccessDeniedError{Subscription: requestedSubscription}
+			}
+			if requestedModel != "" && authorizedSet == nil && !subscriptionIncludesModel(&sub, requestedModel) {
+				return nil, &ModelNotInSubscriptionError{Subscription: requestedSubscription, Model: requestedModel}
+			}
+			return s.completeSelection(ctx, &sub, requestedModel, authorizedSet)
+		}
+	}
+
+	if !strings.Contains(requestedSubscription, "/") {
+		for _, sub := range subscriptions {
+			if sub.Name != requestedSubscription {
+				continue
+			}
+			if subscriptionIsDeleting(&sub) {
+				continue
+			}
+			if !userHasAccess(&sub, username, groups) {
+				return nil, &AccessDeniedError{Subscription: requestedSubscription}
+			}
+			if requestedModel != "" && authorizedSet == nil && !subscriptionIncludesModel(&sub, requestedModel) {
+				return nil, &ModelNotInSubscriptionError{Subscription: requestedSubscription, Model: requestedModel}
+			}
+			return s.completeSelection(ctx, &sub, requestedModel, authorizedSet)
+		}
+	}
+
+	return nil, &SubscriptionNotFoundError{Subscription: requestedSubscription}
+}
+
 // Select implements the subscription selection logic.
 // Returns the selected subscription or an error if none found.
 // If requestedModel is provided, validates that the selected subscription includes that model.
 func (s *Selector) Select(groups []string, username string, requestedSubscription string, requestedModel string) (*SelectResponse, error) {
+	return s.SelectWithContext(context.Background(), groups, username, requestedSubscription, requestedModel)
+}
+
+// SelectWithContext selects a subscription and passes ctx to guardrail resolution.
+func (s *Selector) SelectWithContext(ctx context.Context, groups []string, username string, requestedSubscription string, requestedModel string) (*SelectResponse, error) {
 	if len(groups) == 0 && username == "" {
 		return nil, errors.New("either groups or username must be provided")
 	}
+
+	requestedModel = s.resolveModelAlias(requestedModel)
 
 	subscriptions, err := s.loadSubscriptions()
 	if err != nil {
@@ -145,65 +680,50 @@ func (s *Selector) Select(groups []string, username string, requestedSubscriptio
 		return nil, &NoSubscriptionError{}
 	}
 
-	// Sort by priority (desc), then maxLimit (desc)
 	sortSubscriptionsByPriority(subscriptions)
 
-	// Branch 1: Explicit subscription selection (with validation)
-	// Support both formats: "namespace/name" and bare "name"
-	if requestedSubscription != "" {
-		// First, try exact qualified match (namespace/name)
-		for _, sub := range subscriptions {
-			qualifiedName := fmt.Sprintf("%s/%s", sub.Namespace, sub.Name)
-			if qualifiedName == requestedSubscription {
-				if !userHasAccess(&sub, username, groups) {
-					return nil, &AccessDeniedError{Subscription: requestedSubscription}
-				}
-				// Validate subscription includes the requested model
-				if requestedModel != "" && !subscriptionIncludesModel(&sub, requestedModel) {
-					return nil, &ModelNotInSubscriptionError{Subscription: requestedSubscription, Model: requestedModel}
-				}
-				// Check model health for Degraded subscriptions
-				if err := checkModelHealth(&sub, requestedModel); err != nil {
-					return nil, err
-				}
-				return toResponse(&sub), nil
-			}
-		}
-
-		// If no qualified match found and request is bare name (no '/'), try bare name matching
-		if !strings.Contains(requestedSubscription, "/") {
-			for _, sub := range subscriptions {
-				if sub.Name != requestedSubscription {
-					continue
-				}
-				if !userHasAccess(&sub, username, groups) {
-					return nil, &AccessDeniedError{Subscription: requestedSubscription}
-				}
-				if requestedModel != "" && !subscriptionIncludesModel(&sub, requestedModel) {
-					return nil, &ModelNotInSubscriptionError{Subscription: requestedSubscription, Model: requestedModel}
-				}
-				// Check model health for Degraded subscriptions
-				if err := checkModelHealth(&sub, requestedModel); err != nil {
-					return nil, err
-				}
-				return toResponse(&sub), nil
-			}
-		}
-
-		// Request had '/' but no match found
-		return nil, &SubscriptionNotFoundError{Subscription: requestedSubscription}
+	authorizedSet, err := s.authorizedModels(groups, username)
+	if err != nil {
+		return nil, err
 	}
 
-	// Branch 2: Auto-selection
+	if requestedSubscription != "" {
+		return s.selectExplicit(ctx, subscriptions, requestedSubscription, requestedModel, username, groups, authorizedSet)
+	}
+
+	// Auto-selection
 	var accessibleSubs []subscription
 	for _, sub := range subscriptions {
+		if subscriptionIsDeleting(&sub) {
+			continue
+		}
 		if userHasAccess(&sub, username, groups) {
-			// If model is specified, only include subscriptions that contain that model
-			if requestedModel != "" && !subscriptionIncludesModel(&sub, requestedModel) {
+			// The unfiltered view can be ambiguous (several refs sharing a
+			// client-facing name in one namespace) while the authorized
+			// subset is not: admit the subscription when either view
+			// includes the model and let the authorization filter decide.
+			if requestedModel != "" &&
+				!subscriptionIncludesModel(&sub, requestedModel) &&
+				!subscriptionIncludesModel(authorizedSelectionSubscription(&sub, authorizedSet), requestedModel) {
 				continue
 			}
 			accessibleSubs = append(accessibleSubs, sub)
 		}
+	}
+
+	// Filter auto-selection candidates by model authorization before ambiguity check
+	modelMatched := len(accessibleSubs) > 0
+	if requestedModel != "" && authorizedSet != nil {
+		authorizedSubs := make([]subscription, 0, len(accessibleSubs))
+		for i := range accessibleSubs {
+			if isResolvedModelAuthorized(&accessibleSubs[i], requestedModel, authorizedSet) {
+				authorizedSubs = append(authorizedSubs, accessibleSubs[i])
+			}
+		}
+		if modelMatched && len(authorizedSubs) == 0 {
+			return nil, &AccessDeniedError{}
+		}
+		accessibleSubs = authorizedSubs
 	}
 
 	if len(accessibleSubs) == 0 {
@@ -211,19 +731,77 @@ func (s *Selector) Select(groups []string, username string, requestedSubscriptio
 	}
 
 	if len(accessibleSubs) == 1 {
-		// Check model health for Degraded subscriptions
-		if err := checkModelHealth(&accessibleSubs[0], requestedModel); err != nil {
-			return nil, err
-		}
-		return toResponse(&accessibleSubs[0]), nil
+		return s.completeSelection(ctx, &accessibleSubs[0], requestedModel, authorizedSet)
 	}
 
-	// User has multiple subscriptions - require explicit selection
 	subNames := make([]string, len(accessibleSubs))
 	for i, sub := range accessibleSubs {
 		subNames[i] = sub.Name
 	}
 	return nil, &MultipleSubscriptionsError{Subscriptions: subNames}
+}
+
+func (s *Selector) completeSelection(ctx context.Context, sub *subscription, requestedModel string, authorizedSet map[authpolicy.ModelKey]bool) (*SelectResponse, error) {
+	response, err := s.buildAuthorizedResponse(sub, requestedModel, authorizedSet)
+	if err != nil || requestedModel == "" || !response.AccessAllowed || s.guardrailResolver == nil {
+		return response, err
+	}
+	// Guardrail resolution selects within the authorized subset, matching
+	// the reference the authorization decision approved.
+	selectionSub := authorizedSelectionSubscription(sub, authorizedSet)
+	modelRef := findModelRef(selectionSub, requestedModel)
+	if modelRef == nil {
+		return nil, &GuardrailResolutionError{cause: fmt.Errorf("selected model %q is not in subscription", requestedModel)}
+	}
+	model, err := s.modelByKey(modelRef.Namespace, modelRef.Name)
+	if err != nil {
+		return nil, &GuardrailResolutionError{cause: err}
+	}
+	checks, err := s.guardrailResolver.SelectedChecks(ctx, sub.Object, model)
+	if err != nil {
+		return nil, &GuardrailResolutionError{cause: err}
+	}
+	response.SelectedGuardrailChecks = &checks
+	return response, nil
+}
+
+// GuardrailResolutionError indicates that an authorized model's effective
+// guardrail selection could not be resolved.
+type GuardrailResolutionError struct {
+	cause error
+}
+
+func (e *GuardrailResolutionError) Error() string {
+	return "selected guardrails could not be resolved"
+}
+
+func (e *GuardrailResolutionError) Unwrap() error {
+	return e.cause
+}
+
+// modelByKey looks up one MaaSModelRef, using a direct cache Get when the
+// lister supports it and falling back to a List scan otherwise.
+func (s *Selector) modelByKey(namespace, name string) (*unstructured.Unstructured, error) {
+	if s.modelLister == nil {
+		return nil, errors.New("MaaSModelRef lister is not configured")
+	}
+	if getter, ok := s.modelLister.(ResourceGetter); ok {
+		item, err := getter.Get(namespace, name)
+		if err != nil {
+			return nil, fmt.Errorf("get MaaSModelRef %s/%s: %w", namespace, name, err)
+		}
+		return item, nil
+	}
+	items, err := s.modelLister.List()
+	if err != nil {
+		return nil, fmt.Errorf("list MaaSModelRefs: %w", err)
+	}
+	for _, item := range items {
+		if item.GetNamespace() == namespace && item.GetName() == name {
+			return item, nil
+		}
+	}
+	return nil, fmt.Errorf("MaaSModelRef %s/%s not found", namespace, name)
 }
 
 // SelectHighestPriority returns the accessible subscription with highest spec.priority
@@ -244,6 +822,9 @@ func (s *Selector) SelectHighestPriority(groups []string, username string) (*Sel
 
 	var accessible []subscription
 	for _, sub := range subscriptions {
+		if subscriptionIsDeleting(&sub) {
+			continue
+		}
 		if userHasAccess(&sub, username, groups) {
 			accessible = append(accessible, sub)
 		}
@@ -254,7 +835,19 @@ func (s *Selector) SelectHighestPriority(groups []string, username string) (*Sel
 	}
 
 	sortSubscriptionsByPriority(accessible)
-	return toResponse(&accessible[0]), nil
+	resp := toResponse(&accessible[0])
+	if s.accessChecker != nil {
+		authorizedSet, err := s.authorizedModels(groups, username)
+		if err != nil {
+			return nil, err
+		}
+		resp.ModelRefs = filterAuthorizedModels(resp.ModelRefs, authorizedSet)
+	}
+	return resp, nil
+}
+
+func subscriptionIsDeleting(sub *subscription) bool {
+	return sub != nil && sub.DeletionTimestamp != nil
 }
 
 // loadSubscriptions fetches and parses MaaSSubscription resources.
@@ -278,6 +871,7 @@ func (s *Selector) loadSubscriptions() ([]subscription, error) {
 			continue
 		}
 		s.enrichModelRefs(sub.ModelRefs, modelIndex)
+		sub.Object = obj
 		subscriptions = append(subscriptions, sub)
 	}
 
@@ -297,6 +891,16 @@ func (s *Selector) enrichModelRefs(refs []ModelRefInfo, index map[string]*unstru
 				refs[i].DisplayName = annotations[constant.AnnotationDisplayName]
 				refs[i].Description = annotations[constant.AnnotationDescription]
 			}
+			kind, _, _ := unstructured.NestedString(u.Object, "spec", "modelRef", "kind")
+			switch kind {
+			case "ExternalModel":
+				refs[i].Source = "external"
+			case "LLMInferenceService":
+				refs[i].Source = "internal"
+			}
+			if alias, ok, _ := unstructured.NestedString(u.Object, "status", "resolvedModelAlias"); ok && alias != "" {
+				refs[i].ModelName = alias
+			}
 		}
 	}
 }
@@ -315,11 +919,29 @@ func parseSubscription(obj *unstructured.Unstructured) (subscription, error) {
 		Namespace: obj.GetNamespace(),
 	}
 
-	// Parse annotations for display metadata
+	// Parse annotations for display metadata.
 	if annotations := obj.GetAnnotations(); annotations != nil {
 		sub.DisplayName = annotations[constant.AnnotationDisplayName]
 		sub.Description = annotations[constant.AnnotationDescription]
+		headers, err := parseSubscriptionHeaders(annotations[constant.AnnotationSubscriptionHeaders])
+		if err != nil {
+			return subscription{}, fmt.Errorf("parse subscription headers annotation: %w", err)
+		}
+		sub.Headers = headers
 	}
+
+	// Match controller precedence: spec escape hatch, sticky status, then
+	// legacy annotation from early short-ID builds.
+	identity, _, _ := unstructured.NestedString(obj.Object, "spec", "rateLimitIdentity")
+	if identity == "" {
+		identity, _, _ = unstructured.NestedString(obj.Object, "status", "rateLimitIdentity")
+	}
+	if identity == "" {
+		if annotations := obj.GetAnnotations(); annotations != nil {
+			identity = annotations[constant.AnnotationRateLimitIdentity]
+		}
+	}
+	sub.UseShortRateLimitID = UsesShortRateLimitID(identity)
 
 	// Parse owner
 	if owner, found, _ := unstructured.NestedMap(spec, "owner"); found {
@@ -352,6 +974,10 @@ func parseSubscription(obj *unstructured.Unstructured) (subscription, error) {
 		for _, modelRef := range modelRefs {
 			if modelMap, ok := modelRef.(map[string]any); ok {
 				ref := parseModelRef(modelMap)
+				if ref.Unlimited {
+					// The priority tie-break prefers the most generous subscription.
+					sub.MaxLimit = math.MaxInt64
+				}
 				for _, trl := range ref.TokenRateLimits {
 					if trl.Limit > sub.MaxLimit {
 						sub.MaxLimit = trl.Limit
@@ -364,6 +990,14 @@ func parseSubscription(obj *unstructured.Unstructured) (subscription, error) {
 
 	// Parse tokenMetadata
 	parseTokenMetadata(spec, &sub)
+
+	// Parse the stable administrative organization association. This remains
+	// independent from tokenMetadata.organizationId, which is attribution data.
+	if organization, found, _ := unstructured.NestedMap(spec, "organization"); found {
+		if organizationID, ok := organization["id"].(string); ok {
+			sub.AssociatedOrganizationID = organizationID
+		}
+	}
 
 	// Parse status.phase with validation
 	if status, found, _ := unstructured.NestedMap(obj.Object, "status"); found {
@@ -392,6 +1026,8 @@ func parseSubscription(obj *unstructured.Unstructured) (subscription, error) {
 				}
 			}
 		}
+
+		parseFlowControlStatuses(status, &sub)
 
 		// Parse status.tokenRateLimitStatuses to extract TRLP health
 		if trlpStatuses, found, _ := unstructured.NestedSlice(status, "tokenRateLimitStatuses"); found {
@@ -435,6 +1071,37 @@ func parseSubscription(obj *unstructured.Unstructured) (subscription, error) {
 }
 
 // parseModelRef extracts a ModelRefInfo from an unstructured model ref map.
+// flowControlReasonObjectiveConflict is the MaaSSubscription flow-control reason for an
+// objective name held by an object not managed for the subscription.
+const flowControlReasonObjectiveConflict = "ObjectiveConflict"
+
+// parseFlowControlStatuses reads the objective name of each model from
+// status.flowControlStatuses. Names held by a foreign object are skipped, so its priority
+// is never applied.
+func parseFlowControlStatuses(status map[string]any, sub *subscription) {
+	statuses, found, _ := unstructured.NestedSlice(status, "flowControlStatuses")
+	if !found {
+		return
+	}
+	for _, raw := range statuses {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		namespace, _ := m["namespace"].(string)
+		name, _ := m["name"].(string)
+		objective, _ := m["objectiveName"].(string)
+		reason, _ := m["reason"].(string)
+		if name == "" || objective == "" || reason == flowControlReasonObjectiveConflict {
+			continue
+		}
+		if sub.Objectives == nil {
+			sub.Objectives = make(map[string]string)
+		}
+		sub.Objectives[namespace+"/"+name] = objective
+	}
+}
+
 func parseModelRef(modelMap map[string]any) ModelRefInfo {
 	ref := ModelRefInfo{}
 	if name, ok := modelMap["name"].(string); ok {
@@ -456,6 +1123,11 @@ func parseModelRef(modelMap map[string]any) ModelRefInfo {
 				ref.TokenRateLimits = append(ref.TokenRateLimits, trl)
 			}
 		}
+	}
+	// The CRD makes unlimited and tokenRateLimits mutually exclusive. Should a ref
+	// bypass that validation, the controller enforces the declared limits.
+	if unlimited, ok := modelMap["unlimited"].(bool); ok && unlimited && len(ref.TokenRateLimits) == 0 {
+		ref.Unlimited = true
 	}
 	if billingRate, found, _ := unstructured.NestedMap(modelMap, "billingRate"); found {
 		br := &BillingRate{}
@@ -489,6 +1161,16 @@ func parseTokenMetadata(spec map[string]any, sub *subscription) {
 	}
 }
 
+// effectiveOrganizationID returns the organization ID used for subscription
+// attribution. A stable organization association is authoritative; legacy
+// subscriptions without one retain tokenMetadata.organizationId.
+func (sub subscription) effectiveOrganizationID() string {
+	if sub.AssociatedOrganizationID != "" {
+		return sub.AssociatedOrganizationID
+	}
+	return sub.OrganizationID
+}
+
 // userHasAccess checks if user/groups match subscription owner.
 func userHasAccess(sub *subscription, username string, groups []string) bool {
 	// Check username match
@@ -498,11 +1180,8 @@ func userHasAccess(sub *subscription, username string, groups []string) bool {
 
 	// Check group match
 	for _, subGroup := range sub.Groups {
-		for _, userGroup := range groups {
-			userGroup = strings.TrimSpace(userGroup)
-			if userGroup == subGroup {
-				return true
-			}
+		if slices.Contains(groups, subGroup) {
+			return true
 		}
 	}
 
@@ -510,28 +1189,69 @@ func userHasAccess(sub *subscription, username string, groups []string) bool {
 }
 
 // subscriptionIncludesModel checks if the subscription's modelRefs includes the requested model.
-// requestedModel format: "namespace/name".
+// requestedModel is "namespace/name" or a raw model name (see findModelRef).
 func subscriptionIncludesModel(sub *subscription, requestedModel string) bool {
 	if requestedModel == "" {
 		return true // no model specified, so subscription is valid
 	}
+	return findModelRef(sub, requestedModel) != nil
+}
 
-	// Parse the requested model (format: "namespace/name")
+// findModelRef returns the subscription modelRef matching requestedModel, or
+// nil if none matches. requestedModel is either a "namespace/name" pair or a
+// raw model name (e.g. "claude-opus-4-8") matched against
+// ModelRefInfo.ModelName — the ExternalModel's spec.modelName — or the CRD
+// name. The raw path supports body-routed requests where X-Gateway-Model-Name
+// holds the model name from the request body, not the CRD namespace/name.
+// Raw model names may themselves contain "/", so alias matching runs even
+// when the value parses as namespace/name.
+//
+// Matching precedence: the modelRef's own "namespace/name" pair first, then
+// the pair's namespace plus the modelRef's resolved alias (ModelName), then
+// the full raw value against the alias, then against the modelRef name. The
+// pair-plus-alias step serves path-routed requests, which carry the
+// client-facing model name — it differs from the modelRef name for renamed
+// models and for per-tenant modelRefs serving one shared model. A pair whose
+// alias matches several distinct modelRefs in the subscription fails closed:
+// one client-facing identity claimed twice is ambiguous, and an arbitrary
+// pick could authorize against the wrong modelRef's rate limits.
+func findModelRef(sub *subscription, requestedModel string) *ModelRefInfo {
 	parts := strings.SplitN(requestedModel, "/", 2)
-	if len(parts) != 2 {
-		return false // invalid format
-	}
-	requestedNS := parts[0]
-	requestedName := parts[1]
-
-	// Check if any modelRef in the subscription matches
-	for _, ref := range sub.ModelRefs {
-		if ref.Namespace == requestedNS && ref.Name == requestedName {
-			return true
+	if len(parts) == 2 {
+		for i := range sub.ModelRefs {
+			if sub.ModelRefs[i].Namespace == parts[0] && sub.ModelRefs[i].Name == parts[1] {
+				return &sub.ModelRefs[i]
+			}
+		}
+		// Path-routed requests carry the client-facing model name as the
+		// pair's name segment, but the modelRef may be named differently
+		// (renamed models, per-tenant modelRefs for a shared model). Fall
+		// back to the pair's namespace plus the modelRef's resolved alias,
+		// which carries the client-facing name.
+		var aliasMatch *ModelRefInfo
+		for i := range sub.ModelRefs {
+			ref := &sub.ModelRefs[i]
+			if ref.ModelName == "" || ref.Namespace != parts[0] || ref.ModelName != parts[1] {
+				continue
+			}
+			if aliasMatch != nil && aliasMatch.Name != ref.Name {
+				return nil
+			}
+			aliasMatch = ref
+		}
+		if aliasMatch != nil {
+			return aliasMatch
 		}
 	}
-
-	return false
+	for i := range sub.ModelRefs {
+		if sub.ModelRefs[i].ModelName != "" && sub.ModelRefs[i].ModelName == requestedModel {
+			return &sub.ModelRefs[i]
+		}
+		if sub.ModelRefs[i].Name == requestedModel {
+			return &sub.ModelRefs[i]
+		}
+	}
+	return nil
 }
 
 // checkModelHealth validates subscription phase and model health.
@@ -587,39 +1307,32 @@ func checkModelHealth(sub *subscription, requestedModel string) error {
 		return nil
 	}
 
-	// For Degraded subscriptions, verify rate limits can be enforced (if defined)
-	// Parse the requested model (format: "namespace/name")
-	parts := strings.SplitN(requestedModel, "/", 2)
-	if len(parts) != 2 {
+	// For Degraded subscriptions, verify rate limits can be enforced (if defined).
+	// Resolve the requested model ("namespace/name" or a body-routed raw model
+	// name) to its canonical subscription ref so alias requests get the same
+	// TRLP check as namespace/name requests.
+	ref := findModelRef(sub, requestedModel)
+	if ref == nil {
 		return &ModelUnhealthyError{
 			Subscription: sub.Name,
 			Phase:        sub.Phase,
 			Reason:       "InvalidModelFormat",
-			Message:      "invalid model format: must be namespace/name",
-		}
-	}
-	requestedNS := parts[0]
-	requestedName := parts[1]
-
-	// Check if this model has tokenRateLimits defined in the subscription spec
-	hasRateLimits := false
-	for _, ref := range sub.ModelRefs {
-		if ref.Namespace == requestedNS && ref.Name == requestedName {
-			if len(ref.TokenRateLimits) > 0 {
-				hasRateLimits = true
-			}
-			break
+			Message:      "requested model does not match any model in the subscription",
 		}
 	}
 
-	// If model doesn't have rate limits defined, allow inference (no TRLP to check)
-	if !hasRateLimits {
+	// Unlimited models depend on their TRLP too: without it the gateway default
+	// deny applies, which the user would see as an unexplained 429.
+	needsTRLP := ref.Unlimited || len(ref.TokenRateLimits) > 0
+
+	// If the model has no token budget at all, allow inference (no TRLP to check)
+	if !needsTRLP {
 		return nil
 	}
 
-	// Model has rate limits defined - verify TRLP is ready
+	// Model is governed by a TRLP - verify it is ready
 	for _, trlp := range sub.TokenRateLimitStatuses {
-		if trlp.Model == requestedName {
+		if trlp.Model == ref.Name {
 			if !trlp.Ready {
 				return &ModelUnhealthyError{
 					Subscription: sub.Name,
@@ -633,7 +1346,7 @@ func checkModelHealth(sub *subscription, requestedModel string) error {
 		}
 	}
 
-	// Model has rate limits defined but TRLP status missing - fail closed
+	// Model is governed by a TRLP but its status is missing - fail closed
 	return &ModelUnhealthyError{
 		Subscription: sub.Name,
 		Phase:        sub.Phase,
@@ -642,14 +1355,15 @@ func checkModelHealth(sub *subscription, requestedModel string) error {
 	}
 }
 
-// hasModel returns true if the subscription includes the given model name.
-func (s subscription) hasModel(modelID string) bool {
+// findModelNamespaces returns all namespaces where the given model name appears in the subscription's modelRefs.
+func (s subscription) findModelNamespaces(modelID string) []string {
+	var namespaces []string
 	for _, ref := range s.ModelRefs {
 		if ref.Name == modelID {
-			return true
+			namespaces = append(namespaces, ref.Namespace)
 		}
 	}
-	return false
+	return namespaces
 }
 
 // sortSubscriptionsByPriority sorts in-place by priority desc, then maxLimit desc, then name asc.
@@ -673,11 +1387,36 @@ func (s *Selector) ListAccessibleForModel(username string, groups []string, mode
 		return nil, fmt.Errorf("failed to load subscriptions: %w", err)
 	}
 
+	authorizedSet, err := s.authorizedModels(groups, username)
+	if err != nil {
+		return nil, err
+	}
+
 	result := []SubscriptionInfo{}
 	for _, sub := range subscriptions {
-		if userHasAccess(&sub, username, groups) && sub.hasModel(modelID) {
-			result = append(result, toSubscriptionInfo(&sub))
+		modelNamespaces := sub.findModelNamespaces(modelID)
+		if !userHasAccess(&sub, username, groups) || len(modelNamespaces) == 0 {
+			continue
 		}
+
+		if s.accessChecker != nil {
+			authorized := false
+			for _, ns := range modelNamespaces {
+				if authorizedSet[authpolicy.ModelKey{Namespace: ns, Name: modelID}] {
+					authorized = true
+					break
+				}
+			}
+			if !authorized {
+				continue
+			}
+		}
+
+		info := toSubscriptionInfo(&sub)
+		if authorizedSet != nil {
+			info.ModelRefs = filterAuthorizedModels(info.ModelRefs, authorizedSet)
+		}
+		result = append(result, info)
 	}
 
 	// Sort for deterministic ordering
@@ -690,50 +1429,44 @@ func (s *Selector) ListAccessibleForModel(username string, groups []string, mode
 
 // toSubscriptionInfo converts internal subscription to a list response item.
 func toSubscriptionInfo(sub *subscription) SubscriptionInfo {
-	desc := sub.Description
-	if desc == "" {
-		desc = sub.DisplayName
-	}
-	if desc == "" {
-		desc = sub.Name
-	}
 	modelRefs := sub.ModelRefs
 	if modelRefs == nil {
 		modelRefs = []ModelRefInfo{}
 	}
 	info := SubscriptionInfo{
 		SubscriptionIDHeader:    sub.Name,
-		SubscriptionDescription: desc,
+		SubscriptionDescription: sub.Description,
 		DisplayName:             sub.DisplayName,
 		Priority:                sub.Priority,
 		ModelRefs:               modelRefs,
-		OrganizationID:          sub.OrganizationID,
+		OrganizationID:          sub.effectiveOrganizationID(),
 		CostCenter:              sub.CostCenter,
 		Labels:                  sub.Labels,
 	}
 	return info
 }
 
+func inventoryOrganizationID(sub *SelectResponse) string {
+	if sub.AssociatedOrganizationID != "" {
+		return sub.AssociatedOrganizationID
+	}
+	return sub.OrganizationID
+}
+
 // ResponseToSubscriptionInfo converts a SelectResponse to a SubscriptionInfo.
 func ResponseToSubscriptionInfo(sub *SelectResponse) SubscriptionInfo {
-	desc := sub.Description
-	if desc == "" {
-		desc = sub.DisplayName
-	}
-	if desc == "" {
-		desc = sub.Name
-	}
 	modelRefs := sub.ModelRefs
 	if modelRefs == nil {
 		modelRefs = []ModelRefInfo{}
 	}
 	return SubscriptionInfo{
 		SubscriptionIDHeader:    sub.Name,
-		SubscriptionDescription: desc,
+		Namespace:               sub.Namespace,
+		SubscriptionDescription: sub.Description,
 		DisplayName:             sub.DisplayName,
 		Priority:                sub.Priority,
 		ModelRefs:               modelRefs,
-		OrganizationID:          sub.OrganizationID,
+		OrganizationID:          inventoryOrganizationID(sub),
 		CostCenter:              sub.CostCenter,
 		Labels:                  sub.Labels,
 	}
@@ -746,20 +1479,47 @@ func toResponse(sub *subscription) *SelectResponse {
 		modelRefs = []ModelRefInfo{}
 	}
 	resp := &SelectResponse{
-		Name:           sub.Name,
-		Namespace:      sub.Namespace,
-		DisplayName:    sub.DisplayName,
-		Description:    sub.Description,
-		Priority:       sub.Priority,
-		ModelRefs:      modelRefs,
-		OrganizationID: sub.OrganizationID,
-		CostCenter:     sub.CostCenter,
-		Labels:         sub.Labels,
-		Phase:          sub.Phase,
-		Ready:          sub.Ready,
+		Name:                     sub.Name,
+		Namespace:                sub.Namespace,
+		DisplayName:              sub.DisplayName,
+		Description:              sub.Description,
+		Priority:                 sub.Priority,
+		ModelRefs:                modelRefs,
+		OrganizationID:           sub.effectiveOrganizationID(),
+		AssociatedOrganizationID: sub.AssociatedOrganizationID,
+		CostCenter:               sub.CostCenter,
+		Labels:                   sub.Labels,
+		Headers:                  sub.Headers,
+		Phase:                    sub.Phase,
+		Ready:                    sub.Ready,
 	}
 	if sub.DeletionTimestamp != nil {
 		resp.DeletionTimestamp = *sub.DeletionTimestamp
+	}
+	return resp
+}
+
+// toResponseWithResolvedModel converts a subscription and attaches the resolved
+// MaaSModelRef identity (namespace/name) used for TokenRateLimitPolicy matching, and the
+// flow-control objective and fairness ID for that model.
+func (s *Selector) toResponseWithResolvedModel(sub *subscription, resolvedModel string) *SelectResponse {
+	resp := toResponse(sub)
+	resp.ResolvedModel = resolvedModel
+	resp.FairnessID = s.tenantName
+	if sub == nil {
+		return resp
+	}
+	// TRLP limits are keyed on the modelref, not the requested identity: a
+	// request carrying a client-facing alias (bare or as a pair's name
+	// segment) must resolve to the matched ref's namespace/name so its rate
+	// limits apply. An exact pair already equals the ref's identity.
+	if ref := findModelRef(sub, resolvedModel); ref != nil {
+		resolvedModel = ref.Namespace + "/" + ref.Name
+		resp.ResolvedModel = resolvedModel
+		resp.Objective = sub.Objectives[resolvedModel]
+	}
+	if sub.UseShortRateLimitID {
+		resp.RateLimitID = RateLimitIDFor(sub.Namespace, sub.Name, resolvedModel)
 	}
 	return resp
 }

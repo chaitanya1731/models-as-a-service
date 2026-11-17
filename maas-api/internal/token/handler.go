@@ -10,59 +10,84 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/constant"
+	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/groupname"
 	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/logger"
 )
 
 type Handler struct {
-	name   string
-	logger *logger.Logger
+	tenantName string
+	logger     *logger.Logger
 }
 
-func NewHandler(log *logger.Logger, name string) *Handler {
+func NewHandler(log *logger.Logger, tenantName string) *Handler {
 	if log == nil {
 		log = logger.Production()
 	}
 	return &Handler{
-		name:   name,
-		logger: log,
+		tenantName: tenantName,
+		logger:     log,
 	}
 }
 
-// parseGroupsHeader parses the group header which comes as a JSON array.
-// Format: "[\"group1\",\"group2\",\"group3\"]" (JSON-encoded array string).
-func parseGroupsHeader(header string) ([]string, error) {
+// ParseGroupsHeader parses the group header which may arrive as a JSON array
+// (e.g., ["ai-eng"]) or as an Authorino bracket-wrapped format (e.g., [ai-eng]).
+func ParseGroupsHeader(header string) ([]string, error) {
 	if header == "" {
 		return nil, errors.New("header is empty")
 	}
-
-	// Try to unmarshal as JSON array directly
-	var groups []string
-	if err := json.Unmarshal([]byte(header), &groups); err != nil {
-		return nil, fmt.Errorf("failed to parse header as JSON array: %w", err)
+	trimmed := strings.TrimSpace(header)
+	if trimmed == "[]" {
+		return []string{}, nil
 	}
 
-	if len(groups) == 0 {
+	var parsedGroups []string
+
+	// Try JSON array first (e.g., ["ai-eng", "platform"])
+	if err := json.Unmarshal([]byte(header), &parsedGroups); err != nil {
+		// Fall back to bracket-wrapped space-separated format (e.g., [ai-eng platform]).
+		// Authorino's plain selector serializes arrays this way.
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			inner := trimmed[1 : len(trimmed)-1]
+			parsedGroups = strings.Fields(inner)
+		} else {
+			return nil, fmt.Errorf("unsupported group header format: %s", header)
+		}
+	}
+
+	var validGroups []string
+	for _, g := range parsedGroups {
+		if g != "" {
+			validGroups = append(validGroups, g)
+		}
+	}
+
+	if len(validGroups) == 0 {
 		return nil, errors.New("no groups found in header")
 	}
 
-	// Trim whitespace from each group
-	for i := range groups {
-		groups[i] = strings.TrimSpace(groups[i])
-	}
-
-	return groups, nil
+	return validGroups, nil
 }
 
 // ExtractUserInfo extracts user information from headers set by the auth policy.
 func (h *Handler) ExtractUserInfo() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		requestLogger := h.logger.WithContext(c.Request.Context())
+		if value, exists := c.Get("verified_identity"); exists {
+			if !h.setUserContextFromVerifiedIdentity(c, value) {
+				return
+			}
+			c.Next()
+			return
+		}
+
 		username := strings.TrimSpace(c.GetHeader(constant.HeaderUsername))
 		groupHeader := c.GetHeader(constant.HeaderGroup)
+		organizationID := strings.TrimSpace(c.GetHeader(constant.HeaderOrganizationID))
 
 		// Validate required headers exist and are not empty
 		// Missing headers indicate a configuration issue with the auth policy (internal error)
 		if username == "" {
-			h.logger.Error("Missing or empty username header",
+			requestLogger.Error("Missing or empty username header",
 				"header", constant.HeaderUsername,
 			)
 			c.JSON(http.StatusInternalServerError, gin.H{
@@ -75,9 +100,9 @@ func (h *Handler) ExtractUserInfo() gin.HandlerFunc {
 		}
 
 		if groupHeader == "" {
-			h.logger.Error("Missing group header",
+			requestLogger.Error("Missing group header",
 				"header", constant.HeaderGroup,
-				"username", username,
+				"username", logger.RedactValue(username),
 			)
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"error":         "Exception thrown while generating token",
@@ -90,9 +115,9 @@ func (h *Handler) ExtractUserInfo() gin.HandlerFunc {
 
 		// Parse groups from header - format: "[group1 group2 group3]"
 		// Parsing errors also indicate configuration issues
-		groups, err := parseGroupsHeader(groupHeader)
+		groups, err := ParseGroupsHeader(groupHeader)
 		if err != nil {
-			h.logger.Error("Failed to parse group header",
+			requestLogger.Error("Failed to parse group header",
 				"header", constant.HeaderGroup,
 				"header_value", groupHeader,
 				"error", err,
@@ -106,18 +131,131 @@ func (h *Handler) ExtractUserInfo() gin.HandlerFunc {
 			return
 		}
 
-		// Create UserContext from headers
+		// Create UserContext from headers and handler config.
+		// Tenant comes from TENANT_NAME env var set during maas-api deployment.
 		userContext := &UserContext{
-			Username: username,
-			Groups:   groups,
+			Username:       username,
+			Groups:         groups,
+			Tenant:         h.tenantName,
+			OrganizationID: organizationID,
 		}
 
-		h.logger.Debug("Extracted user info from headers",
-			"username", username,
+		logFields := []any{
+			"username", logger.RedactValue(username),
 			"groups", groups,
-		)
+		}
+		if organizationID != "" {
+			logFields = append(logFields, "organization_id", organizationID)
+		}
+		requestLogger.Debug("Extracted user info from headers", logFields...)
 
 		c.Set("user", userContext)
 		c.Next()
 	}
+}
+
+// ExtractUserInfoOptional is a lenient variant of ExtractUserInfo for endpoints
+// that must remain accessible when no auth policy is active (e.g. no
+// LLMInferenceService deployed). When the identity headers are entirely absent
+// the middleware continues without setting a user context, letting the handler
+// decide what to return. A verified identity takes precedence over legacy
+// headers. Otherwise, if headers ARE present but malformed, it still aborts so
+// that real configuration errors are surfaced.
+func (h *Handler) ExtractUserInfoOptional() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if value, exists := c.Get("verified_identity"); exists {
+			if !h.setUserContextFromVerifiedIdentity(c, value) {
+				return
+			}
+			c.Next()
+			return
+		}
+
+		requestLogger := h.logger.WithContext(c.Request.Context())
+
+		username := strings.TrimSpace(c.GetHeader(constant.HeaderUsername))
+		groupHeader := c.GetHeader(constant.HeaderGroup)
+		organizationID := strings.TrimSpace(c.GetHeader(constant.HeaderOrganizationID))
+
+		// Incomplete legacy identity headers are treated as absent. This keeps
+		// a verified identity, when present, authoritative and lets handlers
+		// reject requests that have no usable identity.
+		if username == "" || groupHeader == "" {
+			requestLogger.Debug("Auth identity headers not present or incomplete, continuing without user context")
+			c.Next()
+			return
+		}
+
+		// Parse groups — malformed headers are still an error.
+		groups, err := ParseGroupsHeader(groupHeader)
+		if err != nil {
+			requestLogger.Error("Failed to parse group header",
+				"header", constant.HeaderGroup,
+				"header_value", groupHeader,
+				"error", err,
+			)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error":         "Exception thrown while generating token",
+				"exceptionCode": "AUTH_FAILURE",
+				"refId":         "003",
+			})
+			c.Abort()
+			return
+		}
+
+		userContext := &UserContext{
+			Username:       username,
+			Groups:         groups,
+			Tenant:         h.tenantName,
+			OrganizationID: organizationID,
+		}
+
+		logFields := []any{
+			"username", logger.RedactValue(username),
+			"groups", groups,
+		}
+		if organizationID != "" {
+			logFields = append(logFields, "organization_id", organizationID)
+		}
+		requestLogger.Debug("Extracted user info from headers", logFields...)
+
+		c.Set("user", userContext)
+		c.Next()
+	}
+}
+
+func (h *Handler) setUserContextFromVerifiedIdentity(c *gin.Context, value any) bool {
+	identity, ok := value.(*VerifiedIdentity)
+	if !ok || identity == nil {
+		requestLogger := h.logger.WithContext(c.Request.Context())
+		requestLogger.Error("Invalid verified identity context type")
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":         "Exception thrown while generating token",
+			"exceptionCode": "AUTH_FAILURE",
+			"refId":         "004",
+		})
+		c.Abort()
+		return false
+	}
+
+	groups, err := QualifiedGroups(identity)
+	if err != nil {
+		h.rejectIdentity(c, err)
+		return false
+	}
+	if !groupname.AllValid(identity.Claims.Groups) {
+		groups = nil
+	}
+	groups = append([]string{"system:authenticated"}, groups...)
+	username := identity.Claims.PreferredUsername
+	if username == "" {
+		username = identity.Claims.Subject
+	}
+	c.Set("user", &UserContext{
+		Username:       username,
+		Groups:         groups,
+		Tenant:         h.tenantName,
+		OrganizationID: identity.Claims.OrgID,
+	})
+	return true
 }

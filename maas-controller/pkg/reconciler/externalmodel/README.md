@@ -1,101 +1,90 @@
-# External Model Reconciler
+# Legacy External Model Reconciler (`maas.opendatahub.io`)
 
-Watches `MaaSModelRef` CRs with `kind: ExternalModel` and creates the Istio
-resources required to route traffic from the MaaS gateway to an external AI
-model provider.
+> **Deprecated — do not create new resources with this API**
+>
+> `maas.opendatahub.io/v1alpha1` **ExternalModel** is legacy. Use **`inference.opendatahub.io/v1alpha1`** **`ExternalProvider`** and **`ExternalModel`** instead (see [External model setup](../../../../docs/content/install/external-model-setup.md) and the [ExternalModel CRD reference](../../../../docs/content/reference/crds/external-model.md)).
+>
+> - **RHOAI 3.6+ (Praxis):** New legacy ExternalModels are **rejected at admission** by the maas-controller validating webhook (`vexternalmodel.kb.io`). GitOps and `kubectl apply` must use the inference API group.
+> - **RHOAI 3.5 (Go IPP):** Existing legacy objects could be converted automatically by the IPP `legacy-migration` controller into inference CRs; that path does **not** run on Praxis extproc.
+>
+> This package remains for **existing** legacy CRs: supersede handling, `status.phase: Migrated`, and teardown of `maas-*` networking when a matching inference ExternalModel owns the route.
 
-## What It Creates
+## Supported API (use this for new work)
 
-For each `ExternalModel` MaaSModelRef, the reconciler creates:
+Define a provider and model under `inference.opendatahub.io` (same namespace). `MaaSModelRef` resolves inference ExternalModels first.
+
+```yaml
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalProvider
+metadata:
+  name: gpt-4o-mini
+  namespace: llm
+spec:
+  provider: openai
+  endpoint: api.openai.com
+  auth:
+    type: apikey
+    secretRef:
+      name: gpt-4o-mini-api-key
+---
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalModel
+metadata:
+  name: gpt-4o-mini
+  namespace: llm
+spec:
+  externalProviderRefs:
+    - ref:
+        name: gpt-4o-mini
+      targetModel: gpt-4o-mini
+      apiFormat: openai-chat
+      path: /v1/chat/completions
+```
+
+Networking for inference ExternalModels is reconciled by **ai-gateway-payload-processing** (IPP) or **ai-gateway-controller** (Praxis), not by this package.
+
+---
+
+## What this reconciler does (legacy only)
+
+Watches **`maas.opendatahub.io`** `ExternalModel` CRs and, when not superseded by an inference ExternalModel, created the Kubernetes/Gateway API/Istio resources required to route traffic from the MaaS gateway to an external provider using the **old** single-CR shape.
+
+When an **`inference.opendatahub.io`** ExternalModel exists for the same name/namespace and has published `status.httpRouteName`, this reconciler tears down legacy `maas-*` children and sets legacy `status.phase` to **`Migrated`**.
+
+## Legacy resources created
+
+For each legacy `ExternalModel`, the reconciler created child resources named `maas-<externalmodel-name>`:
 
 | # | Resource | Purpose |
 |---|----------|---------|
 | 1 | ExternalName Service | DNS bridge so HTTPRoute backendRef can reference the external host |
 | 2 | ServiceEntry | Registers the external FQDN in the Istio mesh (required for REGISTRY_ONLY) |
 | 3 | DestinationRule | TLS origination (skipped when `tls: false`) |
-| 4 | HTTPRoute | Routes `/external/<provider>/*` to the provider, sets Host header |
+| 4 | HTTPRoute | Routes `/<namespace>/<externalmodel-name>/*` to the provider, sets Host header |
 
-Resources are created in the gateway namespace (`openshift-ingress`), which is
-cross-namespace from the MaaSModelRef. Since Kubernetes garbage collection does
-not follow cross-namespace OwnerReferences, the reconciler uses a **finalizer**
-to explicitly delete all managed resources when the CR is removed.
+Resources are created in the `ExternalModel` namespace. The HTTPRoute parentRef targets the configured MaaS gateway, commonly `openshift-ingress/maas-default-gateway`. OwnerReferences on the child resources let Kubernetes garbage collection remove them when the legacy `ExternalModel` is deleted.
 
-## MaaSModelRef Spec
+The `maas-` prefix avoids collisions with the **`inference.opendatahub.io`** ExternalModel controller, which uses the model name directly for its networking resources.
 
-Until the CRD is enriched with external model fields (tracked separately), the
-reconciler reads configuration from annotations:
+## Legacy ExternalModel spec (deprecated)
 
 ```yaml
 apiVersion: maas.opendatahub.io/v1alpha1
-kind: MaaSModelRef
+kind: ExternalModel
 metadata:
   name: gpt-4o-mini
-  namespace: opendatahub
-  annotations:
-    maas.opendatahub.io/provider: "openai"
-    maas.opendatahub.io/endpoint: "api.openai.com"
-    maas.opendatahub.io/port: "443"                         # default
-    maas.opendatahub.io/tls: "true"                         # default
-    maas.opendatahub.io/path-prefix: "/external/openai/"    # default: /external/<provider>/
-    maas.opendatahub.io/extra-headers: "anthropic-version=2023-06-01"  # optional
+  namespace: llm
 spec:
-  modelRef:
-    kind: ExternalModel
-    name: gpt-4o-mini
+  provider: openai
+  targetModel: gpt-4o-mini
+  endpoint: api.openai.com
+  credentialRef:
+    name: gpt-4o-mini-api-key
 ```
 
-When the CRD is updated, the reconciler will read from `spec` fields instead.
-
-## Annotation Reference
+## Annotation reference (legacy CR only)
 
 | Annotation | Required | Default | Example |
 |------------|----------|---------|---------|
-| `maas.opendatahub.io/endpoint` | Yes | - | `api.openai.com` |
-| `maas.opendatahub.io/provider` | No | `spec.modelRef.name` | `openai` |
 | `maas.opendatahub.io/port` | No | `443` | `8000` |
 | `maas.opendatahub.io/tls` | No | `true` | `false` |
-| `maas.opendatahub.io/path-prefix` | No | `/external/<provider>/` | `/v1/` |
-| `maas.opendatahub.io/extra-headers` | No | - | `anthropic-version=2023-06-01` |
-
-## Provider Examples
-
-### OpenAI
-
-```yaml
-annotations:
-  maas.opendatahub.io/provider: "openai"
-  maas.opendatahub.io/endpoint: "api.openai.com"
-```
-
-### Anthropic
-
-```yaml
-annotations:
-  maas.opendatahub.io/provider: "anthropic"
-  maas.opendatahub.io/endpoint: "api.anthropic.com"
-  maas.opendatahub.io/extra-headers: "anthropic-version=2023-06-01"
-```
-
-### Self-hosted vLLM (no TLS)
-
-```yaml
-annotations:
-  maas.opendatahub.io/provider: "vllm"
-  maas.opendatahub.io/endpoint: "vllm.example.com"
-  maas.opendatahub.io/port: "8000"
-  maas.opendatahub.io/tls: "false"
-```
-
-## Moving to MaaS
-
-This reconciler is designed to be portable to the MaaS controller repo. To
-integrate with the existing MaaS provider pattern:
-
-1. Implement `BackendHandler` interface in `providers_external.go`
-2. Call `BuildExternalNameService`, `BuildServiceEntry`, `BuildDestinationRule`,
-   `BuildHTTPRoute` from `ReconcileRoute`
-3. Set status endpoint and phase from `Status`
-4. Finalizer handles cleanup in `CleanupOnDelete`
-
-The resource builder functions in `resources.go` are stateless and can be
-copied directly into the MaaS controller.

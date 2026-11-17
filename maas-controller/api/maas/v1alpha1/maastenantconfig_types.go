@@ -1,0 +1,133 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package v1alpha1
+
+import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+const (
+	// MaasTenantConfigKind is the API kind for MaaS-specific tenant configuration.
+	MaasTenantConfigKind = "MaasTenantConfig"
+	// MaasTenantConfigInstanceName is the singleton resource name enforced by the API.
+	MaasTenantConfigInstanceName = "default-tenant"
+)
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:resource:scope=Namespaced
+// +kubebuilder:validation:XValidation:rule="self.metadata.name == 'default-tenant'",message="MaasTenantConfig name must be default-tenant"
+// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`,description="Ready"
+// +kubebuilder:printcolumn:name="Reason",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].reason`,description="Reason"
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+// +kubebuilder:printcolumn:name="InfraNamespace",type=string,JSONPath=`.status.infraNamespace`,priority=1
+
+// MaasTenantConfig is the namespace-scoped singleton for MaaS-specific tenant settings.
+// Platform context such as Gateway and OIDC belongs to AITenant; this object only
+// owns MaaS runtime configuration such as API key policy and telemetry settings.
+type MaasTenantConfig struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   MaasTenantConfigSpec   `json:"spec,omitempty"`
+	Status MaasTenantConfigStatus `json:"status,omitempty"`
+}
+
+// MaasTenantConfigSpec defines MaaS-owned tenant configuration.
+type MaasTenantConfigSpec struct {
+	// APITranslation authorizes the API translation capabilities supported by
+	// the selected Praxis dataplane. Omission is equivalent to disabled for
+	// new tenants; the pointer preserves an explicit operator choice during
+	// IPP migration.
+	// +optional
+	APITranslation *TenantAPITranslationConfig `json:"apiTranslation,omitempty"`
+
+	// APIKeys contains configuration for API key management.
+	// +kubebuilder:validation:Optional
+	APIKeys *TenantAPIKeysConfig `json:"apiKeys,omitempty"`
+
+	// Telemetry contains configuration for telemetry and metrics collection.
+	// +kubebuilder:validation:Optional
+	Telemetry *TenantTelemetryConfig `json:"telemetry,omitempty"`
+
+	// MaasAPI defines scaling and resource configuration for maas-api pods.
+	// +kubebuilder:validation:Optional
+	MaasAPI *TenantMaasAPIConfig `json:"maasApi,omitempty"`
+
+	// PayloadProcessing defines scaling configuration for payload-processing (IPP) pods.
+	// +kubebuilder:validation:Optional
+	PayloadProcessing *TenantPayloadProcessingConfig `json:"payloadProcessing,omitempty"`
+
+	// PayloadPreProcessing defines scaling configuration for payload-pre-processing (IPP) pods.
+	// +kubebuilder:validation:Optional
+	PayloadPreProcessing *TenantPayloadProcessingConfig `json:"payloadPreProcessing,omitempty"`
+
+	// Guardrails attaches reusable AIGuardrail policies at the MaaS tenant-config
+	// scope. References resolve in this object's namespace (the tenant target
+	// namespace); a namespace must not be specified on the reference. Selections
+	// are additive with the AITenant baseline and lower scopes and cannot remove
+	// checks contributed elsewhere.
+	// +optional
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=64
+	Guardrails []GuardrailAttachment `json:"guardrails,omitempty"`
+}
+
+// TenantAPITranslationConfig controls whether supported API translation is
+// permitted for this tenant. Enabled is a pointer so migration can distinguish
+// an omitted setting from an explicit false or true value.
+type TenantAPITranslationConfig struct {
+	// Enabled permits only translation directions supported by the installed
+	// Praxis controller and ExtProc image. Omitted and false both disable
+	// translation for new tenants.
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+}
+
+// MaasTenantConfigStatus defines the observed state of MaasTenantConfig.
+type MaasTenantConfigStatus struct {
+	// Phase is a high-level lifecycle phase for the platform reconcile.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Enum=Pending;Active;Degraded;Failed
+	Phase string `json:"phase,omitempty"`
+
+	// InfraNamespace is the infrastructure namespace where maas-api and the
+	// maas-db-config secret are deployed for this tenant.
+	// When credential rotation is needed, update the maas-db-config secret
+	// in this namespace.
+	// +optional
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	InfraNamespace string `json:"infraNamespace,omitempty"`
+
+	// Conditions represent the latest available observations.
+	// Types mirror ODH modelsasservice / maas-controller status for DSC aggregation: Ready,
+	// DependenciesAvailable, MaaSPrerequisitesAvailable, DeploymentsAvailable, Degraded.
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+
+// MaasTenantConfigList contains a list of MaasTenantConfig.
+type MaasTenantConfigList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []MaasTenantConfig `json:"items"`
+}
+
+func init() {
+	register(&MaasTenantConfig{}, &MaasTenantConfigList{})
+}

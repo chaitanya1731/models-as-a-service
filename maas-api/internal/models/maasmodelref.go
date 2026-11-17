@@ -1,7 +1,9 @@
 package models
 
 import (
+	"encoding/json"
 	"net/url"
+	"strings"
 
 	"github.com/openai/openai-go/v2"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -15,6 +17,12 @@ const (
 	maasGroup    = "maas.opendatahub.io"
 	maasVersion  = "v1alpha1"
 	maasResource = "maasmodelrefs"
+
+	// kindExternalModel and kindLLMISvc are the two valid values of MaaSModelRef spec.modelRef.kind.
+	// An empty kind defaults to kindLLMISvc ("llmisvc").
+	kindExternalModel    = "ExternalModel"
+	kindLLMISvc          = "llmisvc"
+	kindLLMISvcAlternate = "LLMInferenceService"
 )
 
 // MaaSModelRefLister lists MaaSModelRef CRs from a cache (e.g. informer-backed). Used for GET /v1/models.
@@ -48,6 +56,14 @@ func GVR() schema.GroupVersionResource {
 }
 
 // maasModelRefToModel converts a MaaSModelRef unstructured to a Model for the API.
+//
+// For LLMInferenceService-backed models (BBR clusters), the model ID is read from
+// status.resolvedModelAlias (the canonical publishers/{ns}/models/{name} form).
+// For ExternalModel refs, the client-facing model identity is used: the
+// ExternalModel's spec.modelName as mirrored to status.resolvedModelAlias,
+// falling back to the ExternalModel CR name when the alias is not yet populated.
+// Both kinds advertise the shared gateway base URL from status.httpRouteHostnames[0]
+// when present (falling back to status.endpoint).
 func maasModelRefToModel(u *unstructured.Unstructured) *Model {
 	if u == nil {
 		return nil
@@ -58,18 +74,33 @@ func maasModelRefToModel(u *unstructured.Unstructured) *Model {
 	ready := phase == "Ready"
 	kind, _, _ := unstructured.NestedString(u.Object, "spec", "modelRef", "kind")
 	if kind == "" {
-		kind = "llmisvc"
+		kind = kindLLMISvc
 	}
 
 	modelRefName, _, _ := unstructured.NestedString(u.Object, "spec", "modelRef", "name")
 
-	// For ExternalModel refs, use the ExternalModel CR name as the model ID so that
-	// GET /v1/models returns the identifier that inference endpoints expect.
-	// ExternalModels skip the backend probe (no /v1/models discovery), so without
-	// this the catalog would expose the MaaSModelRef name which doesn't work for inference.
 	modelID := name
-	if kind == "ExternalModel" && modelRefName != "" {
-		modelID = modelRefName
+	switch kind {
+	case kindExternalModel:
+		// For ExternalModel refs, use the client-facing model identity from
+		// status.resolvedModelAlias (the ExternalModel's spec.modelName) so
+		// GET /v1/models returns the identifier the gateway serves at
+		// /{namespace}/{name} and inference requests expect. Falls back to
+		// the ExternalModel CR name when the alias is not yet populated or
+		// the model declares no client-facing name.
+		if alias, _, _ := unstructured.NestedString(u.Object, "status", "resolvedModelAlias"); alias != "" {
+			modelID = alias
+		} else if modelRefName != "" {
+			modelID = modelRefName
+		}
+	default:
+		// For LLMInferenceService-backed models, use status.resolvedModelAlias as the
+		// canonical BBR model ID (publishers/{namespace}/models/{model-name}), which is
+		// the correct identifier clients must use in the "model" field of inference requests.
+		// Falls back to metadata.name when resolvedModelAlias is not yet populated.
+		if alias, _, _ := unstructured.NestedString(u.Object, "status", "resolvedModelAlias"); alias != "" {
+			modelID = alias
+		}
 	}
 
 	annotations := u.GetAnnotations()
@@ -81,15 +112,44 @@ func maasModelRefToModel(u *unstructured.Unstructured) *Model {
 			GenAIUseCase:  annotations[constant.AnnotationGenAIUseCase],
 			ContextWindow: annotations[constant.AnnotationContextWindow],
 		}
-		if d.DisplayName != "" || d.Description != "" || d.GenAIUseCase != "" || d.ContextWindow != "" {
+		if raw := annotations[constant.AnnotationModelCapabilities]; raw != "" {
+			var caps []string
+			if err := json.Unmarshal([]byte(raw), &caps); err == nil {
+				d.ModelCapabilities = caps
+			}
+		}
+		if d.DisplayName != "" || d.Description != "" || d.GenAIUseCase != "" || d.ContextWindow != "" || len(d.ModelCapabilities) > 0 {
 			details = &d
 		}
 	}
 
+	// Both LLMInferenceService and ExternalModel share the gateway base URL on BBR
+	// clusters. Prefer status.httpRouteHostnames[0]; fall back to status.endpoint
+	// (already a base URL after controller reconcile) when hostnames are not set yet.
 	var urlPtr *apis.URL
-	if endpoint != "" {
-		parsed, err := url.Parse(endpoint)
+	if hostnames, _, _ := unstructured.NestedStringSlice(u.Object, "status", "httpRouteHostnames"); len(hostnames) > 0 {
+		if parsed, err := url.Parse("https://" + hostnames[0]); err == nil {
+			urlPtr = (*apis.URL)(parsed)
+		}
+	} else if endpoint != "" {
+		normalizedEndpoint := endpoint
+		if strings.HasPrefix(normalizedEndpoint, "//") {
+			normalizedEndpoint = "https:" + normalizedEndpoint
+		} else if !strings.Contains(normalizedEndpoint, "://") && !strings.HasPrefix(normalizedEndpoint, "/") {
+			normalizedEndpoint = "https://" + normalizedEndpoint
+		}
+
+		parsed, err := url.Parse(normalizedEndpoint)
 		if err == nil {
+			if strings.EqualFold(parsed.Scheme, "http") {
+				parsed.Scheme = "https"
+			}
+			parsed.Path = ""
+			parsed.RawPath = ""
+			parsed.RawQuery = ""
+			parsed.ForceQuery = false
+			parsed.Fragment = ""
+			parsed.RawFragment = ""
 			urlPtr = (*apis.URL)(parsed)
 		}
 	}

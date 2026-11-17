@@ -15,14 +15,20 @@ import (
 type MockStore struct {
 	mu   sync.RWMutex
 	keys map[string]*storedKey // keyed by ID
+
+	// UpdateLastUsedCount tracks how many times UpdateLastUsed has been called.
+	// Useful for asserting debounce behavior in tests.
+	UpdateLastUsedCount int
 }
 
 type storedKey struct {
 	metadata   ApiKey
+	groups     []string
 	username   string
 	keyHash    string
 	expiresAt  time.Time
 	lastUsedAt *time.Time
+	deletedAt  *time.Time
 	ephemeral  bool
 }
 
@@ -41,7 +47,18 @@ var _ MetadataStore = (*MockStore)(nil)
 // ephemeral marks the key as short-lived for programmatic use.
 // Note: keyPrefix is NOT stored (security - reduces brute-force attack surface).
 func (m *MockStore) AddKey(
-	ctx context.Context, username, keyID, keyHash, name, description string, userGroups []string, subscription string, expiresAt *time.Time, ephemeral bool,
+	ctx context.Context,
+	username,
+	keyID,
+	keyHash,
+	name,
+	description string,
+	userGroups []string,
+	subscription string,
+	tenant string,
+	expiresAt *time.Time,
+	ephemeral bool,
+	labels map[string]string,
 ) error {
 	if keyID == "" {
 		return ErrEmptyJTI
@@ -61,6 +78,10 @@ func (m *MockStore) AddKey(
 		expiresAtTime = *expiresAt
 	}
 
+	if len(labels) == 0 {
+		labels = nil
+	}
+
 	// userGroups is already []string - no parsing needed
 	m.keys[keyID] = &storedKey{
 		metadata: ApiKey{
@@ -68,13 +89,16 @@ func (m *MockStore) AddKey(
 			Name:         name,
 			Description:  description,
 			Subscription: subscription,
+			Tenant:       tenant,
 			Groups:       userGroups,
 			Status:       StatusActive,
 			CreationDate: time.Now().UTC().Format(time.RFC3339),
 			Ephemeral:    ephemeral,
+			Labels:       labels,
 		},
 		username:  username,
 		keyHash:   keyHash,
+		groups:    userGroups,
 		expiresAt: expiresAtTime,
 		ephemeral: ephemeral,
 	}
@@ -164,11 +188,16 @@ func (m *MockStore) List(ctx context.Context, username string, params Pagination
 	}, nil
 }
 
-// filterKeys applies username, status, and ephemeral filters to API keys.
-func (m *MockStore) filterKeys(username string, statusFilters []string, includeEphemeral bool, now time.Time) []ApiKey {
+// filterKeys applies tenant, username, status, and ephemeral filters to API keys.
+func (m *MockStore) filterKeys(username string, tenant string, statusFilters []string, includeEphemeral bool, now time.Time) []ApiKey {
 	filtered := make([]ApiKey, 0, len(m.keys))
 
 	for _, k := range m.keys {
+		// Tenant scoping is mandatory
+		if k.metadata.Tenant != tenant {
+			continue
+		}
+
 		// Filter ephemeral keys unless explicitly included
 		if !includeEphemeral && k.ephemeral {
 			continue
@@ -312,6 +341,7 @@ func applyPagination(keys []ApiKey, offset, limit int) ([]ApiKey, bool) {
 func (m *MockStore) Search(
 	ctx context.Context,
 	username string,
+	tenant string,
 	filters *SearchFilters,
 	sortParams *SortParams,
 	pagination *PaginationParams,
@@ -330,9 +360,9 @@ func (m *MockStore) Search(
 	// Determine if ephemeral keys should be included
 	includeEphemeral := filters.IncludeEphemeral != nil && *filters.IncludeEphemeral
 
-	// Filter keys by username, status, and ephemeral
+	// Filter keys by tenant, username, status, and ephemeral
 	now := time.Now().UTC()
-	allKeys := m.filterKeys(username, filters.Status, includeEphemeral, now)
+	allKeys := m.filterKeys(username, tenant, filters.Status, includeEphemeral, now)
 
 	// Filter by subscription
 	if filters.Subscription != nil && *filters.Subscription != "" {
@@ -340,6 +370,29 @@ func (m *MockStore) Search(
 		filtered := allKeys[:0]
 		for _, k := range allKeys {
 			if k.Subscription == sub {
+				filtered = append(filtered, k)
+			}
+		}
+		allKeys = filtered
+	}
+	if len(filters.SubscriptionNames) > 0 {
+		allowedSubscriptions := make(map[string]struct{}, len(filters.SubscriptionNames))
+		for _, subscription := range filters.SubscriptionNames {
+			allowedSubscriptions[strings.TrimSpace(subscription)] = struct{}{}
+		}
+		filtered := allKeys[:0]
+		for _, key := range allKeys {
+			if _, allowed := allowedSubscriptions[key.Subscription]; allowed {
+				filtered = append(filtered, key)
+			}
+		}
+		allKeys = filtered
+	}
+
+	if len(filters.LabelsContain) > 0 {
+		filtered := allKeys[:0]
+		for _, k := range allKeys {
+			if labelsContain(k.Labels, filters.LabelsContain) {
 				filtered = append(filtered, k)
 			}
 		}
@@ -360,6 +413,22 @@ func (m *MockStore) Search(
 	}, nil
 }
 
+// Helper function to check if the have map contains all the keys and values in the want map.
+func labelsContain(have, want map[string]string) bool {
+	if len(want) == 0 {
+		return true
+	}
+	if have == nil {
+		return false
+	}
+	for k, v := range want {
+		if have[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
 func (m *MockStore) Get(ctx context.Context, keyID string) (*ApiKey, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -371,6 +440,7 @@ func (m *MockStore) Get(ctx context.Context, keyID string) (*ApiKey, error) {
 
 	meta := k.metadata
 	meta.Username = k.username
+	meta.Groups = k.groups
 
 	// Compute status
 	now := time.Now().UTC()
@@ -392,7 +462,7 @@ func (m *MockStore) GetByHash(ctx context.Context, keyHash string) (*ApiKey, err
 	defer m.mu.Unlock()
 
 	for _, k := range m.keys {
-		if k.keyHash == keyHash {
+		if k.keyHash == keyHash && k.deletedAt == nil {
 			// Check expiration and auto-update status if expired
 			now := time.Now().UTC()
 			if !k.expiresAt.IsZero() && k.expiresAt.Before(now) {
@@ -408,6 +478,7 @@ func (m *MockStore) GetByHash(ctx context.Context, keyHash string) (*ApiKey, err
 
 			meta := k.metadata
 			meta.Username = k.username
+			meta.Groups = k.groups
 			if k.lastUsedAt != nil {
 				meta.LastUsedAt = k.lastUsedAt.Format(time.RFC3339)
 			}
@@ -418,18 +489,143 @@ func (m *MockStore) GetByHash(ctx context.Context, keyHash string) (*ApiKey, err
 	return nil, ErrKeyNotFound
 }
 
-func (m *MockStore) InvalidateAll(ctx context.Context, username string) (int, error) {
+// bulkRevokeMatch returns true if the key matches the bulk revoke scope.
+// Keys with a past expiresAt are treated as expired even when the persisted
+// status is still "active", consistent with the Get/Search auto-expire logic.
+func bulkRevokeMatch(k *storedKey, username, subscription, tenant string) bool {
+	if k.deletedAt != nil || k.metadata.Status != StatusActive || k.metadata.Tenant != tenant {
+		return false
+	}
+	if !k.expiresAt.IsZero() && k.expiresAt.Before(time.Now().UTC()) {
+		return false
+	}
+	if username != "" && k.username != username {
+		return false
+	}
+	if subscription != "" && k.metadata.Subscription != subscription {
+		return false
+	}
+	return true
+}
+
+func (m *MockStore) BulkRevoke(ctx context.Context, username, subscription, tenant string, dryRun bool) (int, error) {
+	if username == "" && subscription == "" {
+		return 0, errors.New("at least one of username or subscription is required")
+	}
+
+	if dryRun {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+
+		count := 0
+		for _, k := range m.keys {
+			if bulkRevokeMatch(k, username, subscription, tenant) {
+				count++
+			}
+		}
+		return count, nil
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	count := 0
 	for _, k := range m.keys {
-		if k.username == username && k.metadata.Status == StatusActive {
+		if bulkRevokeMatch(k, username, subscription, tenant) {
 			k.metadata.Status = StatusRevoked
 			count++
 		}
 	}
+	return count, nil
+}
 
+func (m *MockStore) BulkRevokeBySubscriptions(
+	ctx context.Context,
+	username string,
+	subscriptions []string,
+	tenant string,
+	dryRun bool,
+) (int, error) {
+	if username == "" || len(subscriptions) == 0 {
+		return 0, errors.New("username and at least one subscription are required")
+	}
+
+	subscriptionSet := make(map[string]struct{}, len(subscriptions))
+	for _, subscription := range subscriptions {
+		subscriptionSet[subscription] = struct{}{}
+	}
+
+	revoke := func(k *storedKey) bool {
+		if !bulkRevokeMatch(k, username, "", tenant) {
+			return false
+		}
+		_, allowed := subscriptionSet[k.metadata.Subscription]
+		return allowed
+	}
+
+	if dryRun {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+
+		count := 0
+		for _, k := range m.keys {
+			if revoke(k) {
+				count++
+			}
+		}
+		return count, nil
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	count := 0
+	for _, k := range m.keys {
+		if revoke(k) {
+			k.metadata.Status = StatusRevoked
+			count++
+		}
+	}
+	return count, nil
+}
+
+func (m *MockStore) InvalidateTenant(ctx context.Context, tenant string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	count := 0
+	for _, k := range m.keys {
+		if k.metadata.Tenant == tenant && k.deletedAt == nil {
+			now := time.Now().UTC()
+			k.deletedAt = &now
+			if k.metadata.Status == StatusActive {
+				k.metadata.Status = StatusRevoked
+			}
+			count++
+		}
+	}
+
+	return count, nil
+}
+
+func (m *MockStore) InvalidateSubscription(ctx context.Context, tenant, subscription string) (int, error) {
+	if strings.TrimSpace(subscription) == "" {
+		return 0, errors.New("subscription is required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	count := 0
+	for _, k := range m.keys {
+		if k.metadata.Tenant == tenant && k.metadata.Subscription == subscription && k.deletedAt == nil {
+			now := time.Now().UTC()
+			k.deletedAt = &now
+			if k.metadata.Status == StatusActive {
+				k.metadata.Status = StatusRevoked
+			}
+			count++
+		}
+	}
 	return count, nil
 }
 
@@ -462,7 +658,16 @@ func (m *MockStore) UpdateLastUsed(ctx context.Context, keyID string) error {
 
 	now := time.Now().UTC()
 	k.lastUsedAt = &now
+	m.UpdateLastUsedCount++
 	return nil
+}
+
+// GetUpdateLastUsedCount returns the current call count under the store's read lock,
+// safe for concurrent use with in-flight UpdateLastUsed calls.
+func (m *MockStore) GetUpdateLastUsedCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.UpdateLastUsedCount
 }
 
 // DeleteExpiredEphemeral removes expired ephemeral keys from the mock store.
@@ -488,6 +693,24 @@ func (m *MockStore) DeleteExpiredEphemeral(ctx context.Context) (int64, error) {
 		}
 	}
 
+	return count, nil
+}
+
+func (m *MockStore) DeleteSoftDeleted(ctx context.Context, retention time.Duration) (int64, error) {
+	if retention < 0 {
+		return 0, errors.New("retention must not be negative")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cutoff := time.Now().UTC().Add(-retention)
+	var count int64
+	for id, k := range m.keys {
+		if k.deletedAt != nil && k.deletedAt.Before(cutoff) {
+			delete(m.keys, id)
+			count++
+		}
+	}
 	return count, nil
 }
 

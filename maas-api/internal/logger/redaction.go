@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"fmt"
 	"net/http"
 	"net/textproto"
+	"strings"
 	"sync"
 )
 
@@ -18,6 +20,9 @@ var (
 		"X-Api-Key",
 		"Cookie",
 		"Set-Cookie",
+		"X-MaaS-Username",
+		"X-MaaS-Group",
+		"X-MaaS-Identity",
 	}
 
 	// hmacKey is a per-process random key used to prevent rainbow table attacks
@@ -88,14 +93,29 @@ func RedactHeaders(headers http.Header, hashPrefix bool) map[string]string {
 			if len(values) > 0 {
 				val = values[0]
 			}
-			result[name] = RedactHeader(val, hashPrefix)
+			result[canonical] = RedactHeader(val, hashPrefix)
 		} else if len(values) > 0 {
 			// Pass through non-sensitive headers
-			result[name] = values[0]
+			result[canonical] = values[0]
 		}
 	}
 
 	return result
+}
+
+// RedactValue returns an HMAC-SHA256 prefix of a sensitive value (e.g. username)
+// for log correlation without exposing the original. The per-process HMAC key
+// prevents rainbow-table reversal while keeping the prefix stable within a
+// single process lifetime (CWE-532 mitigation).
+func RedactValue(value string) string {
+	if value == "" {
+		return "<empty>"
+	}
+	initHMACKey()
+	mac := hmac.New(sha256.New, hmacKey)
+	mac.Write([]byte(value))
+	digest := mac.Sum(nil)
+	return "sha256:" + base64.URLEncoding.EncodeToString(digest)[:12]
 }
 
 // IsSensitiveHeader checks if a header name is in the sensitive list.
@@ -108,4 +128,15 @@ func IsSensitiveHeader(name string) bool {
 		}
 	}
 	return false
+}
+
+// SensitiveHeadersSummaryForAccessLog returns presence-only key=value pairs for each
+// entry in SensitiveHeaders (uses RedactHeader).
+func SensitiveHeadersSummaryForAccessLog(h http.Header) string {
+	parts := make([]string, 0, len(SensitiveHeaders))
+	for _, name := range SensitiveHeaders {
+		val := RedactHeader(h.Get(name), false)
+		parts = append(parts, fmt.Sprintf("%s=%s", name, val))
+	}
+	return strings.Join(parts, " ")
 }

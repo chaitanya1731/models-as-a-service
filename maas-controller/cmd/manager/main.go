@@ -18,41 +18,56 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	stderrors "errors"
 	"flag"
 	"fmt"
-	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
 	"time"
 
-	kservev1alpha1 "github.com/kserve/kserve/pkg/apis/serving/v1alpha1"
+	kservev1alpha2 "github.com/kserve/kserve/pkg/apis/serving/v1alpha2"
+	llmdv1alpha2 "github.com/llm-d/llm-d-router/apix/v1alpha2"
+	aigatewayv1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/aigateway/v1alpha1"
+	confv1 "github.com/openshift/api/config/v1"
+	utiltls "github.com/openshift/controller-runtime-common/pkg/tls"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	extv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	crwebhook "sigs.k8s.io/controller-runtime/pkg/webhook"
 	gatewayapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	maasv1alpha1 "github.com/opendatahub-io/models-as-a-service/maas-controller/api/maas/v1alpha1"
 	"github.com/opendatahub-io/models-as-a-service/maas-controller/pkg/controller/maas"
+	"github.com/opendatahub-io/models-as-a-service/maas-controller/pkg/oteljson"
 	"github.com/opendatahub-io/models-as-a-service/maas-controller/pkg/platform/tenantreconcile"
 	"github.com/opendatahub-io/models-as-a-service/maas-controller/pkg/reconciler/externalmodel"
+	"github.com/opendatahub-io/models-as-a-service/maas-controller/pkg/webhook"
 )
 
 var (
@@ -60,17 +75,35 @@ var (
 	setupLog = ctrl.Log.WithName("setup")
 )
 
+const (
+	tlsProfileFetchMaxRetries = 3
+	tlsProfileFetchTimeout    = 10 * time.Second
+	tlsProfileFetchRetryDelay = 2 * time.Second
+
+	// metricsCertDir is where OpenShift service-ca mounts the metrics serving cert.
+	// Must match the Deployment volumeMount added for SecureServing.
+	metricsCertDir = "/tmp/k8s-metrics-server/metrics-certs"
+)
+
+var (
+	tlsProfileRetryDelay = tlsProfileFetchRetryDelay
+	fatalExit            = os.Exit
+)
+
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(extv1.AddToScheme(scheme))
-	utilruntime.Must(kservev1alpha1.AddToScheme(scheme))
+	utilruntime.Must(kservev1alpha2.AddToScheme(scheme))
 	utilruntime.Must(gatewayapiv1.Install(scheme))
+	utilruntime.Must(aigatewayv1alpha1.AddToScheme(scheme))
 	utilruntime.Must(maasv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(llmdv1alpha2.Install(scheme))
+	utilruntime.Must(confv1.Install(scheme))
 }
 
-//+kubebuilder:rbac:groups="",resources=namespaces,verbs=get;create
+//+kubebuilder:rbac:groups="",resources=namespaces,verbs=get;create;patch
 
-// ensureSubscriptionNamespaceWithClient checks whether the subscription namespace exists
+// ensureManagedNamespaceWithClient checks whether a controller-managed namespace exists
 // and creates it if missing. It checks for existence first so that the controller can
 // start even when the service account lacks namespace-create permission (common in
 // operator-managed deployments where the operator pre-creates the namespace).
@@ -78,37 +111,37 @@ func init() {
 //
 // Handles the edge case where the namespace is in Terminating phase during RHOAI
 // reinstall/upgrade - waits for deletion to complete before attempting creation.
-func ensureSubscriptionNamespaceWithClient(ctx context.Context, namespace string, clientset kubernetes.Interface) error {
+func ensureManagedNamespaceWithClient(ctx context.Context, namespace, purpose string, clientset kubernetes.Interface) error {
 	ns, err := clientset.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
 	if err == nil {
 		if ns.Status.Phase == corev1.NamespaceTerminating {
-			setupLog.Info("subscription namespace is terminating, waiting for deletion to complete",
-				"namespace", namespace)
+			setupLog.Info("managed namespace is terminating, waiting for deletion to complete",
+				"namespace", namespace, "purpose", purpose)
 
 			pollErr := wait.PollUntilContextTimeout(ctx, 2*time.Second, 90*time.Second, true,
 				func(ctx context.Context) (bool, error) {
 					checkNs, pollErr := clientset.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
 					if errors.IsNotFound(pollErr) {
-						setupLog.Info("terminating namespace has been deleted", "namespace", namespace)
+						setupLog.Info("terminating namespace has been deleted", "namespace", namespace, "purpose", purpose)
 						return true, nil
 					}
 					if errors.IsForbidden(pollErr) {
 						setupLog.Info("insufficient permissions to poll namespace deletion status, "+
 							"assuming namespace is managed externally",
-							"namespace", namespace, "error", pollErr)
+							"namespace", namespace, "purpose", purpose, "error", pollErr)
 						return true, nil
 					}
 					if pollErr != nil {
 						return false, fmt.Errorf("error checking namespace status during deletion wait: %w", pollErr)
 					}
 					if checkNs.Status.Phase == corev1.NamespaceActive || checkNs.Status.Phase == "" {
-						setupLog.Info("subscription namespace became active during deletion wait "+
+						setupLog.Info("managed namespace became active during deletion wait "+
 							"(recreated by operator or external process)",
-							"namespace", namespace)
+							"namespace", namespace, "purpose", purpose)
 						return true, nil
 					}
 					setupLog.V(1).Info("namespace still terminating, will retry",
-						"namespace", namespace, "phase", checkNs.Status.Phase)
+						"namespace", namespace, "purpose", purpose, "phase", checkNs.Status.Phase)
 					return false, nil
 				})
 
@@ -128,23 +161,23 @@ func ensureSubscriptionNamespaceWithClient(ctx context.Context, namespace string
 				return nil
 			}
 		} else {
-			setupLog.Info("subscription namespace already exists",
-				"namespace", namespace, "phase", ns.Status.Phase)
-			return nil
+			setupLog.Info("managed namespace already exists",
+				"namespace", namespace, "purpose", purpose, "phase", ns.Status.Phase)
+			return ensureManagedNamespaceLabels(ctx, ns, namespace, purpose, clientset)
 		}
 	}
 
 	if errors.IsForbidden(err) {
 		setupLog.Info("insufficient permissions to check namespace existence, assuming it exists — "+
 			"verify that the ClusterRoleBinding references the correct namespace for the controller ServiceAccount",
-			"namespace", namespace, "error", err)
+			"namespace", namespace, "purpose", purpose, "error", err)
 		return nil
 	}
 	if !errors.IsNotFound(err) {
 		return fmt.Errorf("unable to check if namespace %q exists: %w", namespace, err)
 	}
 
-	setupLog.Info("subscription namespace not found, attempting to create it", "namespace", namespace)
+	setupLog.Info("managed namespace not found, attempting to create it", "namespace", namespace, "purpose", purpose)
 	return wait.ExponentialBackoffWithContext(ctx, wait.Backoff{
 		Steps:    5,
 		Duration: 1 * time.Second,
@@ -152,18 +185,14 @@ func ensureSubscriptionNamespaceWithClient(ctx context.Context, namespace string
 	}, func(ctx context.Context) (bool, error) {
 		ns := &corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: namespace,
-				Labels: map[string]string{
-					"opendatahub.io/generated-namespace": "true",
-					"app.kubernetes.io/managed-by":       "maas-controller",
-					"app.kubernetes.io/part-of":          "maas-controller",
-				},
+				Name:   namespace,
+				Labels: managedNamespaceLabelsFor(purpose),
 			},
 		}
 
 		_, err := clientset.CoreV1().Namespaces().Create(ctx, ns, metav1.CreateOptions{})
 		if err == nil {
-			setupLog.Info("subscription namespace ready", "namespace", namespace)
+			setupLog.Info("managed namespace ready", "namespace", namespace, "purpose", purpose)
 			return true, nil
 		}
 		if errors.IsAlreadyExists(err) {
@@ -176,11 +205,14 @@ func ensureSubscriptionNamespaceWithClient(ctx context.Context, namespace string
 				return false, nil
 			}
 			if existingNs.Status.Phase == corev1.NamespaceActive || existingNs.Status.Phase == "" {
-				setupLog.Info("subscription namespace ready", "namespace", namespace)
+				if labelErr := ensureManagedNamespaceLabels(ctx, existingNs, namespace, purpose, clientset); labelErr != nil {
+					return false, labelErr
+				}
+				setupLog.Info("managed namespace ready", "namespace", namespace, "purpose", purpose)
 				return true, nil
 			}
 			setupLog.Info("namespace already exists but is not ready, will retry",
-				"namespace", namespace, "phase", existingNs.Status.Phase)
+				"namespace", namespace, "purpose", purpose, "phase", existingNs.Status.Phase)
 			return false, nil
 		}
 		if errors.IsForbidden(err) {
@@ -188,15 +220,147 @@ func ensureSubscriptionNamespaceWithClient(ctx context.Context, namespace string
 				"either pre-create the namespace or grant 'create' on namespaces to the controller service account: %w",
 				namespace, err)
 		}
-		setupLog.Info("retrying namespace creation", "namespace", namespace, "error", err)
+		setupLog.Info("retrying namespace creation", "namespace", namespace, "purpose", purpose, "error", err)
 		return false, nil // transient error, retry
 	})
+}
+
+var managedNamespaceLabels = map[string]string{
+	"opendatahub.io/generated-namespace": "true",
+	"app.kubernetes.io/managed-by":       "maas-controller",
+	"app.kubernetes.io/part-of":          "maas-controller",
+}
+
+const (
+	networkPolicyRequiredLabel = "opendatahub.io/generated-namespace"
+	// nemoGuardrailsWorkloadLabel lets guardrails workloads run in this namespace.
+	nemoGuardrailsWorkloadLabel = "trustyai.opendatahub.io/nemo-guardrails-workload"
+)
+
+func managedNamespaceLabelsFor(purpose string) map[string]string {
+	n := len(managedNamespaceLabels)
+	if purpose == "infra" {
+		n++
+	}
+	labels := make(map[string]string, n)
+	for k, v := range managedNamespaceLabels {
+		labels[k] = v
+	}
+	if purpose == "infra" {
+		labels[nemoGuardrailsWorkloadLabel] = "true"
+	}
+	return labels
+}
+
+// requiredLabelsFor returns the labels that must be present on a managed namespace.
+// Infra namespaces get the guardrails label in addition to the network-policy label.
+func requiredLabelsFor(purpose string) map[string]string {
+	r := map[string]string{networkPolicyRequiredLabel: "true"}
+	if purpose == "infra" {
+		r[nemoGuardrailsWorkloadLabel] = "true"
+	}
+	return r
+}
+
+// ensureManagedNamespaceLabels patches any missing required labels.
+// Ownership labels are left unchanged.
+func ensureManagedNamespaceLabels(ctx context.Context, ns *corev1.Namespace, namespace, purpose string, clientset kubernetes.Interface) error {
+	required := requiredLabelsFor(purpose)
+	var patch strings.Builder
+	for k, v := range required {
+		if ns.Labels != nil && ns.Labels[k] == v {
+			continue
+		}
+		if patch.Len() > 0 {
+			patch.WriteByte(',')
+		}
+		patch.WriteString(`"` + k + `":"` + v + `"`)
+	}
+	if patch.Len() == 0 {
+		return nil
+	}
+	patchData := []byte(`{"metadata":{"labels":{` + patch.String() + `}}}`)
+	if _, err := clientset.CoreV1().Namespaces().Patch(ctx, namespace, types.MergePatchType, patchData, metav1.PatchOptions{}); err != nil {
+		return fmt.Errorf("failed to patch labels on existing namespace %q: %w", namespace, err)
+	}
+	setupLog.Info("patched required labels on managed namespace",
+		"namespace", namespace, "purpose", purpose)
+	return nil
+}
+
+func subscriptionNamespaceExists(ctx context.Context, namespace string, clientset kubernetes.Interface) (bool, error) {
+	ns, err := clientset.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
+	if err == nil {
+		return ns.Status.Phase != corev1.NamespaceTerminating, nil
+	}
+	if errors.IsNotFound(err) {
+		return false, nil
+	}
+	if errors.IsForbidden(err) {
+		setupLog.Info("insufficient permissions to check subscription namespace existence, assuming it exists",
+			"namespace", namespace, "error", err)
+		return true, nil
+	}
+	return false, fmt.Errorf("unable to check if subscription namespace %q exists: %w", namespace, err)
+}
+
+func ensureAITenantNamespaceWithClient(ctx context.Context, namespace string, clientset kubernetes.Interface) error {
+	return ensureManagedNamespaceWithClient(ctx, namespace, "aitenant", clientset)
+}
+
+func ensureInfraNamespaceWithClient(ctx context.Context, namespace string, clientset kubernetes.Interface) error {
+	return ensureManagedNamespaceWithClient(ctx, namespace, "infra", clientset)
+}
+
+// bootstrapManagedNamespaces either ensures/migrates the infrastructure
+// namespace (when it is separate from the controller namespace) or labels the
+// controller namespace for guardrails (when infrastructure is shared with the
+// controller namespace)
+func bootstrapManagedNamespaces(ctx context.Context, clientset kubernetes.Interface,
+	infraNamespace, controllerNamespace, maasSubscriptionNamespace string,
+) bool {
+	// Ensure infrastructure namespace exists when it differs from controller namespace
+	if infraNamespace != "" && infraNamespace != controllerNamespace {
+		if err := ensureInfraNamespaceWithClient(ctx, infraNamespace, clientset); err != nil {
+			setupLog.Error(err, "unable to ensure infrastructure namespace exists", "namespace", infraNamespace)
+			os.Exit(1)
+		}
+
+		// Migrate maas-db-config secret from controller namespace to infrastructure namespace
+		if err := migrateMaaSDBSecretToInfraNamespace(ctx, controllerNamespace, infraNamespace, clientset); err != nil {
+			if errors.IsForbidden(err) {
+				setupLog.Info("insufficient RBAC to migrate maas-db-config secret — "+
+					"ensure secret-migrate Roles and RoleBindings are applied; skipping migration for now",
+					"controllerNamespace", controllerNamespace,
+					"infraNamespace", infraNamespace,
+					"error", err)
+			} else {
+				setupLog.Error(err, "failed to migrate maas-db-config secret to infrastructure namespace",
+					"controllerNamespace", controllerNamespace,
+					"infraNamespace", infraNamespace)
+				os.Exit(1)
+			}
+		}
+	} else if infraNamespace != "" {
+		// Shared namespace: add the guardrails label only.
+		if err := labelInfraNamespace(ctx, infraNamespace, clientset); err != nil {
+			setupLog.Error(err, "unable to label infrastructure namespace for NeMo guardrails", "namespace", infraNamespace)
+			os.Exit(1)
+		}
+	}
+
+	defaultSubscriptionNamespaceExists, err := subscriptionNamespaceExists(ctx, maasSubscriptionNamespace, clientset)
+	if err != nil {
+		setupLog.Error(err, "unable to inspect subscription namespace", "namespace", maasSubscriptionNamespace)
+		os.Exit(1)
+	}
+	return defaultSubscriptionNamespaceExists
 }
 
 // resolveNamespaceAfterTerminationWait interprets the namespace GET after a successful termination poll.
 // If fallThroughToCreate is true, the caller must assign the original finalErr to the outer GET error and
 // continue into namespace creation. If fallThroughToCreate is false and the returned error is nil, the
-// subscription namespace is already satisfied (Active or assumed external management).
+// managed namespace is already satisfied (Active or assumed external management).
 func resolveNamespaceAfterTerminationWait(namespace string, finalNs *corev1.Namespace, finalErr error) (doneErr error, fallThroughToCreate bool) {
 	if finalErr == nil && (finalNs.Status.Phase == corev1.NamespaceActive || finalNs.Status.Phase == "") {
 		setupLog.Info("subscription namespace exists and is active "+
@@ -224,65 +388,173 @@ func resolveNamespaceAfterTerminationWait(namespace string, finalNs *corev1.Name
 		namespace, finalNs.Status.Phase), false
 }
 
-// checkSubscriptionNamespaceReady returns nil if the subscription namespace exists and controllers can rely on it.
-// Terminating and missing namespaces are not ready. Forbidden on GET matches startup behavior (assume operator-managed).
-//
-// Namespace.Status.Phase is documented as Active or Terminating; an empty string is treated as ready because it is
-// commonly seen before status is fully populated and matches Kubernetes' defaulting to an active namespace.
-func checkSubscriptionNamespaceReady(ctx context.Context, clientset kubernetes.Interface, namespace string) error {
-	ns, err := clientset.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
-	if errors.IsNotFound(err) {
-		return fmt.Errorf("subscription namespace %q does not exist", namespace)
+// migrateMaaSDBSecretToInfraNamespace copies the maas-db-config secret from the controller
+// namespace to the infrastructure namespace during upgrades when namespace separation is enabled.
+// This maintains backward compatibility for deployments that don't run setup-database.sh.
+func migrateMaaSDBSecretToInfraNamespace(ctx context.Context, controllerNs, infraNs string, clientset kubernetes.Interface) error {
+	secretName := tenantreconcile.MaaSDBSecretName
+	secretKey := tenantreconcile.MaaSDBSecretKey
+
+	if infraNs == controllerNs || infraNs == "" {
+		return nil
 	}
-	if errors.IsForbidden(err) {
-		setupLog.V(1).Info("readiness: insufficient permissions to check namespace, assuming ready", "namespace", namespace, "error", err)
+
+	log := setupLog.WithValues("controllerNamespace", controllerNs, "infraNamespace", infraNs)
+
+	if _, err := clientset.CoreV1().Secrets(infraNs).Get(ctx, secretName, metav1.GetOptions{}); err == nil {
+		log.V(1).Info("maas-db-config secret already exists in infrastructure namespace, no migration needed")
+		return nil
+	} else if !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to check for existing secret in infrastructure namespace: %w", err)
+	}
+
+	sourceSecret, err := clientset.CoreV1().Secrets(controllerNs).Get(ctx, secretName, metav1.GetOptions{})
+	if errors.IsNotFound(err) {
+		log.Info("maas-db-config secret not found in controller namespace, assuming fresh install")
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("subscription namespace %q ready check: %w", namespace, err)
+		return fmt.Errorf("failed to read secret from controller namespace: %w", err)
 	}
-	if ns.Status.Phase == corev1.NamespaceTerminating {
-		return fmt.Errorf("subscription namespace %q is terminating", namespace)
+
+	log.Info("detected upgrade scenario: copying maas-db-config secret to infrastructure namespace with FQDN connection string")
+
+	existingURL, ok := sourceSecret.Data[secretKey]
+	if !ok || len(existingURL) == 0 {
+		return fmt.Errorf("key %q not found or empty in secret %s/%s", secretKey, controllerNs, secretName)
 	}
-	if ns.Status.Phase == corev1.NamespaceActive || ns.Status.Phase == "" {
-		return nil
+
+	fqdnURL := convertToFQDNConnectionURL(string(existingURL), controllerNs)
+
+	targetSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretName,
+			Namespace: infraNs,
+			Labels: map[string]string{
+				"app.kubernetes.io/part-of":    "maas-controller",
+				"app.kubernetes.io/managed-by": "maas-controller",
+			},
+			Annotations: map[string]string{
+				"maas.opendatahub.io/migrated-from": controllerNs,
+			},
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{
+			secretKey: []byte(fqdnURL),
+		},
 	}
-	return fmt.Errorf("subscription namespace %q is not ready (phase=%q)", namespace, ns.Status.Phase)
+
+	if _, err := clientset.CoreV1().Secrets(infraNs).Create(ctx, targetSecret, metav1.CreateOptions{}); err != nil {
+		if errors.IsAlreadyExists(err) {
+			log.Info("maas-db-config secret was created concurrently in infrastructure namespace")
+			return nil
+		}
+		return fmt.Errorf("failed to create secret in infrastructure namespace: %w", err)
+	}
+
+	log.Info("successfully copied maas-db-config secret to infrastructure namespace",
+		"sourceNamespace", controllerNs,
+		"targetNamespace", infraNs,
+		"connectionURL", maskConnectionURL(fqdnURL))
+
+	return nil
 }
 
-// subscriptionNamespaceReadiness performs an uncached Namespace GET on each probe for an accurate signal.
-// Load is bounded by the kubelet readiness probe interval (often ~10s); avoid short-lived caching here so
-// Terminating / deleted namespaces are reflected promptly.
-func subscriptionNamespaceReadiness(clientset kubernetes.Interface, namespace string) healthz.Checker {
-	return func(req *http.Request) error {
-		return checkSubscriptionNamespaceReady(req.Context(), clientset, namespace)
+// labelInfraNamespace adds the guardrails label to the controller namespace
+// when it doubles as the infrastructure namespace. Only required labels are
+// patched; ownership labels are not added.
+func labelInfraNamespace(ctx context.Context, namespace string, clientset kubernetes.Interface) error {
+	ns, err := clientset.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
+	if err != nil {
+		if errors.IsForbidden(err) {
+			setupLog.Info("insufficient permissions to read infrastructure namespace, skipping guardrails label",
+				"namespace", namespace, "error", err)
+			return nil
+		}
+		return fmt.Errorf("failed to get infrastructure namespace %q: %w", namespace, err)
 	}
+	return ensureManagedNamespaceLabels(ctx, ns, namespace, "infra", clientset)
 }
 
-// subscriptionNamespaceMonitor periodically re-runs ensureSubscriptionNamespaceWithClient so a namespace
+// convertToFQDNConnectionURL updates a PostgreSQL connection URL to use FQDN for cross-namespace access.
+func convertToFQDNConnectionURL(rawURL, namespace string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		setupLog.V(1).Info("failed to parse connection URL for FQDN conversion, using as-is", "error", err)
+		return rawURL
+	}
+
+	hostname := u.Hostname()
+	if hostname == "" {
+		return rawURL
+	}
+
+	if strings.Contains(hostname, ".") {
+		return rawURL
+	}
+
+	fqdn := hostname + "." + namespace + ".svc.cluster.local"
+
+	if u.Port() != "" {
+		u.Host = fqdn + ":" + u.Port()
+	} else {
+		u.Host = fqdn
+	}
+
+	return u.String()
+}
+
+// maskConnectionURL masks the password in a connection URL for logging.
+func maskConnectionURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "<invalid-url>"
+	}
+	return u.Redacted()
+}
+
+// managedNamespaceMonitor periodically re-runs ensureManagedNamespaceWithClient so a namespace
 // removed while the process is running can be recreated. When leader election is enabled, only the leader runs this.
-type subscriptionNamespaceMonitor struct {
+type managedNamespaceMonitor struct {
 	clientset          kubernetes.Interface
 	namespace          string
+	purpose            string
 	interval           time.Duration
 	needLeaderElection bool
+	// pauseCondition, if set, is evaluated before each tick; returning true skips
+	// ensureManagedNamespaceWithClient for that tick (e.g. to avoid recreating a
+	// namespace that is being intentionally torn down). A returned error also skips
+	// the tick (fail-closed) and is logged; the next tick will retry.
+	pauseCondition func(ctx context.Context) (bool, error)
 }
 
-func (m *subscriptionNamespaceMonitor) NeedLeaderElection() bool {
+func (m *managedNamespaceMonitor) NeedLeaderElection() bool {
 	return m.needLeaderElection
 }
 
-func (m *subscriptionNamespaceMonitor) Start(ctx context.Context) error {
+func (m *managedNamespaceMonitor) Start(ctx context.Context) error {
 	if m.interval <= 0 {
-		return fmt.Errorf("subscription namespace maintain interval must be positive, got %v", m.interval)
+		return fmt.Errorf("managed namespace maintain interval must be positive, got %v", m.interval)
 	}
 	run := func() {
 		innerCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
-		if err := ensureSubscriptionNamespaceWithClient(innerCtx, m.namespace, m.clientset); err != nil {
+		if m.pauseCondition != nil {
+			pause, err := m.pauseCondition(innerCtx)
+			if err != nil {
+				setupLog.Error(err, "unable to evaluate pause condition before namespace maintenance", "namespace", m.namespace, "purpose", m.purpose)
+				return
+			}
+			if pause {
+				setupLog.V(1).Info("skipping namespace maintenance; pause condition active",
+					"namespace", m.namespace, "purpose", m.purpose)
+				return
+			}
+		}
+		if err := ensureManagedNamespaceWithClient(innerCtx, m.namespace, m.purpose, m.clientset); err != nil {
 			// Keep running; the next tick will retry. Alerting on sustained failure is better done via
 			// metrics (e.g. Prometheus counter) in a follow-up if product needs it.
-			setupLog.Error(err, "subscription namespace maintenance failed", "namespace", m.namespace)
+			setupLog.Error(err, "managed namespace maintenance failed", "namespace", m.namespace, "purpose", m.purpose)
 		}
 	}
 	run()
@@ -295,6 +567,23 @@ func (m *subscriptionNamespaceMonitor) Start(ctx context.Context) error {
 		case <-ticker.C:
 			run()
 		}
+	}
+}
+
+// aitenantTeardownPauseCondition builds a managedNamespaceMonitor pauseCondition that skips
+// AITenant namespace self-heal while the maas-controller Deployment advertises teardown
+// (or is already gone), so the monitor cannot recreate ai-tenants while cleanup is in
+// progress or the controller pod is winding down.
+func aitenantTeardownPauseCondition(reader client.Reader, deploymentKey client.ObjectKey) func(context.Context) (bool, error) {
+	return func(ctx context.Context) (bool, error) {
+		var dep appsv1.Deployment
+		if err := reader.Get(ctx, deploymentKey, &dep); err != nil {
+			if errors.IsNotFound(err) {
+				return true, nil
+			}
+			return false, err
+		}
+		return maas.TeardownRequestedOnDeployment(&dep), nil
 	}
 }
 
@@ -327,12 +616,140 @@ func getClusterServiceAccountIssuer(c client.Reader) (string, error) {
 	return issuer, nil
 }
 
-// ensureClusterBootstrapRunnable ensures default-tenant in the subscription namespace exists once
-// Config/default is present (created by LifecycleReconciler). It does not set owner references:
-// LifecycleReconciler patches Config→Tenant the same way it patches Config→Deployment. ODH may
-// create the Tenant first; this runnable converges the Tenant shell for standalone installs. It
-// does not create or patch the Tenant while the maas-controller Deployment is terminating.
-func ensureClusterBootstrapRunnable(mgr ctrl.Manager, tenantNamespace, controllerDeploymentNS, controllerDeploymentName, gatewayName, gatewayNamespace string) manager.RunnableFunc {
+// ensureDefaultAITenantBootstrap creates the default AITenant once per
+// Config/default anchor after the controller Deployment is live. It intentionally
+// creates only the AITenant shell; the AITenant reconciler owns creation/adoption
+// of the namespace-local MaasTenantConfig/default-tenant object. Once bootstrapped,
+// the Config annotation prevents recreating a default AITenant that an admin
+// deletes intentionally.
+func ensureDefaultAITenantBootstrap(ctx context.Context, c client.Client, tenantNamespace, aitenantNamespace, controllerDeploymentNS, controllerDeploymentName, gatewayName, gatewayNamespace string) (bool, error) {
+	depKey := types.NamespacedName{Namespace: controllerDeploymentNS, Name: controllerDeploymentName}
+	var dep appsv1.Deployment
+	if err := c.Get(ctx, depKey, &dep); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("get maas-controller Deployment for bootstrap gate: %w", err)
+	}
+	if !dep.DeletionTimestamp.IsZero() {
+		return false, nil
+	}
+	if maas.TeardownRequestedOnDeployment(&dep) {
+		return false, nil
+	}
+
+	ctKey := client.ObjectKey{Name: maasv1alpha1.ConfigInstanceName}
+	var ct maasv1alpha1.Config
+	if err := c.Get(ctx, ctKey, &ct); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("get Config for bootstrap gate: %w", err)
+	}
+	if !ct.DeletionTimestamp.IsZero() || ct.UID == "" {
+		return false, nil
+	}
+
+	aitenantKey := client.ObjectKey{Name: tenantreconcile.DefaultAITenantName, Namespace: aitenantNamespace}
+	var existing maasv1alpha1.AITenant
+	if err := c.Get(ctx, aitenantKey, &existing); err != nil {
+		if !errors.IsNotFound(err) {
+			return false, fmt.Errorf("get default AITenant: %w", err)
+		}
+	} else {
+		// Only mark bootstrap complete when the default AITenant is not being
+		// deleted and has a Ready condition set to True.  If the AITenant is
+		// Terminating (e.g. stuck on a finalizer) or not yet ready, we must not
+		// set the annotation so that bootstrap can create a healthy replacement
+		// once the stuck resource is cleaned up.
+		isTerminating := !existing.DeletionTimestamp.IsZero() ||
+			existing.Status.Phase == "Terminating"
+		if isTerminating || !apimeta.IsStatusConditionTrue(existing.Status.Conditions, maasv1alpha1.AITenantConditionReady) {
+			return false, nil
+		}
+		if err := markDefaultAITenantBootstrapped(ctx, c, &ct); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+
+	if ct.Annotations[maas.DefaultAITenantBootstrappedAnnotation] == "true" {
+		return false, nil
+	}
+
+	aitenant := &maasv1alpha1.AITenant{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: maasv1alpha1.GroupVersion.String(),
+			Kind:       maasv1alpha1.AITenantKind,
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      tenantreconcile.DefaultAITenantName,
+			Namespace: aitenantNamespace,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: maasv1alpha1.GroupVersion.String(),
+					Kind:       maasv1alpha1.ConfigKind,
+					Name:       ct.Name,
+					UID:        ct.UID,
+				},
+			},
+		},
+		Spec: maasv1alpha1.AITenantSpec{
+			Gateway: &maasv1alpha1.AITenantGatewayRef{Name: gatewayName},
+		},
+	}
+
+	var tenant maasv1alpha1.Tenant
+	tenantKey := client.ObjectKey{Name: maasv1alpha1.TenantInstanceName, Namespace: tenantNamespace}
+	if err := c.Get(ctx, tenantKey, &tenant); err != nil {
+		if !errors.IsNotFound(err) {
+			return false, fmt.Errorf("get existing default Tenant for migration: %w", err)
+		}
+	} else {
+		if tenant.Spec.ExternalOIDC != nil {
+			oidc := *tenant.Spec.ExternalOIDC
+			aitenant.Spec.OIDC = &oidc
+		}
+		if tenant.Spec.GatewayRef.Name != "" {
+			// AITenant carries only the Gateway name; the namespace is controller configuration.
+			// Preserve an existing custom name so a mismatched namespace fails visibly instead
+			// of silently switching the default tenant back to the flag-default Gateway name.
+			aitenant.Spec.Gateway.Name = tenant.Spec.GatewayRef.Name
+		}
+	}
+
+	if err := c.Create(ctx, aitenant); err != nil {
+		if errors.IsAlreadyExists(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("create default AITenant: %w", err)
+	}
+	return true, nil
+}
+
+func markDefaultAITenantBootstrapped(ctx context.Context, c client.Client, ct *maasv1alpha1.Config) error {
+	if ct == nil || ct.Annotations[maas.DefaultAITenantBootstrappedAnnotation] == "true" {
+		return nil
+	}
+	base := ct.DeepCopy()
+	annotations := ct.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[maas.DefaultAITenantBootstrappedAnnotation] = "true"
+	ct.SetAnnotations(annotations)
+	if err := c.Patch(ctx, ct, client.MergeFrom(base)); err != nil {
+		return fmt.Errorf("mark default AITenant bootstrap on Config/default: %w", err)
+	}
+	return nil
+}
+
+// ensureClusterBootstrapRunnable bootstraps the default AITenant once
+// Config/default is present (created by LifecycleReconciler). It does not set
+// owner references; LifecycleReconciler links Config to the default AITenant,
+// Deployment, and default Tenant. It does not create while the maas-controller
+// Deployment is terminating, so bootstrap does not fight teardown.
+func ensureClusterBootstrapRunnable(mgr ctrl.Manager, tenantNamespace, aitenantNamespace, controllerDeploymentNS, controllerDeploymentName, gatewayName, gatewayNamespace string) manager.RunnableFunc {
 	return func(ctx context.Context) error {
 		log := ctrl.Log.WithName("setup").WithName("ensureClusterBootstrap")
 		c := mgr.GetClient()
@@ -341,67 +758,18 @@ func ensureClusterBootstrapRunnable(mgr ctrl.Manager, tenantNamespace, controlle
 		defer ticker.Stop()
 
 		ensure := func() {
-			depKey := types.NamespacedName{Namespace: controllerDeploymentNS, Name: controllerDeploymentName}
-			var dep appsv1.Deployment
-			if err := c.Get(ctx, depKey, &dep); err != nil {
-				if errors.IsNotFound(err) {
-					return
-				}
-				log.Error(err, "failed to get maas-controller Deployment for bootstrap gate")
+			created, err := ensureDefaultAITenantBootstrap(ctx, c, tenantNamespace, aitenantNamespace, controllerDeploymentNS, controllerDeploymentName, gatewayName, gatewayNamespace)
+			if err != nil {
+				log.Error(err, "failed to ensure default AITenant")
 				return
 			}
-			if !dep.DeletionTimestamp.IsZero() {
-				return
-			}
-
-			tKey := client.ObjectKey{Name: maasv1alpha1.TenantInstanceName, Namespace: tenantNamespace}
-			var tenant maasv1alpha1.Tenant
-			if err := c.Get(ctx, tKey, &tenant); err != nil && !errors.IsNotFound(err) {
-				log.Error(err, "failed to get default Tenant for bootstrap gate")
-				return
-			}
-
-			ctKey := client.ObjectKey{Name: maasv1alpha1.ConfigInstanceName}
-			var ct maasv1alpha1.Config
-			if err := c.Get(ctx, ctKey, &ct); err != nil {
-				if errors.IsNotFound(err) {
-					return
-				}
-				log.Error(err, "failed to get Config")
-				return
-			}
-			if !ct.DeletionTimestamp.IsZero() || ct.UID == "" {
-				return
-			}
-
-			if err := c.Get(ctx, tKey, &tenant); err != nil {
-				if !errors.IsNotFound(err) {
-					log.Error(err, "failed to get default Tenant")
-					return
-				}
-				t := &maasv1alpha1.Tenant{
-					TypeMeta: metav1.TypeMeta{
-						APIVersion: maasv1alpha1.GroupVersion.String(),
-						Kind:       maasv1alpha1.TenantKind,
-					},
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      maasv1alpha1.TenantInstanceName,
-						Namespace: tenantNamespace,
-					},
-				}
-				if t.Spec.GatewayRef.Namespace == "" && t.Spec.GatewayRef.Name == "" {
-					t.Spec.GatewayRef.Namespace = gatewayNamespace
-					t.Spec.GatewayRef.Name = gatewayName
-				}
-				if err := c.Create(ctx, t); err != nil && !errors.IsAlreadyExists(err) {
-					log.Error(err, "failed to create default-tenant", "namespace", tenantNamespace)
-					return
-				}
-				if err := c.Get(ctx, tKey, &tenant); err != nil {
-					log.Error(err, "re-fetch default Tenant after create")
-					return
-				}
-				log.Info("ensured default-tenant exists", "namespace", tenantNamespace)
+			if created {
+				log.Info("ensured default AITenant exists",
+					"name", tenantreconcile.DefaultAITenantName,
+					"namespace", aitenantNamespace,
+					"tenantNamespace", tenantNamespace,
+					"gatewayNamespace", gatewayNamespace,
+					"gatewayName", gatewayName)
 			}
 		}
 
@@ -417,35 +785,393 @@ func ensureClusterBootstrapRunnable(mgr ctrl.Manager, tenantNamespace, controlle
 	}
 }
 
+// fetchTLSProfileWithRetry attempts to fetch the OpenShift TLS security profile.
+// If the config.openshift.io API doesn't exist (non-OpenShift), it returns the
+// default Intermediate profile immediately with available=false. For transient
+// errors on OpenShift, it retries a few times before logging and returning the
+// default Intermediate profile with available=true, allowing the watcher to
+// self-heal when the API recovers.
+func fetchTLSProfileWithRetry(ctx context.Context, c client.Client) (confv1.TLSProfileSpec, confv1.TLSAdherencePolicy, bool, error) {
+	for attempt := range tlsProfileFetchMaxRetries {
+		fetchCtx, fetchCancel := context.WithTimeout(ctx, tlsProfileFetchTimeout)
+		profile, err := utiltls.FetchAPIServerTLSProfile(fetchCtx, c)
+		adherencePolicy := confv1.TLSAdherencePolicyNoOpinion
+		if err == nil {
+			adherencePolicy, err = utiltls.FetchAPIServerTLSAdherencePolicy(fetchCtx, c)
+		}
+		fetchCancel()
+
+		if err == nil {
+			return profile, adherencePolicy, true, nil
+		}
+
+		if apimeta.IsNoMatchError(err) || errors.IsNotFound(err) {
+			setupLog.Info("config.openshift.io API not available, using default Intermediate TLS profile " +
+				"(expected on non-OpenShift clusters)")
+			return *confv1.TLSProfiles[confv1.TLSProfileIntermediateType],
+				confv1.TLSAdherencePolicyNoOpinion, false, nil
+		}
+
+		if errors.IsForbidden(err) || errors.IsUnauthorized(err) {
+			return *confv1.TLSProfiles[confv1.TLSProfileIntermediateType],
+				confv1.TLSAdherencePolicyNoOpinion, false,
+				fmt.Errorf("cluster TLS profile is not readable (check the maas-controller RBAC): %w", err)
+		}
+
+		if attempt < tlsProfileFetchMaxRetries-1 {
+			setupLog.Info("transient error fetching cluster TLS profile, retrying",
+				"error", err, "attempt", attempt+1, "maxRetries", tlsProfileFetchMaxRetries)
+			select {
+			case <-ctx.Done():
+				return *confv1.TLSProfiles[confv1.TLSProfileIntermediateType],
+					confv1.TLSAdherencePolicyNoOpinion, false, ctx.Err()
+			case <-time.After(tlsProfileRetryDelay):
+			}
+		} else {
+			setupLog.Info("failed to fetch cluster TLS profile after retries, using default Intermediate TLS profile",
+				"error", err)
+		}
+	}
+
+	return *confv1.TLSProfiles[confv1.TLSProfileIntermediateType],
+		confv1.TLSAdherencePolicyNoOpinion, true, nil
+}
+
+func tlsProfileForAdherence(profile confv1.TLSProfileSpec, adherence confv1.TLSAdherencePolicy) confv1.TLSProfileSpec {
+	if shouldHonorClusterTLSProfile(adherence) {
+		return profile
+	}
+	return *confv1.TLSProfiles[confv1.TLSProfileIntermediateType]
+}
+
+// shouldHonorClusterTLSProfile mirrors library-go's adherence semantics. This
+// controller's pinned library-go predates that helper, so keep the equivalent
+// switch local rather than upgrading the OpenShift dependency set just for it.
+func shouldHonorClusterTLSProfile(adherence confv1.TLSAdherencePolicy) bool {
+	switch adherence {
+	case confv1.TLSAdherencePolicyNoOpinion,
+		confv1.TLSAdherencePolicyLegacyAdheringComponentsOnly:
+		return false
+	default:
+		// StrictAllComponents and unknown future values honor the profile.
+		return true
+	}
+}
+
+type managerTLSConfig struct {
+	profile      confv1.TLSProfileSpec
+	adherence    confv1.TLSAdherencePolicy
+	available    bool
+	serverTLSOpt func(*tls.Config)
+}
+
+func loadManagerTLSConfig(ctx context.Context, cfg *rest.Config) (managerTLSConfig, error) {
+	k8sClient, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		return managerTLSConfig{}, fmt.Errorf("creating pre-manager Kubernetes client: %w", err)
+	}
+
+	profile, adherence, available, err := fetchTLSProfileWithRetry(ctx, k8sClient)
+	if err != nil {
+		return managerTLSConfig{}, err
+	}
+	if available {
+		setupLog.Info("fetched cluster TLS security profile",
+			"minTLSVersion", profile.MinTLSVersion, "tlsAdherence", adherence)
+	}
+
+	appliedProfile := tlsProfileForAdherence(profile, adherence)
+	setupLog.Info("resolved TLS security profile",
+		"configuredMinTLSVersion", profile.MinTLSVersion,
+		"appliedMinTLSVersion", appliedProfile.MinTLSVersion,
+		"tlsAdherence", adherence,
+		"honorClusterTLSProfile", shouldHonorClusterTLSProfile(adherence))
+	serverTLSOpt, unsupportedCiphers := utiltls.NewTLSConfigFromProfile(appliedProfile)
+	if len(unsupportedCiphers) > 0 {
+		setupLog.Info("TLS profile contains ciphers not supported by this Go version; ignoring them",
+			"unsupportedCiphers", unsupportedCiphers)
+	}
+
+	return managerTLSConfig{
+		profile:      profile,
+		adherence:    adherence,
+		available:    available,
+		serverTLSOpt: serverTLSOpt,
+	}, nil
+}
+
+func mustLoadManagerTLSConfig(ctx context.Context, cfg *rest.Config) managerTLSConfig {
+	tlsConfig, err := loadManagerTLSConfig(ctx, cfg)
+	if err != nil {
+		setupLog.Error(err, "unable to fetch cluster TLS security profile")
+		os.Exit(1)
+	}
+	return tlsConfig
+}
+
+func (c managerTLSConfig) setupWatcher(mgr ctrl.Manager, cancel context.CancelFunc) error {
+	if !c.available {
+		return nil
+	}
+
+	return (&utiltls.SecurityProfileWatcher{
+		Client:                    mgr.GetClient(),
+		InitialTLSProfileSpec:     c.profile,
+		InitialTLSAdherencePolicy: c.adherence,
+		OnProfileChange: func(_ context.Context, oldProfile, newProfile confv1.TLSProfileSpec) {
+			setupLog.Info("TLS security profile changed, initiating graceful shutdown to reload",
+				"oldMinTLS", oldProfile.MinTLSVersion, "newMinTLS", newProfile.MinTLSVersion,
+			)
+			cancel()
+		},
+		OnAdherencePolicyChange: func(_ context.Context, oldPolicy, newPolicy confv1.TLSAdherencePolicy) {
+			setupLog.Info("TLS adherence policy changed, initiating graceful shutdown to reload",
+				"oldPolicy", oldPolicy, "newPolicy", newPolicy)
+			cancel()
+		},
+	}).SetupWithManager(mgr)
+}
+
+func (c managerTLSConfig) registerWatcher(mgr ctrl.Manager, cancel context.CancelFunc) {
+	if err := c.setupWatcher(mgr, cancel); err != nil {
+		cancel()
+		setupLog.Error(err, "unable to set up TLS security profile watcher")
+		fatalExit(1)
+	}
+}
+
+// buildMetricsServerOptions configures the controller-runtime metrics endpoint.
+// When secureMetrics is true, metrics are served over HTTPS with authn/authz
+// filters and the cluster TLS profile applied (plus NextProtos).
+func buildMetricsServerOptions(
+	bindAddress string,
+	secureMetrics bool,
+	serverTLSOpt func(*tls.Config),
+	nextProtosOpt func(*tls.Config),
+) metricsserver.Options {
+	tlsOpts := []func(*tls.Config){nextProtosOpt}
+	if secureMetrics {
+		tlsOpts = []func(*tls.Config){serverTLSOpt, nextProtosOpt}
+	}
+
+	opts := metricsserver.Options{
+		BindAddress:   bindAddress,
+		SecureServing: secureMetrics,
+		TLSOpts:       tlsOpts,
+	}
+	if secureMetrics {
+		opts.FilterProvider = filters.WithAuthenticationAndAuthorization
+		opts.CertDir = metricsCertDir
+	}
+	return opts
+}
+
+func parseReplicasEnv(envVar string) *int32 {
+	s := os.Getenv(envVar)
+	if s == "" {
+		return nil
+	}
+	v, err := strconv.ParseInt(s, 10, 32)
+	if err != nil || v < 0 {
+		setupLog.Info("ignoring invalid replica count", "env", envVar, "value", s)
+		return nil
+	}
+	r := int32(v)
+	return &r
+}
+
+func envOrDefault(envVar, defaultVal string) string {
+	if v := os.Getenv(envVar); v != "" {
+		return v
+	}
+	return defaultVal
+}
+
+func discoveryLogLevelOrDefault(envVar, defaultVal string) string {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(envVar)))
+	if v == "" {
+		return defaultVal
+	}
+
+	switch v {
+	case "debug", "info", "warn", "error":
+		return v
+	default:
+		setupLog.Info("ignoring invalid discovery log level", "env", envVar, "value", v, "using", defaultVal)
+		return defaultVal
+	}
+}
+
+// resolveInfraNamespace determines the infrastructure namespace for maas-api and maas-db-config.
+// Note: PostgreSQL itself can be external (e.g., AWS RDS) - only maas-api and the connection secret deploy here.
+// If infraNs is "AUTO", derives the namespace from the controller namespace.
+// If infraNs is empty or unset, uses the controller namespace (no separation, current behavior).
+// Otherwise, uses the explicitly provided infraNs value.
+func resolveInfraNamespace(infraNs, controllerNs string) string {
+	if infraNs == "AUTO" {
+		return deriveInfraNamespace(controllerNs)
+	}
+	if infraNs == "" {
+		// Default: use controller namespace (no separation)
+		return controllerNs
+	}
+	// Explicit namespace provided
+	return infraNs
+}
+
+// deriveInfraNamespace maps controller namespace to infrastructure namespace.
+// This implements namespace separation: controller runs in one namespace, infrastructure services in another.
+func clampConcurrentReconciles(v int) int {
+	const minConcurrent, maxConcurrent = 1, 10
+	if v < minConcurrent {
+		setupLog.Info("clamping --max-concurrent-reconciles to minimum", "requested", v, "using", minConcurrent)
+		return minConcurrent
+	}
+	if v > maxConcurrent {
+		setupLog.Info("clamping --max-concurrent-reconciles to maximum", "requested", v, "using", maxConcurrent)
+		return maxConcurrent
+	}
+	return v
+}
+
+func deriveInfraNamespace(controllerNs string) string {
+	switch controllerNs {
+	case "redhat-ods-applications":
+		return "redhat-ai-gateway-infra"
+	case "opendatahub":
+		return "odh-ai-gateway-infra"
+	default:
+		// Unknown namespace, use same as controller
+		return controllerNs
+	}
+}
+
+func parseAITenantDeletionTimeout() time.Duration {
+	const defaultTimeout = 10 * time.Minute
+	v, ok := os.LookupEnv("AITENANT_DELETION_TIMEOUT")
+	if !ok {
+		return defaultTimeout
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		setupLog.Error(err, "invalid AITENANT_DELETION_TIMEOUT, using default", "value", v, "default", defaultTimeout)
+		return defaultTimeout
+	}
+	if d < 0 {
+		setupLog.Info("negative AITENANT_DELETION_TIMEOUT is not allowed, using default", "value", v, "default", defaultTimeout)
+		return defaultTimeout
+	}
+	return d
+}
+
+func setupWebhooks(mgr ctrl.Manager, aitenantNamespace, gatewayNamespace string) error {
+	if err := (&webhook.AITenantValidator{
+		Client:            mgr.GetAPIReader(),
+		AITenantNamespace: aitenantNamespace,
+		GatewayNamespace:  gatewayNamespace,
+	}).SetupWebhookWithManager(mgr); err != nil {
+		return fmt.Errorf("AITenant webhook: %w", err)
+	}
+
+	tenantValidator := &webhook.TenantNamespaceValidator{
+		Client: mgr.GetAPIReader(),
+	}
+
+	if err := (&webhook.MaaSSubscriptionValidator{
+		Client:    mgr.GetClient(),
+		Validator: tenantValidator,
+	}).SetupWebhookWithManager(mgr); err != nil {
+		return fmt.Errorf("MaaSSubscription webhook: %w", err)
+	}
+
+	if err := (&webhook.MaaSAuthPolicyValidator{
+		Client:    mgr.GetClient(),
+		Validator: tenantValidator,
+	}).SetupWebhookWithManager(mgr); err != nil {
+		return fmt.Errorf("MaaSAuthPolicy webhook: %w", err)
+	}
+
+	if err := (&webhook.MaaSModelRefValidator{
+		Client:            mgr.GetAPIReader(),
+		AITenantNamespace: aitenantNamespace,
+	}).SetupWebhookWithManager(mgr); err != nil {
+		return fmt.Errorf("MaaSModelRef webhook: %w", err)
+	}
+
+	if err := (&webhook.ExternalModelValidator{}).SetupWebhookWithManager(mgr); err != nil {
+		return fmt.Errorf("ExternalModel webhook: %w", err)
+	}
+
+	return nil
+}
+
 func main() {
 	var metricsAddr string
+	var secureMetrics bool
 	var enableLeaderElection bool
 	var probeAddr string
 	var gatewayName string
 	var gatewayNamespace string
-	var maasAPINamespace string
+	var controllerNamespace string
+	var infraNamespace string
 	var maasSubscriptionNamespace string
+	var aitenantNamespace string
 	var metadataCacheTTL int64
 	var authzCacheTTL int64
 	var subscriptionNamespaceMaintainInterval time.Duration
+	var enableTenantNamespaceDiscovery bool
+	var maxConcurrentReconciles int
+	var observabilityManifestsPath string
+	var monitoringNamespace string
+	var usageLogsManifestPath string
+	var discoveryManifestPath string
+	var logFormat oteljson.Format
 
-	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to.")
+	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8443", "The address the metrics endpoint binds to.")
+	flag.BoolVar(&secureMetrics, "metrics-secure", true,
+		"If true, serve metrics via HTTPS with authentication and authorization. Set false for non-OpenShift/xKS.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager.")
 	flag.StringVar(&gatewayName, "gateway-name", "maas-default-gateway", "The name of the Gateway resource to use for model HTTPRoutes.")
 	flag.StringVar(&gatewayNamespace, "gateway-namespace", "openshift-ingress", "The namespace of the Gateway resource.")
-	flag.StringVar(&maasAPINamespace, "maas-api-namespace", "opendatahub", "The namespace where maas-api service is deployed.")
+	flag.StringVar(&controllerNamespace, "controller-namespace", "opendatahub", "The namespace where the maas-controller Deployment runs.")
+	flag.StringVar(&infraNamespace, "infra-namespace", tenantreconcile.DefaultInfraNamespace,
+		"Infrastructure namespace for maas-api, postgres, and maas-db-config. "+
+			"Defaults to 'AUTO' (namespace separation enabled). Set to empty string to disable for ROSA.")
+	flag.StringVar(&observabilityManifestsPath, "observability-manifests-path", "/deployment/components/observability/observability/dashboards", "Path to observability dashboard kustomize manifests.")
+	flag.StringVar(&usageLogsManifestPath, "usage-logs-manifest-path", "/deployment/components/observability/usage-logs", "Path to usage logs kustomize manifests.")
+	flag.StringVar(&discoveryManifestPath, "discovery-manifest-path", "/deployment/base/maas-discovery", "Path to discovery service kustomize manifests.")
+	flag.StringVar(&monitoringNamespace, "monitoring-namespace", "opendatahub", "The namespace where the monitoring stack is deployed.")
 	flag.StringVar(&maasSubscriptionNamespace, "maas-subscription-namespace", "models-as-a-service", "The namespace to watch for MaaS CRs.")
+	flag.StringVar(&aitenantNamespace, "aitenant-namespace", tenantreconcile.DefaultAITenantNamespace, "The infrastructure namespace where AITenant CRs are accepted.")
 	flag.Int64Var(&metadataCacheTTL, "metadata-cache-ttl", 60, "TTL in seconds for Authorino metadata HTTP caching (apiKeyValidation, subscription-info).")
 	flag.Int64Var(&authzCacheTTL, "authz-cache-ttl", 60, "TTL in seconds for Authorino OPA authorization caching (auth-valid, subscription-valid, require-group-membership).")
 	flag.DurationVar(&subscriptionNamespaceMaintainInterval, "subscription-namespace-maintain-interval", 30*time.Second,
-		"How often to re-check the subscription namespace while the manager is running (recreate if deleted). "+
+		"How often to re-check controller-managed namespaces while the manager is running (recreate if deleted). "+
 			"Larger values reduce apiserver load; smaller values detect external deletions sooner.")
+	flag.IntVar(&maxConcurrentReconciles, "max-concurrent-reconciles", 5,
+		"Maximum number of concurrent reconciles for subscription and auth policy controllers (1-10). Values above 5 may require increased CPU/memory on the controller pod.")
+	flag.BoolVar(&enableTenantNamespaceDiscovery, "enable-tenant-namespace-discovery", false,
+		"Discover AITenant-managed tenant namespaces labeled ai-gateway.opendatahub.io/tenant or maas.opendatahub.io/managed-by-aitenant=true and reconcile MaaS tenant CRs from them.")
 
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
+	oteljson.BindFlags(flag.CommandLine, &logFormat)
 	flag.Parse()
+
+	maxConcurrentReconciles = clampConcurrentReconciles(maxConcurrentReconciles)
+
+	// Allow empty monitoring-namespace to disable observability features (e.g. on xKS
+	// where the monitoring namespace may not exist). Non-empty values must be valid.
+	if monitoringNamespace != "" {
+		if errs := validation.IsDNS1123Label(monitoringNamespace); len(errs) > 0 {
+			setupLog.Error(stderrors.New("invalid monitoring namespace"),
+				"--monitoring-namespace must be a valid Kubernetes namespace name or empty to disable monitoring",
+				"namespace", monitoringNamespace, "errors", errs)
+			os.Exit(1)
+		}
+	}
 
 	if gatewayName == "" || gatewayNamespace == "" {
 		setupLog.Error(stderrors.New("invalid gateway configuration"),
@@ -453,34 +1179,104 @@ func main() {
 			"gatewayName", gatewayName, "gatewayNamespace", gatewayNamespace)
 		os.Exit(1)
 	}
+	if strings.TrimSpace(controllerNamespace) == "" {
+		setupLog.Error(stderrors.New("invalid controller namespace configuration"),
+			"--controller-namespace must be non-empty")
+		os.Exit(1)
+	}
+	if strings.TrimSpace(maasSubscriptionNamespace) == "" {
+		setupLog.Error(stderrors.New("invalid MaaS subscription namespace configuration"),
+			"--maas-subscription-namespace must be non-empty")
+		os.Exit(1)
+	}
+	if strings.TrimSpace(aitenantNamespace) == "" {
+		setupLog.Error(stderrors.New("invalid AITenant namespace configuration"),
+			"--aitenant-namespace must be non-empty")
+		os.Exit(1)
+	}
+	// Validate infraNamespace: empty string and "AUTO" are valid, but whitespace-only is not
+	if infraNamespace != "" && strings.TrimSpace(infraNamespace) == "" {
+		setupLog.Error(stderrors.New("invalid infrastructure namespace configuration"),
+			"--infra-namespace must not be whitespace-only")
+		os.Exit(1)
+	}
 
+	// Derive infrastructure namespace if needed
+	infraNamespace = resolveInfraNamespace(infraNamespace, controllerNamespace)
+
+	if logFormat == oteljson.FormatOTelJSON {
+		oteljson.Apply(&opts, "maas-controller")
+	}
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
 	cfg := ctrl.GetConfigOrDie()
 	clientset, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
-		setupLog.Error(err, "unable to create Kubernetes client for subscription namespace setup")
+		setupLog.Error(err, "unable to create Kubernetes client for managed namespace setup")
 		os.Exit(1)
 	}
-	if err := ensureSubscriptionNamespaceWithClient(context.Background(), maasSubscriptionNamespace, clientset); err != nil {
-		setupLog.Error(err, "unable to ensure subscription namespace exists", "namespace", maasSubscriptionNamespace)
+	if err := ensureAITenantNamespaceWithClient(context.Background(), aitenantNamespace, clientset); err != nil {
+		setupLog.Error(err, "unable to ensure AITenant namespace exists", "namespace", aitenantNamespace)
 		os.Exit(1)
 	}
-
-	setupLog.Info("watching namespace for MaaS CRs", "namespace", maasSubscriptionNamespace)
+	defaultSubscriptionNamespaceExists := bootstrapManagedNamespaces(
+		context.Background(), clientset, infraNamespace, controllerNamespace, maasSubscriptionNamespace,
+	)
 	nsCfg := map[string]cache.Config{maasSubscriptionNamespace: {}}
+	// maas-db-config lives in the infrastructure namespace (where maas-api runs).
+	infraNsCfg := map[string]cache.Config{infraNamespace: {}}
 	cacheOpts := cache.Options{
 		ByObject: map[client.Object]cache.ByObject{
-			&maasv1alpha1.Tenant{}:           {Namespaces: nsCfg},
+			// MaasTenantConfig CRs are watched cluster-wide to support AITenant-created tenants in any namespace.
+			// TODO: Replace with proper namespace discovery from S1 when merged.
+			&maasv1alpha1.MaasTenantConfig{}: {},
+			&maasv1alpha1.Tenant{}:           {},
 			&maasv1alpha1.MaaSAuthPolicy{}:   {Namespaces: nsCfg},
 			&maasv1alpha1.MaaSSubscription{}: {Namespaces: nsCfg},
+			// Restrict the Secret informer to the infrastructure namespace (where maas-db-config lives)
+			// to avoid caching cluster-wide Secrets.
+			&corev1.Secret{}: {Namespaces: infraNsCfg},
 		},
 	}
+	setupLog.Info("watching namespace for MaaS CRs", "namespace", maasSubscriptionNamespace)
+	if enableTenantNamespaceDiscovery || !defaultSubscriptionNamespaceExists {
+		allNamespacesCfg := map[string]cache.Config{cache.AllNamespaces: {}}
+		cacheOpts = cache.Options{
+			ByObject: map[client.Object]cache.ByObject{
+				&maasv1alpha1.MaasTenantConfig{}: {Namespaces: allNamespacesCfg},
+				&maasv1alpha1.Tenant{}:           {Namespaces: allNamespacesCfg},
+				&maasv1alpha1.MaaSAuthPolicy{}:   {Namespaces: allNamespacesCfg},
+				&maasv1alpha1.MaaSSubscription{}: {Namespaces: allNamespacesCfg},
+				// Keep Secret informer scoped to the infra namespace even in multi-tenant mode —
+				// maas-db-config always lives in the infra namespace regardless of tenant count.
+				&corev1.Secret{}: {Namespaces: infraNsCfg},
+			},
+		}
+		setupLog.Info("watching MaaS CRs across all namespaces",
+			"defaultNamespace", maasSubscriptionNamespace,
+			"defaultNamespaceExists", defaultSubscriptionNamespaceExists,
+			"tenantNamespaceLabel", tenantreconcile.LabelAIGatewayTenant,
+			"compatTenantNamespaceLabel", tenantreconcile.LabelManagedByAITenant)
+	}
+
+	ctx, cancel := context.WithCancel(ctrl.SetupSignalHandler())
+
+	tlsConfig := mustLoadManagerTLSConfig(ctx, cfg)
+	profileTLSConfig := &tls.Config{}
+	tlsConfig.serverTLSOpt(profileTLSConfig)
+	nextProtosOpt := func(c *tls.Config) {
+		c.NextProtos = tlsNextProtos(profileTLSConfig.MinVersion, profileTLSConfig.CipherSuites)
+	}
+
+	metricsServerOptions := buildMetricsServerOptions(
+		metricsAddr, secureMetrics, tlsConfig.serverTLSOpt, nextProtosOpt,
+	)
 
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme:                 scheme,
 		Cache:                  cacheOpts,
-		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
+		Metrics:                metricsServerOptions,
+		WebhookServer:          crwebhook.NewServer(crwebhook.Options{TLSOpts: []func(*tls.Config){tlsConfig.serverTLSOpt, nextProtosOpt}}),
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "maas-controller.models-as-a-service.opendatahub.io",
@@ -501,32 +1297,60 @@ func main() {
 	}
 
 	if err := (&maas.MaaSModelRefReconciler{
-		Client:           mgr.GetClient(),
-		Scheme:           mgr.GetScheme(),
-		GatewayName:      gatewayName,
-		GatewayNamespace: gatewayNamespace,
+		Client:                          mgr.GetClient(),
+		Scheme:                          mgr.GetScheme(),
+		GatewayName:                     gatewayName,
+		GatewayNamespace:                gatewayNamespace,
+		DefaultTenantNamespace:          maasSubscriptionNamespace,
+		TenantNamespaceDiscoveryEnabled: enableTenantNamespaceDiscovery,
+		AITenantNamespace:               aitenantNamespace,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "MaaSModelRef")
 		os.Exit(1)
 	}
 	if err := (&maas.MaaSAuthPolicyReconciler{
-		Client:           mgr.GetClient(),
-		Scheme:           mgr.GetScheme(),
-		MaaSAPINamespace: maasAPINamespace,
-		TenantNamespace:  maasSubscriptionNamespace,
-		GatewayName:      gatewayName,
-		ClusterAudience:  clusterAudience,
-		MetadataCacheTTL: metadataCacheTTL,
-		AuthzCacheTTL:    authzCacheTTL,
+		Client:                          mgr.GetClient(),
+		Scheme:                          mgr.GetScheme(),
+		InfraNamespace:                  infraNamespace,
+		TenantNamespace:                 maasSubscriptionNamespace,
+		GatewayName:                     gatewayName,
+		GatewayNamespace:                gatewayNamespace,
+		ClusterAudience:                 clusterAudience,
+		MetadataCacheTTL:                metadataCacheTTL,
+		AuthzCacheTTL:                   authzCacheTTL,
+		TenantNamespaceDiscoveryEnabled: enableTenantNamespaceDiscovery,
+		MaxConcurrentReconciles:         maxConcurrentReconciles,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "MaaSAuthPolicy")
 		os.Exit(1)
 	}
 	if err := (&maas.MaaSSubscriptionReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:                          mgr.GetClient(),
+		Scheme:                          mgr.GetScheme(),
+		APIReader:                       mgr.GetAPIReader(),
+		AppNamespace:                    infraNamespace,
+		DefaultTenantNamespace:          maasSubscriptionNamespace,
+		TenantNamespaceDiscoveryEnabled: enableTenantNamespaceDiscovery,
+		GatewayName:                     gatewayName,
+		GatewayNamespace:                gatewayNamespace,
+		MaxConcurrentReconciles:         maxConcurrentReconciles,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "MaaSSubscription")
+		os.Exit(1)
+	}
+	aitenantDeletionTimeout := parseAITenantDeletionTimeout()
+	if err := (&maas.AITenantReconciler{
+		Client:            mgr.GetClient(),
+		Scheme:            mgr.GetScheme(),
+		APIReader:         mgr.GetAPIReader(),
+		AppNamespace:      infraNamespace,
+		TenantNamespace:   maasSubscriptionNamespace,
+		AITenantNamespace: aitenantNamespace,
+		GatewayName:       gatewayName,
+		GatewayNamespace:  gatewayNamespace,
+		DeletionTimeout:   aitenantDeletionTimeout,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "AITenant")
 		os.Exit(1)
 	}
 
@@ -541,77 +1365,123 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := mgr.Add(&subscriptionNamespaceMonitor{
+	if err := mgr.Add(&managedNamespaceMonitor{
 		clientset:          clientset,
-		namespace:          maasSubscriptionNamespace,
+		namespace:          aitenantNamespace,
+		purpose:            "aitenant",
 		interval:           subscriptionNamespaceMaintainInterval,
 		needLeaderElection: enableLeaderElection,
+		pauseCondition: aitenantTeardownPauseCondition(
+			mgr.GetAPIReader(),
+			client.ObjectKey{Name: tenantreconcile.MaaSControllerDeploymentName, Namespace: controllerNamespace},
+		),
 	}); err != nil {
-		setupLog.Error(err, "unable to add subscription namespace monitor")
+		setupLog.Error(err, "unable to add AITenant namespace monitor")
 		os.Exit(1)
 	}
 
 	// Startup ordering contract:
-	//   1. ensureSubscriptionNamespaceWithClient runs synchronously above, before the manager starts.
+	//   1. Managed namespace ensures run synchronously above, before the manager starts.
 	//   2. LifecycleReconciler creates Config/default when maas-controller is running (see Setup below).
-	//   3. ensureClusterBootstrapRunnable creates default-tenant once Config/default exists (no owner refs).
-	//   4. LifecycleReconciler patches Config→Tenant owner refs (and enqueues on Tenant events).
-	//   5. If Tenant reconciles before Config exists, readyConfigOrWait requeues until the anchor appears.
+	//   3. ensureClusterBootstrapRunnable creates the default AITenant once Config/default exists (no owner refs).
+	//   4. AITenant reconciler creates/adopts MaasTenantConfig/default-tenant.
+	//   5. LifecycleReconciler patches Config→AITenant/MaasTenantConfig owner refs.
+	//   6. If Tenant reconciles before Config exists, readyConfigOrWait requeues until the anchor appears.
 
 	manifestPath := os.Getenv("MAAS_PLATFORM_MANIFESTS")
 	if manifestPath == "" {
-		manifestPath = tenantreconcile.DefaultManifestPath()
+		// tlsConfig.available reflects whether config.openshift.io API exists,
+		// which is the authoritative signal for OCP vs vanilla Kubernetes.
+		isOCP := tlsConfig.available
+		manifestPath = tenantreconcile.ManifestPathForPlatform(isOCP)
 	}
 	if abs, err := filepath.Abs(manifestPath); err == nil {
 		manifestPath = abs
 	}
 	setupLog.Info("Tenant platform kustomize path", "path", manifestPath)
 
-	if err := (&maas.TenantReconciler{
-		Client:           mgr.GetClient(),
-		Scheme:           mgr.GetScheme(),
-		ManifestPath:     manifestPath,
-		AppNamespace:     maasAPINamespace,
-		TenantNamespace:  maasSubscriptionNamespace,
-		GatewayName:      gatewayName,
-		GatewayNamespace: gatewayNamespace,
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Tenant")
+	tenantReconciler := &maas.TenantReconciler{
+		Client:                          mgr.GetClient(),
+		Scheme:                          mgr.GetScheme(),
+		ManifestPath:                    manifestPath,
+		AppNamespace:                    infraNamespace,
+		ControllerNamespace:             controllerNamespace,
+		TenantNamespace:                 maasSubscriptionNamespace,
+		GatewayName:                     gatewayName,
+		GatewayNamespace:                gatewayNamespace,
+		ClusterAudience:                 clusterAudience,
+		TenantNamespaceDiscoveryEnabled: enableTenantNamespaceDiscovery,
+		MetadataCacheTTL:                metadataCacheTTL,
+		MonitoringNamespace:             monitoringNamespace,
+		UsageLogsManifestPath:           usageLogsManifestPath,
+	}
+	if err := tenantReconciler.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "MaasTenantConfig")
 		os.Exit(1)
 	}
 
 	// LifecycleReconciler creates Config/default when maas-controller is running, links the
 	// Deployment and default-tenant to Config (non-controller owner refs), and strips the legacy
-	// cleanup finalizer if present. maasAPINamespace is where ODH deployed maas-controller.
+	// cleanup finalizer if present. controllerNamespace is where maas-controller is deployed.
 	if err := (&maas.LifecycleReconciler{
 		Client:                      mgr.GetClient(),
 		Scheme:                      mgr.GetScheme(),
 		DeploymentName:              "maas-controller",
-		DeploymentNS:                maasAPINamespace,
+		DeploymentNS:                controllerNamespace,
 		TenantSubscriptionNamespace: maasSubscriptionNamespace,
+		AITenantNamespace:           aitenantNamespace,
+		ObservabilityManifestsPath:  observabilityManifestsPath,
+		UsageLogsManifestPath:       usageLogsManifestPath,
+		MonitoringNamespace:         monitoringNamespace,
+		InfraNamespace:              infraNamespace,
+		GatewayNamespace:            gatewayNamespace,
+		DiscoveryEnabled:            os.Getenv("MAAS_DISCOVERY_ENABLED") == "true",
+		DiscoveryManifestPath:       discoveryManifestPath,
+		DiscoveryImage:              os.Getenv("RELATED_IMAGE_ODH_MAAS_DISCOVERY_IMAGE"),
+		DiscoveryLogLevel:           discoveryLogLevelOrDefault("MAAS_DISCOVERY_LOG_LEVEL", "info"),
+		DiscoveryNamespace:          controllerNamespace,
+		DiscoveryReplicas:           parseReplicasEnv("MAAS_DISCOVERY_REPLICAS"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "SelfDeployment")
 		os.Exit(1)
 	}
 
-	if err := mgr.Add(ensureClusterBootstrapRunnable(mgr, maasSubscriptionNamespace, maasAPINamespace, "maas-controller", gatewayName, gatewayNamespace)); err != nil {
+	if err := setupWebhooks(mgr, aitenantNamespace, gatewayNamespace); err != nil {
+		setupLog.Error(err, "unable to setup webhooks")
+		os.Exit(1)
+	}
+
+	if err := mgr.Add(ensureClusterBootstrapRunnable(mgr, maasSubscriptionNamespace, aitenantNamespace, controllerNamespace, "maas-controller", gatewayName, gatewayNamespace)); err != nil {
 		setupLog.Error(err, "unable to register ensureClusterBootstrap runnable")
 		os.Exit(1)
 	}
+
+	tlsConfig.registerWatcher(mgr, cancel)
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
 		os.Exit(1)
 	}
-	// readyz: uncached Namespace GET each probe — see subscriptionNamespaceReadiness.
-	if err := mgr.AddReadyzCheck("readyz", subscriptionNamespaceReadiness(clientset, maasSubscriptionNamespace)); err != nil {
+	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up ready check")
 		os.Exit(1)
 	}
 
 	setupLog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+func tlsNextProtos(minVersion uint16, cipherSuites []uint16) []string {
+	if minVersion < tls.VersionTLS12 {
+		return []string{"http/1.1"}
+	}
+	if minVersion >= tls.VersionTLS13 || len(cipherSuites) == 0 ||
+		slices.Contains(cipherSuites, tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256) ||
+		slices.Contains(cipherSuites, tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256) {
+		return []string{"h2", "http/1.1"}
+	}
+	return []string{"http/1.1"}
 }

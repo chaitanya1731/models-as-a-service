@@ -2,21 +2,33 @@
 
 Defines a subscription plan with per-model token rate limits. Creates Kuadrant TokenRateLimitPolicies enforced by Limitador. Must be created in the `models-as-a-service` namespace.
 
+For AGC ExternalModels with per-gateway routes, each referenced MaaSModelRef reconciles a TokenRateLimitPolicy on its selected tenant route (in the model/route namespace). Policies keep existing names (`maas-trlp-<maasmodelref-name>`) and are labeled with the selected full gateway identity (`maas.opendatahub.io/gateway-namespace`, `maas.opendatahub.io/gateway-name`) for diagnostics and operational context.
+
+By default, when a `MaaSSubscription` is deleted, its finalizer waits for a subscription-scoped cleanup Job to soft-delete and invalidate only the API keys bound to that subscription. Keys for other subscriptions in the tenant are not affected. Cleanup failures keep the subscription in `Terminating`, are retried, and emit a Kubernetes Warning event. Set `maas.opendatahub.io/retain-api-keys-on-delete: "true"` to skip API-key revocation for a subscription copy managed by an external system that performs revocation for the authoritative deletion. Cleanup is also skipped when the owning `AITenant` is being deleted and uses that annotation to retain API keys. The annotation must be present before deletion and cleanup begin. Adding it after a cleanup Job has started or completed is unsupported and may not prevent keys from being revoked. The finalizer still completes its other cleanup. If tenant-level retention is used for every copy, keys remain active and match again when the tenant and a subscription with the same name are recreated; there is no hub-side revocation path yet.
+
 ## MaaSSubscriptionSpec
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| owner | OwnerSpec | Yes | Who owns this subscription |
+| owner | OwnerSpec | Yes | Users and groups entitled to select this subscription; not Kubernetes ownership or RBAC |
+| organization | SubscriptionOrganization | No | Stable organization association for delegated administration. `organization.id` is a non-empty string, may be set only once, and cannot be replaced or removed. It does not change inference access, and it is the authoritative source for subscription-scoped `organization_id` telemetry. |
 | modelRefs | []ModelSubscriptionRef | Yes | Models included with per-model token rate limits (each specifies `name` and `namespace`) |
-| tokenMetadata | TokenMetadata | No | Metadata for token attribution and metering |
+| tokenMetadata | TokenMetadata | No | Metadata for token attribution and metering. `tokenMetadata.organizationId` is the legacy fallback when `organization.id` is unset. |
 | priority | int32 | No | Subscription priority when user has multiple (higher = higher priority; default: 0) |
+| inferencePriority | int32 | No | Scheduling priority for inference requests made under this subscription (signed; higher = scheduled first, negative = below the scheduler default). Independent of `priority`, which only selects among subscriptions. Omitting the field creates no InferenceObjective and the scheduler applies priority `0`; setting it explicitly to `0` creates an InferenceObjective with priority `0`. |
+
+## SubscriptionOrganization
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| id | string | Yes | Non-empty organization identifier. Legacy subscriptions may gain this field once, after their existing key and history association has been verified. The association is then immutable. |
 
 ## OwnerSpec
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| groups | []GroupReference | No | Kubernetes group names that own this subscription |
-| users | []string | No | Kubernetes user names that own this subscription |
+| groups | []GroupReference | No | Identity group names entitled to select this subscription; matched exactly |
+| users | []string | No | Identity user names entitled to select this subscription; matched exactly |
 
 ## ModelSubscriptionRef
 
@@ -24,7 +36,8 @@ Defines a subscription plan with per-model token rate limits. Creates Kuadrant T
 |-------|------|----------|-------------|
 | name | string | Yes | Name of the MaaSModelRef |
 | namespace | string | Yes | Namespace where the MaaSModelRef lives |
-| tokenRateLimits | []TokenRateLimit | Yes | Token-based rate limits for this model (at least one required) |
+| tokenRateLimits | []TokenRateLimit | Unless `unlimited` | Token-based rate limits for this model (at least one entry when set) |
+| unlimited | bool | No | Access to this model without a token budget. Usage is still metered. Mutually exclusive with `tokenRateLimits` |
 | billingRate | BillingRate | No | Cost per token |
 
 ## TokenRateLimit
@@ -34,12 +47,45 @@ Defines a subscription plan with per-model token rate limits. Creates Kuadrant T
 | limit | int64 | Yes | Maximum number of tokens allowed |
 | window | string | Yes | Time window (e.g., `1m`, `1h`, `24h`). Allowed units: `s`, `m`, `h` (1–9999). Pattern: `^[1-9]\d{0,3}(s\|m\|h)$`. **Breaking change:** `d` (days) is no longer accepted; use hours instead (e.g., `24h` not `1d`). |
 
+## Status: flowControlStatuses
+
+`status.flowControlStatuses` lists, for each referenced model, the InferencePool and InferenceObjective used for `inferencePriority`. The objective name is published even when `inferencePriority` is unset, so request headers can always carry it.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| name | string | Name of the MaaSModelRef |
+| namespace | string | Namespace of the MaaSModelRef. The InferencePool and InferenceObjective live in this namespace, alongside the LLMInferenceService. |
+| inferencePool | LocalObjectReference | InferencePool (`group`, `kind`, `name`) observed in the LLMInferenceService's `status.router.scheduler.inferencePool` |
+| objectiveName | string | InferenceObjective name for this subscription and pool, in the pool's namespace. Set whenever the pool is known, including when `inferencePriority` is unset. It does not change when `inferencePriority` changes. |
+| ready | bool | `true` when no request-priority reconciliation is left for this model (see reasons below). It does not report whether the model's backend is ready; see `modelRefStatuses`. |
+| reason | string | Machine-readable reason for `ready` (see below). New reasons may be added. |
+| message | string | Human-readable detail for the reason |
+
+| Reason | ready | Meaning |
+|--------|-------|---------|
+| `ObjectiveReconciled` | `true` | The InferenceObjective is observed with the priority from `inferencePriority` |
+| `PriorityUnset` | `true` | `inferencePriority` is unset: no InferenceObjective is created and the scheduler applies priority `0` |
+| `NotApplicable` | `true` | The model is not served through an inference scheduler, so no InferenceObjective is required. ExternalModels always report this; their readiness is in the ExternalModel's `status.phase` and conditions. |
+| `Unmanaged` | `true` | The InferenceObjective has `opendatahub.io/managed: "false"`; its priority is owned by the user |
+| `PoolPending` | `false` | The model's InferencePool or HTTPRoute has not been observed yet |
+| `ObjectivePending` | `false` | The InferenceObjective is not observed with the desired priority yet |
+| `Unsupported` | `false` | Request priority cannot be applied, for example because traffic is split across a routing group |
+| `NotOnTenantGateway` | `false` | The model's HTTPRoute is not attached to the subscription's tenant Gateway |
+| `ObjectiveConflict` | `false` | Another object holds the InferenceObjective name |
+| `InferenceObjectiveAPIUnavailable` | `false` | The InferenceObjective API (`llm-d.ai`) is not installed |
+| `ReconcileFailed` | `false` | Reconciling request priority for the model failed; it is retried |
+
+When `inferencePriority` is set, the `InferenceObjectivesReady` condition summarizes these entries. It is `True` when every model is ready; otherwise it is `False` with the most severe reason. The condition is removed when `inferencePriority` is unset.
+
+Request priority never fails a subscription. When `inferencePriority` is set and a model reports `ReconcileFailed`, `ObjectiveConflict`, `NotOnTenantGateway`, or `Unsupported`, an otherwise `Active` subscription becomes `Degraded`, which keeps access. Pending states and a missing InferenceObjective API do not change the phase. The status reports controller progress, not confirmation that the inference scheduler has applied the priority.
+
 ## Annotations
 
 MaaSSubscription supports standard Kubernetes and OpenShift annotations for use by `kubectl`, the OpenShift console, and other tooling.
 
 | Annotation | Description | Example |
 | ---------- | ----------- | ------- |
+| `maas.opendatahub.io/retain-api-keys-on-delete` | Skip subscription API-key revocation when this object is deleted, or when its owning `AITenant` is deleted with retention; use only when an external owner revokes keys for the authoritative deletion | `"true"` |
 | `openshift.io/display-name` | Human-readable display name | `"Premium Subscription"` |
 | `openshift.io/description` | Free-text description | `"Premium-tier subscription with 1000 tokens/min rate limit"` |
 

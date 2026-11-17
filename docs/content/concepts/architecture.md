@@ -6,6 +6,20 @@ The MaaS Platform is a Kubernetes-native layer for AI model serving built on [Ga
 
 Our future plans include improved request routing and discovery—and we're already sketching what comes after that.
 
+## Deployment Architecture
+
+MaaS is deployed as a sub-component of the **AI Gateway Operator**, managed by the ODH/RHOAI operator. Enabling `aigateway.modelsAsAService: Managed` in your `DataScienceCluster` triggers the following component chain:
+
+```
+DataScienceCluster
+  └── aigateway.modelsAsAService: Managed
+        └── AI Gateway Operator
+              └── maas-controller
+                    └── maas-api, Tenant, MaaSAuthPolicy, MaaSSubscription, ...
+```
+
+This replaces the previous `kserve.modelsAsService` nesting. KServe is no longer a prerequisite for MaaS — include it only if you need independent model serving.
+
 ## Architecture
 
 ### 🏗️ High-Level Architecture
@@ -97,7 +111,7 @@ graph TB
 6. Only the hash and metadata (username, groups, name, `subscription` — the MaaSSubscription name bound at mint, `expiresAt`) are stored in PostgreSQL.
 7. The plaintext key is returned to the user **only in this minting response** (show-once), along with `expiresAt`; it is **not** exposed again on later reads. The diagram below stops at storage and does not show the HTTP response back to the user.
 
-Every key expires. With **operator-managed** MaaS, the cluster operator sets the maximum lifetime on the **`Tenant`** CR: **`spec.apiKeys.maxExpirationDays`** (see [Tenant CR](../install/maas-setup.md#tenant-cr)). **`maas-api`** applies that cap as **`API_KEY_MAX_EXPIRATION_DAYS`** (for example 90 days by default when defaults apply). Omit **`expiresIn`** on create to use that maximum, or set a shorter **`expiresIn`** (e.g., `30d`, `90d`, `1h`) within the configured cap. The response always includes **`expiresAt`** (RFC3339).
+Every key expires. With **operator-managed** MaaS, the cluster operator sets the maximum lifetime on the **`MaasTenantConfig`** CR: **`spec.apiKeys.maxExpirationDays`** (see [MaasTenantConfig CR](../install/maas-setup.md#maastenantconfig-cr)). **`maas-api`** applies that cap as **`API_KEY_MAX_EXPIRATION_DAYS`** (for example 90 days by default when defaults apply). Omit **`expiresIn`** on create to use that maximum, or set a shorter **`expiresIn`** (e.g., `30d`, `90d`, `1h`) within the configured cap. The response always includes **`expiresAt`** (RFC3339).
 
 ```mermaid
 graph TB
@@ -249,7 +263,7 @@ Token usage and rate-limit data flow from Limitador into Prometheus and onward t
 1. Limitador stores token usage counters (e.g., `authorized_hits`, `authorized_calls`, `limited_calls`) with labels (`user`, `model`).
 2. A ServiceMonitor (or Kuadrant PodMonitor) configures Prometheus to scrape Limitador's `/metrics` endpoint.
 3. Prometheus stores the metrics in its time-series database.
-4. Grafana (or other visualization tools) queries Prometheus to build dashboards for usage, billing, and operational health.
+4. Perses (ODH/RHOAI observability console) queries Prometheus to build usage dashboards.
 
 ```mermaid
 graph LR
@@ -266,16 +280,16 @@ graph LR
     end
     
     subgraph Visualization["Visualization"]
-        Grafana[Grafana<br/>Dashboards]
+        Perses[Perses<br/>ODH dashboards]
     end
     
     Limitador -->|"/metrics"| SM
     SM -->|"Scrape"| Prometheus
-    Prometheus -->|"Query"| Grafana
+    Prometheus -->|"Query"| Perses
     
     style Limitador fill:#e65100,stroke:#333,stroke-width:2px,color:#fff
     style Prometheus fill:#1976d2,stroke:#333,stroke-width:2px,color:#fff
-    style Grafana fill:#388e3c,stroke:#333,stroke-width:2px,color:#fff
+    style Perses fill:#388e3c,stroke:#333,stroke-width:2px,color:#fff
 ```
 
 ## 🔄 Component Flows

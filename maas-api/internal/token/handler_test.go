@@ -1,0 +1,282 @@
+package token_test
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/constant"
+	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/logger"
+	"github.com/opendatahub-io/models-as-a-service/maas-api/internal/token"
+)
+
+func setupRouter(t *testing.T) *gin.Engine {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+
+	h := token.NewHandler(logger.Development(), "test")
+	router := gin.New()
+	router.Use(h.ExtractUserInfo())
+	router.GET("/test", func(c *gin.Context) {
+		user, exists := c.Get("user")
+		if !exists {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "user not found in context"})
+			return
+		}
+		c.JSON(http.StatusOK, user)
+	})
+
+	return router
+}
+
+// TestExtractUserInfo_TenantFromConfig verifies that the ExtractUserInfo middleware
+// correctly sets the tenant from the handler's configured tenantName (from TENANT_NAME env var).
+func TestExtractUserInfo_TenantFromConfig(t *testing.T) {
+	router := setupRouter(t)
+
+	t.Run("TenantFromHandler", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		req.Header.Set(constant.HeaderUsername, "testuser")
+		req.Header.Set(constant.HeaderGroup, `["group1"]`)
+		req.Header.Set(constant.HeaderOrganizationID, "stable-org")
+
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var body token.UserContext
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+		assert.Equal(t, "testuser", body.Username)
+		assert.Equal(t, []string{"group1"}, body.Groups)
+		assert.Equal(t, "test", body.Tenant, "tenant should come from handler config")
+		assert.Equal(t, "stable-org", body.OrganizationID)
+	})
+}
+
+// setupOptionalRouter creates a test router using ExtractUserInfoOptional middleware.
+func setupOptionalRouter(t *testing.T) *gin.Engine {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+
+	h := token.NewHandler(logger.Development(), "test")
+	router := gin.New()
+	router.Use(h.ExtractUserInfoOptional())
+	router.GET("/test", func(c *gin.Context) {
+		user, exists := c.Get("user")
+		if !exists {
+			c.JSON(http.StatusOK, gin.H{"user_present": false})
+			return
+		}
+		uc, ok := user.(*token.UserContext)
+		if !ok {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "invalid user context"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"user_present": true,
+			"username":     uc.Username,
+			"groups":       uc.Groups,
+			"tenant":       uc.Tenant,
+		})
+	})
+
+	return router
+}
+
+func TestExtractUserInfoOptional(t *testing.T) {
+	t.Run("sets user context when both headers present", func(t *testing.T) {
+		router := setupOptionalRouter(t)
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		req.Header.Set(constant.HeaderUsername, "testuser")
+		req.Header.Set(constant.HeaderGroup, `["group1"]`)
+
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var body map[string]any
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+		assert.Equal(t, true, body["user_present"])
+		assert.Equal(t, "testuser", body["username"])
+		assert.Equal(t, "test", body["tenant"])
+	})
+
+	t.Run("continues without user context when no headers present", func(t *testing.T) {
+		router := setupOptionalRouter(t)
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		// No auth headers set
+
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var body map[string]any
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+		assert.Equal(t, false, body["user_present"])
+	})
+
+	t.Run("continues without user context when only username header present", func(t *testing.T) {
+		router := setupOptionalRouter(t)
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		req.Header.Set(constant.HeaderUsername, "testuser")
+		// No group header
+
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var body map[string]any
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+		assert.Equal(t, false, body["user_present"])
+	})
+
+	t.Run("continues without user context when only group header present", func(t *testing.T) {
+		router := setupOptionalRouter(t)
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		req.Header.Set(constant.HeaderGroup, `["group1"]`)
+		// No username header
+
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var body map[string]any
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+		assert.Equal(t, false, body["user_present"])
+	})
+
+	t.Run("sets an empty group list for an empty array header", func(t *testing.T) {
+		router := setupOptionalRouter(t)
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		req.Header.Set(constant.HeaderUsername, "testuser")
+		req.Header.Set(constant.HeaderGroup, "[]")
+
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var body struct {
+			UserPresent bool     `json:"user_present"`
+			Username    string   `json:"username"`
+			Groups      []string `json:"groups"`
+		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+		assert.True(t, body.UserPresent)
+		assert.Equal(t, "testuser", body.Username)
+		assert.Equal(t, []string{}, body.Groups)
+	})
+
+	t.Run("preserves group values from header", func(t *testing.T) {
+		router := setupOptionalRouter(t)
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		req.Header.Set(constant.HeaderUsername, "testuser")
+		req.Header.Set(constant.HeaderGroup, `[" org/users ","quote\\\"comma,pipe|"]`)
+
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		require.Equal(t, http.StatusOK, w.Code)
+		var body struct {
+			Groups []string `json:"groups"`
+		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+		assert.Equal(t, []string{" org/users ", `quote\"comma,pipe|`}, body.Groups)
+	})
+
+	t.Run("aborts when group header is malformed", func(t *testing.T) {
+		router := setupOptionalRouter(t)
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		req.Header.Set(constant.HeaderUsername, "testuser")
+		req.Header.Set(constant.HeaderGroup, "not-valid-format")
+
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusInternalServerError, w.Code)
+
+		var body map[string]any
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+		assert.Equal(t, "AUTH_FAILURE", body["exceptionCode"])
+	})
+
+	t.Run("derives user context from verified identity", func(t *testing.T) {
+		gin.SetMode(gin.TestMode)
+		handler := token.NewHandler(logger.Development(), "test")
+		router := gin.New()
+		router.Use(handler.ExtractVerifiedIdentityOptional(), handler.ExtractUserInfoOptional())
+		router.GET("/test", func(c *gin.Context) {
+			user, exists := c.Get("user")
+			if !exists {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "user context missing"})
+				return
+			}
+			userContext, ok := user.(*token.UserContext)
+			if !ok {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "invalid user context"})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"user": userContext})
+		})
+
+		request := httptest.NewRequest(http.MethodGet, "/test", nil)
+		request.Header.Set(constant.HeaderIdentity, validIdentityEnvelope)
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, request)
+
+		require.Equal(t, http.StatusOK, recorder.Code)
+		var response struct {
+			User token.UserContext `json:"user"`
+		}
+		require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+		user := response.User
+		assert.Equal(t, "alex", user.Username)
+		assert.Equal(t, []string{
+			"system:authenticated",
+			"42c3e46f-2477-44d7-a85b-d3b43f6b31fa/users",
+		}, user.Groups)
+		assert.Equal(t, "test", user.Tenant)
+	})
+
+	t.Run("drops verified identity groups when one group is invalid", func(t *testing.T) {
+		gin.SetMode(gin.TestMode)
+		handler := token.NewHandler(logger.Development(), "test")
+		router := gin.New()
+		router.Use(handler.ExtractVerifiedIdentityOptional(), handler.ExtractUserInfoOptional())
+		router.GET("/test", func(c *gin.Context) {
+			user, exists := c.Get("user")
+			if !exists {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "user context missing"})
+				return
+			}
+			c.JSON(http.StatusOK, user)
+		})
+
+		envelope := strings.Replace(
+			validIdentityEnvelope,
+			`"groups": ["users"]`,
+			`"groups": ["valid-group", "bad,group"]`,
+			1,
+		)
+		request := httptest.NewRequest(http.MethodGet, "/test", nil)
+		request.Header.Set(constant.HeaderIdentity, envelope)
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, request)
+
+		require.Equal(t, http.StatusOK, recorder.Code)
+		var user token.UserContext
+		require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &user))
+		assert.Equal(t, []string{"system:authenticated"}, user.Groups)
+	})
+}

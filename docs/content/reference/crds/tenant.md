@@ -1,30 +1,198 @@
-# Tenant
+# MaasTenantConfig
 
-Configures the MaaS platform tenant. The Tenant CRD is a namespace-scoped singleton — the resource name must be `default-tenant` (enforced by CEL validation). It specifies the gateway used to expose model endpoints, API key policies, external OIDC authentication, and telemetry settings.
+Configures MaaS-specific tenant settings. `MaasTenantConfig` is a namespace-scoped singleton; the resource name must be `default-tenant` (enforced by CEL validation).
+
+Platform context such as Gateway and external OIDC belongs to [`AITenant`](ai-tenant.md). `MaasTenantConfig` owns MaaS runtime configuration such as API key policy and telemetry settings. The legacy `Tenant` CRD remains installed during the migration window so existing `Tenant/default-tenant` objects can be copied into `MaasTenantConfig/default-tenant`; the migrated legacy objects themselves are temporary.
+
+## Multi-Tenant Deployment
+
+In multi-tenant deployments, each tenant has one `MaasTenantConfig` in its tenant namespace:
+
+| Tenant Type | Config Namespace | Config Name | maas-api Deployment | Created By |
+|-------------|------------------|-------------|---------------------|------------|
+| Default | `models-as-a-service` | `default-tenant` | `maas-api` (infra namespace) | Default AITenant bootstrap |
+| Additional | `ai-tenant-{tenantID}` | `default-tenant` | `maas-api-{tenantID}` (infra namespace) | AITenant reconciler |
+
+Key points:
+
+- All `MaasTenantConfig` resources are named `default-tenant` within their namespace.
+- The default `MaasTenantConfig/default-tenant` is created or adopted by `AITenant/models-as-a-service`.
+- Additional tenant configs are created by the AITenant reconciler, which provisions the tenant namespace and config object.
+- maas-api Deployments are created in the infrastructure namespace (AUTO-derived by default: `odh-ai-gateway-infra` for ODH or `redhat-ai-gateway-infra` for RHOAI). See [Infrastructure Namespace Migration](../../configuration-and-management/infra-namespace-migration.md) for details.
+- Each tenant has an isolated maas-api instance for API key and subscription management.
+- `MaasTenantConfig` resources for additional tenants have the finalizer `maas.opendatahub.io/tenant-cleanup`.
+- For AITenant-managed tenants, Gateway comes from `AITenant.status.gatewayRef`; OIDC comes from `AITenant.spec.oidc`.
+
+See [AITenant CRD](ai-tenant.md) for creating additional tenants.
 
 ---
 
 ## Spec
 
-### TenantSpec
+### MaasTenantConfigSpec
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| gatewayRef | TenantGatewayRef | No | Reference to the Gateway (Gateway API) used for exposing model endpoints. Defaults to `openshift-ingress/maas-default-gateway`. |
+| apiTranslation | TenantAPITranslationConfig | No | Permission for the API translation directions supported by the installed Praxis dataplane; default off |
 | apiKeys | TenantAPIKeysConfig | No | Configuration for API key management |
-| externalOIDC | TenantExternalOIDCConfig | No | External OIDC identity provider settings for the maas-api AuthPolicy |
 | telemetry | TenantTelemetryConfig | No | Telemetry and metrics collection configuration |
+| maasApi | MaasAPIConfig | No | Replica count and resource configuration for the maas-api Deployment |
+| payloadProcessing | PayloadProcessingConfig | No | Replica count, autoscaling, and resource configuration for the payload-processing Deployment |
+| payloadPreProcessing | PayloadProcessingConfig | No | Replica count, autoscaling, and resource configuration for the payload-pre-processing Deployment |
 
 ---
 
-## TenantGatewayRef
+## TenantAPITranslationConfig
 
-`spec.gatewayRef` identifies the Gateway API Gateway resource that the controller uses for model endpoint routing.
+`spec.apiTranslation.enabled` permits only translation flows explicitly
+supported by the installed AI Gateway Controller and Praxis ExtProc image. It
+defaults to off when omitted. An omitted `enabled`, explicit `false`, and
+explicit `true` remain distinct inputs while maas-controller migrates a
+recognized RHOAI 3.5 IPP ConfigMap.
+
+This is a tenant permission for the translation flows supported by the
+installed dataplane; it does not choose a translator. The shared post-auth
+flow is **Anthropic Messages client → OpenAI Chat Completions backend**, scoped
+to `/v1/messages`. The ExternalModel flow is **OpenAI Chat Completions client
+→ selected Anthropic Messages provider**. For ExternalModels,
+`intelligent_route` selects the provider first, and that provider's trusted
+profile determines whether translation runs. An OpenAI-compatible provider
+remains pass-through.
+
+The currently qualified ExternalModel profiles are OpenAI `openai-chat`
+pass-through and Anthropic `messages` translation. The Anthropic profile
+requires this permission to be enabled. Azure OpenAI, Vertex AI, Bedrock, and
+custom provider or format combinations are not qualified by this runtime; an
+active unqualified binding fails reconciliation and retains the last-known
+serving route rather than being silently removed.
+
+The shared translator stays strict for Anthropic-only fields that Chat
+Completions cannot represent. Requests using `cache_control` prompt-caching
+markers or extended-thinking fields are rejected with a client error; this
+Phase 1 renderer does not opt into lossy feature removal. Claude Code may send
+those fields, so enabling the setting alone does not establish Claude Code
+compatibility.
+
+```yaml
+spec:
+  apiTranslation:
+    enabled: true
+```
+
+During an IPP → Praxis migration, an active Anthropic `messages` ExternalModel
+binding does not block cleanup while this field is `true`, whether an operator
+set it or maas-controller wrote it for a recognized RHOAI 3.5 IPP ConfigMap.
+Setting it to `false` is an explicit decision to accept the compatibility loss
+described in the [3.6 upgrade guide](../../migration/upgrade-to-3.6.md#ipp-praxis-api-translation-migration).
+It does not mean that a legacy transform was preserved, and it also turns off
+`targetModel` and provider `path` rewriting for every ExternalModel and the
+Anthropic `messages` profile.
+
+---
+
+## MaasAPIConfig
+
+`spec.maasApi` controls replica count and resource overrides for the tenant's maas-api Deployment.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| namespace | string | No | `openshift-ingress` | Namespace of the Gateway resource. Max length: 63 characters. |
-| name | string | No | `maas-default-gateway` | Name of the Gateway resource. Max length: 63 characters. |
+| replicas | int32 | No | 1 | Sets the Deployment `spec.replicas`. Spec-based replicas take precedence over the `maas.opendatahub.io/maas-api-replicas` annotation. When neither is set, the base manifest default applies. Valid range: 1–100. |
+| resources | [ResourceRequirements](https://kubernetes.io/docs/reference/kubernetes-api/core/pod-v1/#resources) | No | requests: 128Mi/100m, limits: 256Mi/500m | Overrides the resource requests and limits for the maas-api container. When set, replaces the entire resource block (full replacement, not merge). Resource claims are not supported. |
+
+### Resource Overrides
+
+Use `resources` to override the default container resource requests and limits for the maas-api container. When set, the entire resource block is replaced (not merged with defaults). When not set, the base manifest defaults are used. Only `requests` and `limits` are accepted; resource claims are not supported.
+
+```yaml
+spec:
+  maasApi:
+    replicas: 2
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "200m"
+      limits:
+        memory: "1Gi"
+        cpu: "1"
+```
+
+---
+
+## PayloadProcessingConfig
+
+`spec.payloadProcessing` controls replica count, autoscaling, and resource limits for the tenant's payload-processing Deployment.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| replicas | int32 | No | 1 | Sets the Deployment `spec.replicas`. When `autoscaling` is also configured, this value becomes the HPA `minReplicas` floor instead. Valid range: 1–100. |
+| autoscaling | PayloadProcessingAutoscaling | No | - | Presence of this section enables HPA-based autoscaling for payload-processing pods. |
+| resources | [ResourceRequirements](https://kubernetes.io/docs/reference/kubernetes-api/core/pod-v1/#resources) | No | requests: 128Mi/100m, limits: 512Mi/1 | Overrides the resource requests and limits for the payload-processing container. When set, replaces the entire resource block (full replacement, not merge). Resource claims are not supported. |
+
+### PayloadProcessingAutoscaling
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| maxReplicas | int32 | No | 10 | HPA `maxReplicas`. Valid range: 1–100. |
+| targetCPUUtilization | int32 | No | 70 | HPA target CPU utilization percentage. Valid range: 1–100. |
+| targetMemoryUtilization | int32 | No | 80 | HPA target memory utilization percentage. Valid range: 1–100. |
+
+When autoscaling is enabled:
+- `spec.payloadProcessing.replicas` (if set) becomes the HPA `minReplicas` floor instead of directly setting `spec.replicas` on the Deployment.
+- The HPA manages the Deployment's replica count based on CPU and memory utilization thresholds.
+- Scale-down uses a 300s stabilization window and a 25%/60s policy to prevent flapping.
+- Scale-up reacts immediately (0s stabilization) with up to 100%/15s or 4 pods/15s (whichever is higher).
+
+Remove the `autoscaling` section to disable autoscaling. The HPA will be removed and the Deployment will revert to static replica management via `spec.payloadProcessing.replicas`.
+
+### Resource Overrides
+
+Use `resources` to override the default container resource requests and limits for the payload-processing container. When set, the entire resource block is replaced (not merged with defaults). When not set, the base manifest defaults are used. Only `requests` and `limits` are accepted; resource claims are not supported.
+
+If autoscaling is enabled, `resources.requests.cpu` and `resources.requests.memory` must both be specified when overriding resources. Incomplete overrides are rejected and the manifest defaults are preserved. Because `resources` replaces the entire block, a limits-only override removes existing requests. That can cause `FailedGetResourceMetric` for the affected HPA metric; another valid metric may still drive scaling.
+
+```yaml
+spec:
+  payloadProcessing:
+    replicas: 2
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "200m"
+      limits:
+        memory: "2Gi"
+        cpu: "2"
+```
+
+---
+
+## PayloadPreProcessingConfig
+
+`spec.payloadPreProcessing` controls replica count, autoscaling, and resource limits for the tenant's payload-pre-processing Deployment. It uses the same shape as [`PayloadProcessingConfig`](#payloadprocessingconfig).
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| replicas | int32 | No | 1 | Sets the Deployment `spec.replicas`. When `autoscaling` is also configured, this value becomes the HPA `minReplicas` floor instead. Valid range: 1–100. |
+| autoscaling | PayloadProcessingAutoscaling | No | - | Presence of this section enables HPA-based autoscaling for payload-pre-processing pods. |
+| resources | [ResourceRequirements](https://kubernetes.io/docs/reference/kubernetes-api/core/pod-v1/#resources) | No | requests: 128Mi/100m, limits: 512Mi/1 | Overrides the resource requests and limits for the payload-pre-processing container. When set, replaces the entire resource block (full replacement, not merge). Resource claims are not supported. |
+
+Autoscaling behavior, request requirements when HPA is enabled, and full-replacement resource semantics match `spec.payloadProcessing`.
+
+```yaml
+spec:
+  payloadPreProcessing:
+    replicas: 2
+    autoscaling:
+      maxReplicas: 10
+      targetCPUUtilization: 70
+      targetMemoryUtilization: 80
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "200m"
+      limits:
+        memory: "1Gi"
+        cpu: "1"
+```
 
 ---
 
@@ -35,18 +203,7 @@ Configures the MaaS platform tenant. The Tenant CRD is a namespace-scoped single
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | maxExpirationDays | int32 | No | Maximum number of days an API key can be valid. Must be at least 1. |
-
----
-
-## TenantExternalOIDCConfig
-
-`spec.externalOIDC` configures an external OIDC identity provider for token-based authentication.
-
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| issuerUrl | string | Yes | — | OIDC issuer URL. Must start with `https://`. Max length: 2048 characters. |
-| clientId | string | Yes | — | OAuth2 client ID. Max length: 256 characters. |
-| ttl | int | No | `300` | JWKS cache duration in seconds. Minimum: 30. |
+| deletionRetentionDays | int32 | No | Number of days lifecycle-invalidated API keys remain soft-deleted for audit before physical deletion. Defaults to 90; must be at least 1. |
 
 ---
 
@@ -57,22 +214,30 @@ Configures the MaaS platform tenant. The Tenant CRD is a namespace-scoped single
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | enabled | bool | No | `true` | Whether telemetry collection is enabled |
-| metrics | TenantMetricsConfig | No | — | Fine-grained control over metric dimensions |
+| metrics | TenantMetricsConfig | No | - | Fine-grained control over metric dimensions |
+| logs | TenantLogsConfig | No | - | Fine-grained control over usage-log identity fields |
 
 ### TenantMetricsConfig
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | captureOrganization | bool | No | `true` | Add an "organization" dimension to telemetry metrics |
-| captureUser | bool | No | `false` | Add a "user" dimension containing the authenticated user ID. May have GDPR / privacy implications — ensure compliance before enabling. |
+| captureUser | bool | No | `false` | Add a "user" dimension containing the authenticated user ID. May have privacy implications; ensure compliance before enabling. |
 | captureGroup | bool | No | `false` | Add a "group" dimension to telemetry metrics |
 | captureModelUsage | bool | No | `true` | Capture per-model usage metrics |
+
+### TenantLogsConfig
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| captureUser | bool | No | `false` | Include the authenticated user ID as `user_id` on usage logs. Independent of `metrics.captureUser`. May have privacy implications; ensure compliance before enabling. |
+| captureOrganization | bool | No | `true` | Include the subscription organization ID as `organization_id` on usage logs. Independent of `metrics.captureOrganization`. |
 
 ---
 
 ## Status
 
-### TenantStatus
+### MaasTenantConfigStatus
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -81,7 +246,7 @@ Configures the MaaS platform tenant. The Tenant CRD is a namespace-scoped single
 
 ### Print Columns
 
-`kubectl get tenant` displays:
+`kubectl get maastenantconfig` displays:
 
 | Column | Source |
 |--------|--------|
@@ -91,24 +256,77 @@ Configures the MaaS platform tenant. The Tenant CRD is a namespace-scoped single
 
 ---
 
-## Example
+## Annotations
+
+Optional metadata annotations that control per-tenant horizontal scaling.
+
+### Replica Count Overrides
+
+| Annotation | Default | Valid Range | Description |
+|------------|---------|-------------|-------------|
+| `maas.opendatahub.io/maas-api-replicas` | 1 | 1–100 | Overrides the maas-api Deployment replica count. When `spec.maasApi.replicas` is also set, the spec value takes precedence. |
+| `maas.opendatahub.io/payload-processing-replicas` | 1 | 1–100 | **Deprecated:** use `spec.payloadProcessing.replicas` instead. Still supported during the migration window but will be removed in a future release. |
+| `maas.opendatahub.io/payload-pre-processing-replicas` | 1 | 1–100 | **Deprecated:** use `spec.payloadPreProcessing.replicas` instead. Still supported during the migration window but will be removed in a future release. |
+
+When set, the controller patches the corresponding Deployment's `spec.replicas` during reconciliation. Invalid values (non-numeric, zero, negative, or exceeding 100) produce a `Degraded` status condition with a remediation message; the default replica count is preserved.
+
+Remove the annotation to revert to the manifest default.
+
+### Example: Scaling for High Concurrency
 
 ```yaml
 apiVersion: maas.opendatahub.io/v1alpha1
-kind: Tenant
+kind: MaasTenantConfig
+metadata:
+  name: default-tenant
+  namespace: models-as-a-service
+  annotations:
+    maas.opendatahub.io/maas-api-replicas: "3"
+    maas.opendatahub.io/payload-processing-replicas: "2"
+spec:
+  apiKeys:
+    maxExpirationDays: 90
+    deletionRetentionDays: 90
+```
+
+### Example: Autoscaling Payload Processing
+
+```yaml
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaasTenantConfig
 metadata:
   name: default-tenant
   namespace: models-as-a-service
 spec:
-  gatewayRef:
-    namespace: openshift-ingress
-    name: maas-default-gateway
+  payloadProcessing:
+    replicas: 2                     # minimum replicas (HPA minReplicas floor)
+    autoscaling:
+      maxReplicas: 15               # maximum replicas (ceiling)
+      targetCPUUtilization: 60      # scale up when avg CPU > 60%
+      targetMemoryUtilization: 75   # scale up when avg memory > 75%
+  payloadPreProcessing:
+    replicas: 2
+    autoscaling:
+      maxReplicas: 10
+      targetCPUUtilization: 70
+      targetMemoryUtilization: 80
   apiKeys:
     maxExpirationDays: 90
-  externalOIDC:
-    issuerUrl: "https://keycloak.example.com/realms/maas"
-    clientId: maas-api
-    ttl: 300
+```
+
+---
+
+## Example
+
+```yaml
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaasTenantConfig
+metadata:
+  name: default-tenant
+  namespace: models-as-a-service
+spec:
+  apiKeys:
+    maxExpirationDays: 90
   telemetry:
     enabled: true
     metrics:
@@ -116,12 +334,26 @@ spec:
       captureUser: false
       captureGroup: false
       captureModelUsage: true
+    logs:
+      captureUser: false
+      captureOrganization: true
 ```
 
 ---
 
+## Migration Notes
+
+During reconciliation, the controller copies `Tenant.spec.apiKeys` and `Tenant.spec.telemetry` into `MaasTenantConfig/default-tenant` when those fields are not already set. Legacy `Tenant.spec.gatewayRef` and `Tenant.spec.externalOIDC` are migrated to the owning `AITenant` where possible, because Gateway and OIDC are platform context rather than MaaS runtime configuration.
+
+The copy is fill-only: if `MaasTenantConfig/default-tenant` already has `spec.apiKeys` or `spec.telemetry`, the controller does not overwrite those fields from the legacy `Tenant`. Treat `MaasTenantConfig` as the source of truth after it exists.
+
+After migration, the controller marks the legacy singleton as migrated and removes it only after verifying that the expected AITenant-managed `MaasTenantConfig/default-tenant` exists and contains the migrated configuration. If the target is missing, ownership or tenant-namespace metadata does not match, copied configuration is incomplete, or the controller migration markers are absent, the legacy `Tenant/default-tenant` is not deleted. Note that migration markers and annotations may already have been applied to the legacy object even when deletion is skipped.
+
+A namespace that only has the legacy `Tenant/default-tenant` object is unsupported after this migration. Admission compatibility may still allow older tenant-scoped resources during the grace window, but platform workload reconciliation runs from `MaasTenantConfig/default-tenant`; restore the owning `AITenant` bootstrap or create the `MaasTenantConfig` singleton before relying on that namespace.
+
 ## Related Documentation
 
+- [AITenant CRD](ai-tenant.md) - Tenant namespace, Gateway, OIDC, and tenant-admin RBAC
 - [MaaSModelRef CRD](maas-model-ref.md) - Model endpoint references
 - [MaaSAuthPolicy CRD](maas-auth-policy.md) - Access control policies
 - [MaaSSubscription CRD](maas-subscription.md) - Subscription and rate limiting

@@ -195,6 +195,58 @@ export AUTHORINO_MIN_VERSION="0.22.0"
 export LIMITADOR_MIN_VERSION="0.16.0"
 export DNS_OPERATOR_MIN_VERSION="0.15.0"
 
+# resolve_policy_engine_namespace returns the namespace where RHCL/Kuadrant workloads run.
+# Optional argument: policy engine name (rhcl|kuadrant). Defaults to POLICY_ENGINE env or auto-detect.
+resolve_policy_engine_namespace() {
+  local policy_engine="${1:-${POLICY_ENGINE:-}}"
+  local default_ns="${RHCL_NAMESPACE:-kuadrant-system}"
+  if [[ -z "$policy_engine" ]]; then
+    if kubectl get ns kuadrant-system &>/dev/null \
+      && kubectl get deploy authorino -n kuadrant-system &>/dev/null 2>&1; then
+      echo "kuadrant-system"
+      return
+    fi
+    if kubectl get ns rh-connectivity-link &>/dev/null \
+      && kubectl get deploy authorino -n rh-connectivity-link &>/dev/null 2>&1; then
+      echo "rh-connectivity-link"
+      return
+    fi
+    echo "$default_ns"
+    return
+  fi
+  case "$policy_engine" in
+    rhcl|kuadrant) echo "$default_ns" ;;
+    *)
+      log_warn "Unknown policy engine '$policy_engine', defaulting to $default_ns"
+      echo "$default_ns"
+      ;;
+  esac
+}
+
+# resolve_authorino_namespace returns the namespace where Authorino runs.
+resolve_authorino_namespace() {
+  resolve_policy_engine_namespace "$@"
+}
+
+# wait_for_gateway_programmed polls until a Gateway reaches Programmed=True.
+wait_for_gateway_programmed() {
+  local gateway_name="${1:?gateway name required}"
+  local gateway_ns="${2:-openshift-ingress}"
+  local timeout="${3:-600}"
+
+  echo "Waiting for Gateway ${gateway_ns}/${gateway_name} to be Programmed=True (timeout: ${timeout}s)..."
+
+  if oc wait "gateway/${gateway_name}" -n "${gateway_ns}" --for=condition=Programmed --timeout="${timeout}s"; then
+    echo "✅ Gateway ${gateway_ns}/${gateway_name} is Programmed"
+    return 0
+  fi
+
+  echo "❌ ERROR: Gateway ${gateway_ns}/${gateway_name} did not reach Programmed=True within ${timeout}s"
+  oc get "gateway/${gateway_name}" -n "${gateway_ns}" -o wide || true
+  oc describe "gateway/${gateway_name}" -n "${gateway_ns}" || true
+  return 1
+}
+
 # ==========================================
 # Logging Functions
 # ==========================================
@@ -272,6 +324,85 @@ patch_csv_operator_container_env() {
   return 0
 }
 
+# Set resources on spec.install.spec.deployments[0].containers[0] of a ClusterServiceVersion.
+# <resources_json> replaces the container's resources as a whole.
+# Returns 0 if a patch was applied, 1 if the value was already correct, 2 if patch failed.
+patch_csv_operator_container_resources() {
+  local namespace=$1
+  local csv_name=$2
+  local resources_json=$3
+
+  local current desired
+  current=$(kubectl get csv "$csv_name" -n "$namespace" -o json 2>/dev/null \
+    | jq -cS '.spec.install.spec.deployments[0].spec.template.spec.containers[0].resources // {}' 2>/dev/null || echo "")
+  desired=$(jq -cS . <<<"$resources_json")
+
+  if [[ "$current" == "$desired" ]]; then
+    return 1
+  fi
+
+  log_debug "Setting resources on CSV ${csv_name}: ${desired} (was: ${current:-unknown})"
+  kubectl patch csv "$csv_name" -n "$namespace" --type='json' -p="[
+    {
+      \"op\": \"add\",
+      \"path\": \"/spec/install/spec/deployments/0/spec/template/spec/containers/0/resources\",
+      \"value\": ${desired}
+    }
+  ]" 2>/dev/null || {
+    log_warn "Failed to set resources on CSV ${csv_name}"
+    return 2
+  }
+  return 0
+}
+
+# Patch one or more RELATED_IMAGE_* env vars on an operator's CSV and force-restart it so
+# the new values take effect (operators read their own env vars once, at process startup).
+# Used to override sub-component images (e.g. ai-gateway-operator, maas-controller, maas-api)
+# that the ODH operator's module/component reconcilers read from their own container env.
+#
+# Arguments: <namespace> <csv_name_prefix> <NAME=VALUE> [<NAME=VALUE> ...]
+# Entries with an empty VALUE are skipped (so callers can pass through unset overrides safely).
+patch_operator_related_images() {
+  local namespace=$1
+  local operator_prefix=$2
+  shift 2
+
+  local pairs=("$@")
+  [[ ${#pairs[@]} -eq 0 ]] && return 0
+
+  local has_value=false
+  local pair
+  for pair in "${pairs[@]}"; do
+    [[ -n "${pair#*=}" ]] && has_value=true
+  done
+  [[ "$has_value" == "true" ]] || return 0
+
+  local csv_name
+  csv_name=$(kubectl get csv -n "$namespace" --no-headers 2>/dev/null | grep "^${operator_prefix}" | awk '{print $1}' | head -1)
+  if [[ -z "$csv_name" ]]; then
+    log_warn "Could not find CSV for $operator_prefix in $namespace, skipping RELATED_IMAGE patch"
+    return 0
+  fi
+
+  local patched_any=false
+  local pair name value
+  for pair in "${pairs[@]}"; do
+    name="${pair%%=*}"
+    value="${pair#*=}"
+    [[ -z "$value" ]] && continue
+    log_info "Setting ${name}=${value} on ${csv_name}..."
+    patch_csv_operator_container_env "$namespace" "$csv_name" "$name" "$value" && patched_any=true
+  done
+
+  if [[ "$patched_any" != "true" ]]; then
+    log_debug "CSV $csv_name already has the requested RELATED_IMAGE values"
+    return 0
+  fi
+
+  log_info "Restarting $operator_prefix operator to pick up RELATED_IMAGE changes..."
+  kubectl delete pod -n "$namespace" -l control-plane=controller-manager --force --grace-period=0 2>/dev/null || true
+}
+
 # Patch Kuadrant/RHCL CSV to recognize OpenShift Gateway controller
 # This is required because Kuadrant needs to know about the Gateway API provider
 # Without this patch, Kuadrant shows "MissingDependency" and AuthPolicies won't be enforced
@@ -279,12 +410,16 @@ patch_csv_operator_container_env() {
 # Also sets RATELIMIT_*_SERVICE_FAILURE_MODE=deny so policy fails closed when Limitador
 # service is unavailable (see Kuadrant operator deployment env).
 #
+# Also raises the operator's resources. The upstream 200m CPU / 300Mi memory limits
+# get it OOMKilled or failing probes while it renders the wasm config for many
+# TokenRateLimitPolicies, and TRLPs are not enforced until it recovers.
+#
 # Arguments: <namespace> <csv_name_prefix>  e.g. patch_kuadrant_csv "kuadrant-system" "kuadrant-operator"
 patch_kuadrant_csv() {
   local namespace=$1
   local operator_prefix=$2
 
-  log_info "Patching $operator_prefix CSV (Gateway API, rate limit failure modes)..."
+  log_info "Patching $operator_prefix CSV (Gateway API, rate limit failure modes, auth service timeout, resources)..."
 
   # Find the CSV
   local csv_name
@@ -305,12 +440,22 @@ patch_kuadrant_csv() {
   patch_csv_operator_container_env "$namespace" "$csv_name" "RATELIMIT_CHECK_SERVICE_FAILURE_MODE" "deny" && patched_any=true
   patch_csv_operator_container_env "$namespace" "$csv_name" "RATELIMIT_REPORT_SERVICE_FAILURE_MODE" "deny" && patched_any=true
 
+  # --- Auth service timeout (RHOAIENG-79789) ---
+  patch_csv_operator_container_env "$namespace" "$csv_name" "AUTH_SERVICE_TIMEOUT" "2s" && patched_any=true
+
+  # --- Operator resources ---
+  local operator_memory_limit="1Gi"
+  local operator_resources
+  operator_resources=$(jq -nc --arg mem "$operator_memory_limit" \
+    '{requests: {cpu: "200m", memory: "512Mi"}, limits: {cpu: "1", memory: $mem}}')
+  patch_csv_operator_container_resources "$namespace" "$csv_name" "$operator_resources" && patched_any=true
+
   if [[ "$patched_any" != "true" ]]; then
-    log_debug "CSV already has all required operator env (Gateway + rate limit failure modes)"
+    log_debug "CSV already has all required operator env and resources (Gateway + rate limit failure modes + auth timeout + resources)"
     return 0
   fi
 
-  log_info "CSV patched (Gateway controller and/or rate limit failure modes)"
+  log_info "CSV patched (Gateway controller and/or rate limit failure modes and/or auth timeout and/or resources)"
 
   # CRITICAL: Force delete the operator pod to pick up the new env var
   # OLM updates the deployment spec but doesn't always trigger a pod restart
@@ -338,10 +483,20 @@ patch_kuadrant_csv() {
 
     if echo "$pod_env" | grep '^ISTIO_GATEWAY_CONTROLLER_NAMES=' | grep -q 'openshift.io/gateway-controller/v1' \
       && echo "$pod_env" | grep -Fq 'RATELIMIT_CHECK_SERVICE_FAILURE_MODE=deny' \
-      && echo "$pod_env" | grep -Fq 'RATELIMIT_REPORT_SERVICE_FAILURE_MODE=deny'; then
-      log_info "Operator pod has required CSV env (ISTIO gateway controller + RATELIMIT_* failure modes)"
+      && echo "$pod_env" | grep -Fq 'RATELIMIT_REPORT_SERVICE_FAILURE_MODE=deny' \
+      && echo "$pod_env" | grep -Fq 'AUTH_SERVICE_TIMEOUT=2s'; then
+      log_info "Operator pod has required CSV env (ISTIO gateway controller + RATELIMIT_* failure modes + AUTH_SERVICE_TIMEOUT)"
     else
-      log_warn "Operator pod may not have correct env yet (ISTIO / RATELIMIT_* failure modes)"
+      log_warn "Operator pod may not have correct env yet (ISTIO / RATELIMIT_* failure modes / AUTH_SERVICE_TIMEOUT)"
+    fi
+
+    local memory_limit
+    memory_limit=$(kubectl get deployment "$operator_deployment" -n "$namespace" \
+      -o jsonpath='{.spec.template.spec.containers[0].resources.limits.memory}' 2>/dev/null || true)
+    if [[ "$memory_limit" == "$operator_memory_limit" ]]; then
+      log_info "Operator deployment has memory limit ${memory_limit}"
+    else
+      log_warn "Operator deployment memory limit is '${memory_limit}', expected ${operator_memory_limit}"
     fi
 
     # Give the operator time to fully initialize with the new Gateway controller configuration
@@ -870,82 +1025,6 @@ find_project_root() {
   fi
 }
 
-# _patch_params_env key value project_root
-#   Patches a key=value line in params.env. Creates a backup on first call.
-_patch_params_env() {
-  local key="$1" value="$2" project_root="$3"
-  local overlay="odh"
-  [[ "${DEV_MODE:-false}" == "true" ]] && overlay="dev"
-  export _MAAS_PARAMS_ENV="$project_root/deployment/overlays/$overlay/params.env"
-  [ -f "$_MAAS_PARAMS_ENV" ] || return 0
-  export _MAAS_PARAMS_ENV_BACKUP="${_MAAS_PARAMS_ENV}.backup"
-  if [ ! -f "$_MAAS_PARAMS_ENV_BACKUP" ]; then
-    cp "$_MAAS_PARAMS_ENV" "$_MAAS_PARAMS_ENV_BACKUP"
-  fi
-  local sed_cmd="sed"
-  [[ "$(uname -s)" == "Darwin" ]] && sed_cmd="gsed"
-  $sed_cmd -i "s|^${key}=.*|${key}=${value}|" "$_MAAS_PARAMS_ENV"
-}
-
-# _cleanup_params_env
-#   Restores params.env from backup. Safe to call multiple times.
-_cleanup_params_env() {
-  if [ -n "${_MAAS_PARAMS_ENV_BACKUP:-}" ] && [ -f "$_MAAS_PARAMS_ENV_BACKUP" ]; then
-    mv -f "$_MAAS_PARAMS_ENV_BACKUP" "$_MAAS_PARAMS_ENV" 2>/dev/null || true
-  fi
-}
-
-# set_maas_api_image
-#   Sets the MaaS API container image in base kustomization using MAAS_API_IMAGE env var.
-#   If MAAS_API_IMAGE is not set, does nothing.
-#   Creates a backup that must be restored by calling cleanup_maas_api_image.
-#
-# Environment:
-#   MAAS_API_IMAGE - Container image to use (e.g., quay.io/opendatahub/maas-api:pr-123)
-set_maas_api_image() {
-  if [ -z "${MAAS_API_IMAGE:-}" ]; then
-    return 0
-  fi
-  if [ -n "${_MAAS_API_IMAGE_SET:-}" ]; then
-    return 0
-  fi
-
-  local project_root
-  project_root="$(find_project_root)" || {
-    echo "Error: failed to find project root" >&2
-    return 1
-  }
-
-  export _MAAS_API_KUSTOMIZATION="$project_root/deployment/base/maas-api/core/kustomization.yaml"
-  export _MAAS_API_BACKUP="${_MAAS_API_KUSTOMIZATION}.backup"
-  export _MAAS_API_IMAGE_SET=1
-
-  echo "   Setting MaaS API image: ${MAAS_API_IMAGE}"
-  cp "$_MAAS_API_KUSTOMIZATION" "$_MAAS_API_BACKUP" || {
-    echo "Error: failed to create backup of kustomization.yaml" >&2
-    return 1
-  }
-  (cd "$(dirname "$_MAAS_API_KUSTOMIZATION")" && kustomize edit set image "maas-api=${MAAS_API_IMAGE}") || {
-    echo "Error: failed to set image in kustomization.yaml" >&2
-    mv -f "$_MAAS_API_BACKUP" "$_MAAS_API_KUSTOMIZATION" 2>/dev/null || true
-    return 1
-  }
-
-  # Patch params.env — kustomize replacements in shared-patches read from this
-  # file and override the base images: transformer set above.
-  _patch_params_env "maas-api-image" "$MAAS_API_IMAGE" "$project_root"
-}
-
-# cleanup_maas_api_image
-#   Restores the original kustomization.yaml and params.env from backup.
-#   Safe to call even if set_maas_api_image was not called or MAAS_API_IMAGE was not set.
-cleanup_maas_api_image() {
-  if [ -n "${_MAAS_API_BACKUP:-}" ] && [ -f "$_MAAS_API_BACKUP" ]; then
-    mv -f "$_MAAS_API_BACKUP" "$_MAAS_API_KUSTOMIZATION" 2>/dev/null || true
-  fi
-  _cleanup_params_env
-}
-
 # set_overlay_namespace overlay_dir namespace
 #   Sets the namespace in the overlay's kustomization.yaml before build.
 #   Creates a backup that must be restored by calling cleanup_overlay_namespace.
@@ -1381,7 +1460,9 @@ cleanup_custom_catalogsource() {
 }
 
 # wait_datasciencecluster_ready [name] [timeout]
-#   Waits for a DataScienceCluster's KServe and ModelsAsService components to be ready.
+#   Waits for a DataScienceCluster's KServe component (and AIGateway, if enabled) to be
+#   ready. Does NOT gate on ModelsAsServiceReady — see the comment inside the loop below
+#   for why that condition isn't a usable signal at this function's call sites.
 #
 # Arguments:
 #   name    - Name of the DataScienceCluster (default: default-dsc)
@@ -1395,7 +1476,13 @@ wait_datasciencecluster_ready() {
   local interval=20
   local elapsed=0
 
-  echo "* Waiting for DataScienceCluster '$name' KServe and ModelsAsService components to be ready..."
+  echo "* Waiting for DataScienceCluster '$name' KServe component to be ready..."
+
+  # AIGateway is only expected to be Managed/ready when the caller asked deploy.sh to pin
+  # an ai-gateway-operator image (see enable_ai_gateway_component). Only gate on it then —
+  # otherwise a cluster without AI Gateway enabled would never satisfy this check.
+  local require_aigateway=false
+  [[ -n "${AI_GATEWAY_OPERATOR_IMAGE:-}" ]] && require_aigateway=true
 
   while [ $elapsed -lt $timeout ]; do
     # Grab full DSC status as JSON
@@ -1409,34 +1496,43 @@ wait_datasciencecluster_ready() {
       continue
     fi
 
-    local kserve_state kserve_ready maas_ready model_controller_ready
+    local kserve_state kserve_ready maas_ready aigateway_ready aigateway_message
     kserve_state=$(echo "$dsc_json" | jq -r '.status.components.kserve.managementState // ""')
     kserve_ready=$(echo "$dsc_json" | jq -r '.status.conditions[]? | select(.type=="KserveReady") | .status' | tail -n1)
     maas_ready=$(echo "$dsc_json" | jq -r '.status.conditions[]? | select(.type=="ModelsAsServiceReady") | .status' | tail -n1)
-    model_controller_ready=$(echo "$dsc_json" | jq -r '.status.conditions[]? | select(.type=="ModelControllerReady") | .status' | tail -n1)
+    aigateway_ready=$(echo "$dsc_json" | jq -r '.status.conditions[]? | select(.type=="AIGatewayReady") | .status' | tail -n1)
+    aigateway_message=$(echo "$dsc_json" | jq -r '.status.conditions[]? | select(.type=="AIGatewayReady") | .message' | tail -n1)
 
-    # v2 API: ModelsAsServiceReady doesn't exist, use ModelControllerReady instead
-    # v1 API: ModelsAsServiceReady exists but may stay False
-    # Use ModelControllerReady as fallback if ModelsAsServiceReady is not True
-    # This handles both v2 API (no ModelsAsServiceReady condition) and v1 API (condition exists but may stay False)
-    local maas_check="$maas_ready"
-    if [[ "$maas_ready" != "True" && "$model_controller_ready" == "True" ]]; then
-      maas_check="$model_controller_ready"
+    # ModelsAsServiceReady is NOT gated on here. Per the ModelsAsService component's own
+    # reconciler (opendatahub-operator internal/controller/components/modelsasservice), this
+    # condition just mirrors the maas-controller-owned Tenant CR's Ready status — and
+    # maas-controller isn't installed yet at any of this function's call sites (kustomize mode
+    # installs it via deploy.sh only after this DSC-readiness wait returns; operator mode's
+    # AIGateway module deploys it asynchronously afterward too). So ModelsAsServiceReady can
+    # never legitimately be True here — it isn't a usable readiness signal at this point in
+    # either deploy mode. Real maas-controller/Tenant readiness is verified later, once it
+    # actually exists (see wait_for_resource "deployment" "maas-controller" in deploy.sh).
+    # We still surface it below purely for diagnostics.
+    if [[ "$require_aigateway" == "true" && "$aigateway_ready" == "False" && -n "$aigateway_message" ]]; then
+      echo "  ERROR: AIGateway failed to reconcile in DataScienceCluster/$name: $aigateway_message"
+      echo "  This is a real deployment gap (not a transient state) — failing fast instead of waiting out the full timeout."
+      return 1
     fi
 
-    if [[ "$kserve_state" == "Managed" && "$kserve_ready" == "True" && "$maas_check" == "True" ]]; then
-      echo "  * KServe and ModelsAsService are ready in DataScienceCluster '$name'"
+    if [[ "$kserve_state" == "Managed" && "$kserve_ready" == "True" ]] \
+      && { [[ "$require_aigateway" != "true" ]] || [[ "$aigateway_ready" == "True" ]]; }; then
+      echo "  * KServe (and AIGateway, if applicable) are ready in DataScienceCluster '$name'"
       return 0
     else
-      echo "  - KServe state: $kserve_state, KserveReady: $kserve_ready, ModelsAsServiceReady: $maas_ready, ModelControllerReady: $model_controller_ready"
+      echo "  - KServe state: $kserve_state, KserveReady: $kserve_ready, ModelsAsServiceReady: ${maas_ready:-<absent>} (informational only), AIGatewayReady: ${aigateway_ready:-<n/a>}"
     fi
 
     sleep $interval
     elapsed=$((elapsed + interval))
   done
 
-  echo "  ERROR: KServe and/or ModelsAsService did not become ready in DataScienceCluster/$name within $timeout seconds."
-  echo "  Final status: KServe=$kserve_state, KserveReady=$kserve_ready, ModelsAsServiceReady=$maas_ready, ModelControllerReady=$model_controller_ready"
+  echo "  ERROR: KServe/AIGateway did not become ready in DataScienceCluster/$name within $timeout seconds."
+  echo "  Final status: KServe=$kserve_state, KserveReady=$kserve_ready, ModelsAsServiceReady=${maas_ready:-<absent>} (informational only), AIGatewayReady=${aigateway_ready:-<n/a>}"
   echo "  Tip: Check 'kubectl describe datasciencecluster $name' for more details"
   return 1
 }
@@ -1605,6 +1701,52 @@ wait_authorino_ready() {
 }
 
 # ==========================================
+# External OIDC / AuthPolicy alignment
+# ==========================================
+
+# verify_gateway_oidc_authpolicy <gateway_namespace>
+# When OIDC_ISSUER_URL is set, verify the gateway-level maas-gateway-auth AuthPolicy
+# contains oidc-identities authentication with the correct issuer URL.
+# This is the consolidated gateway AuthPolicy that replaces the per-route
+# maas-api-auth-policy for OIDC configuration.
+# Returns 0 if skipped (no OIDC_ISSUER_URL) or match; 1 on failure.
+verify_gateway_oidc_authpolicy() {
+  local ns="${1:-openshift-ingress}"
+  if [[ -z "${OIDC_ISSUER_URL:-}" ]]; then
+    return 0
+  fi
+  if ! command -v jq &>/dev/null; then
+    echo "verify_gateway_oidc_authpolicy: jq not found; skipping OIDC issuer check" >&2
+    return 0
+  fi
+  local json
+  if ! json=$(kubectl get authpolicy maas-gateway-auth -n "$ns" -o json 2>/dev/null); then
+    echo "verify_gateway_oidc_authpolicy: could not read authpolicy/maas-gateway-auth in namespace $ns" >&2
+    return 1
+  fi
+  local policy_issuer
+  # Try v1 structure first (.spec.rules), then fall back to v1beta2 (.spec.defaults.rules)
+  # TenantReconciler uses v1 structure; MaaSAuthPolicyReconciler still uses v1beta2 structure
+  policy_issuer=$(echo "$json" | jq -r '.spec.rules.authentication["oidc-identities"].jwt.issuerUrl // .spec.defaults.rules.authentication["oidc-identities"].jwt.issuerUrl // empty')
+  if [[ -z "$policy_issuer" ]]; then
+    echo "verify_gateway_oidc_authpolicy: maas-gateway-auth has no oidc-identities authentication rule" >&2
+    echo "  Ensure the default AITenant has spec.oidc configured and MaaSAuthPolicy controller has reconciled." >&2
+    return 1
+  fi
+  local exp got
+  exp="${OIDC_ISSUER_URL%/}"
+  got="${policy_issuer%/}"
+  if [[ "$exp" != "$got" ]]; then
+    echo "verify_gateway_oidc_authpolicy: OIDC issuer mismatch." >&2
+    echo "  Expected (OIDC_ISSUER_URL):          $exp" >&2
+    echo "  Live maas-gateway-auth issuerUrl:   $got" >&2
+    echo "  Fix: ensure AITenant spec.oidc.issuerUrl matches OIDC_ISSUER_URL." >&2
+    return 1
+  fi
+  return 0
+}
+
+# ==========================================
 # Database Secret Helpers
 # ==========================================
 
@@ -1747,4 +1889,256 @@ dump_llmis_diagnostics() {
     echo "=========================================="
     echo "End of diagnostics for: $llmis_name"
     echo "=========================================="
+}
+
+# ==========================================
+# Gateway AllowedRoutes Helpers
+# ==========================================
+
+# _allowed_routes_same_yaml <indent_string>
+#   Emits the secure-default allowedRoutes YAML block (from: Same).
+_allowed_routes_same_yaml() {
+  local I="$1"
+  printf '%s' \
+"${I}allowedRoutes:
+${I}  namespaces:
+${I}    from: Same"
+}
+
+# _is_valid_dns1123_label <value>
+#   Returns 0 if value is a DNS-1123 label (safe to embed in YAML/JSON quotes).
+_is_valid_dns1123_label() {
+  local v="$1"
+  [[ ${#v} -le 63 ]] && [[ "$v" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]
+}
+
+# _is_valid_k8s_label_key <key>
+#   Returns 0 if key is a valid Kubernetes label key (name or prefix/name).
+_is_valid_k8s_label_key() {
+  local key="$1" name prefix
+  [[ -z "$key" || ${#key} -gt 253 ]] && return 1
+  if [[ "$key" == */* ]]; then
+    prefix="${key%/*}"
+    name="${key##*/}"
+    [[ -z "$prefix" || -z "$name" ]] && return 1
+    # Prefix: DNS subdomain; name: DNS-1123 label with optional dots/underscores mid-segment
+    [[ "$prefix" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$ ]] || return 1
+    [[ ${#name} -le 63 && "$name" =~ ^[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?$ ]] || return 1
+    return 0
+  fi
+  [[ ${#key} -le 63 && "$key" =~ ^[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?$ ]]
+}
+
+# _is_valid_k8s_label_value <value>
+#   Returns 0 if value is a valid Kubernetes label value (or empty).
+_is_valid_k8s_label_value() {
+  local v="$1"
+  [[ -z "$v" ]] && return 0
+  [[ ${#v} -le 63 && "$v" =~ ^[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?$ ]]
+}
+
+# build_allowed_routes_yaml <indent>
+#   Generates the allowedRoutes YAML block for a Gateway listener at the given
+#   indentation level. Designed for embedding directly into heredoc manifests.
+#
+#   Uses env vars (see below) to pick a mode:
+#     ALLOWED_ROUTE_NAMESPACES  → from: Selector with matchExpressions on
+#                                  kubernetes.io/metadata.name (namespace name list)
+#     NAMESPACE_SELECTOR_LABELS → from: Selector with matchLabels (label filter)
+#     (neither / invalid)       → from: Same (secure default; only the Gateway's
+#                                  own namespace can attach HTTPRoutes)
+#
+# Arguments:
+#   indent - Number of spaces for the 'allowedRoutes:' key (default: 6)
+#
+# Environment:
+#   ALLOWED_ROUTE_NAMESPACES  - Comma-separated namespace names, e.g. "opendatahub,llm"
+#   NAMESPACE_SELECTOR_LABELS - Comma-separated key=value pairs, e.g. "gateway-access=true"
+build_allowed_routes_yaml() {
+  local indent="${1:-6}"
+  local I
+  I="$(printf '%*s' "$indent" '')"
+
+  if [[ -n "${ALLOWED_ROUTE_NAMESPACES:-}" ]]; then
+    local values_lines="" _ns
+    IFS=',' read -ra _ns_arr <<< "$ALLOWED_ROUTE_NAMESPACES"
+    for _ns in "${_ns_arr[@]}"; do
+      _ns="${_ns//[[:space:]]/}"
+      [[ -z "$_ns" ]] && continue
+      if ! _is_valid_dns1123_label "$_ns"; then
+        log_warn "Ignoring invalid namespace name in ALLOWED_ROUTE_NAMESPACES: ${_ns}"
+        continue
+      fi
+      values_lines+="${I}        - \"${_ns}\""$'\n'
+    done
+    if [[ -z "$values_lines" ]]; then
+      # Empty/invalid list would emit values:[] which matches nothing and is not
+      # a useful config — fall back to the secure default instead.
+      log_warn "ALLOWED_ROUTE_NAMESPACES has no valid namespace names; falling back to from: Same"
+      _allowed_routes_same_yaml "$I"
+      return 0
+    fi
+    printf '%s' \
+"${I}allowedRoutes:
+${I}  namespaces:
+${I}    from: Selector
+${I}    selector:
+${I}      matchExpressions:
+${I}      - key: kubernetes.io/metadata.name
+${I}        operator: In
+${I}        values:
+${values_lines}"
+  elif [[ -n "${NAMESPACE_SELECTOR_LABELS:-}" ]]; then
+    local labels_lines="" _pair _key _val
+    IFS=',' read -ra _pairs <<< "$NAMESPACE_SELECTOR_LABELS"
+    for _pair in "${_pairs[@]}"; do
+      _pair="${_pair//[[:space:]]/}"
+      [[ -z "$_pair" || "$_pair" != *=* ]] && continue
+      _key="${_pair%%=*}"
+      _val="${_pair#*=}"
+      if [[ -z "$_key" ]] || ! _is_valid_k8s_label_key "$_key" || ! _is_valid_k8s_label_value "$_val"; then
+        log_warn "Ignoring invalid label selector pair in NAMESPACE_SELECTOR_LABELS: ${_pair}"
+        continue
+      fi
+      labels_lines+="${I}        ${_key}: \"${_val}\""$'\n'
+    done
+    if [[ -z "$labels_lines" ]]; then
+      # No valid key=value pairs — fall back to the secure default instead of
+      # emitting an empty matchLabels selector, which would match all namespaces.
+      log_warn "NAMESPACE_SELECTOR_LABELS has no valid key=value pairs; falling back to from: Same"
+      _allowed_routes_same_yaml "$I"
+      return 0
+    fi
+    printf '%s' \
+"${I}allowedRoutes:
+${I}  namespaces:
+${I}    from: Selector
+${I}    selector:
+${I}      matchLabels:
+${labels_lines}"
+  else
+    _allowed_routes_same_yaml "$I"
+  fi
+}
+
+# build_allowed_routes_json
+#   Outputs the allowedRoutes value as JSON for use with kubectl patch --type=json.
+#   Uses the same ALLOWED_ROUTE_NAMESPACES / NAMESPACE_SELECTOR_LABELS env vars
+#   as build_allowed_routes_yaml; defaults to {"namespaces":{"from":"Same"}}.
+build_allowed_routes_json() {
+  if [[ -n "${ALLOWED_ROUTE_NAMESPACES:-}" ]]; then
+    local values="" _ns
+    IFS=',' read -ra _ns_arr <<< "$ALLOWED_ROUTE_NAMESPACES"
+    for _ns in "${_ns_arr[@]}"; do
+      _ns="${_ns//[[:space:]]/}"
+      [[ -z "$_ns" ]] && continue
+      if ! _is_valid_dns1123_label "$_ns"; then
+        log_warn "Ignoring invalid namespace name in ALLOWED_ROUTE_NAMESPACES: ${_ns}" >&2
+        continue
+      fi
+      [[ -n "$values" ]] && values+=","
+      values+="\"${_ns}\""
+    done
+    if [[ -z "$values" ]]; then
+      log_warn "ALLOWED_ROUTE_NAMESPACES has no valid namespace names; falling back to from: Same" >&2
+      printf '{"namespaces":{"from":"Same"}}'
+      return 0
+    fi
+    printf '{"namespaces":{"from":"Selector","selector":{"matchExpressions":[{"key":"kubernetes.io/metadata.name","operator":"In","values":[%s]}]}}}' "$values"
+  elif [[ -n "${NAMESPACE_SELECTOR_LABELS:-}" ]]; then
+    local labels_json="{" first=true _pair _key _val
+    IFS=',' read -ra _pairs <<< "$NAMESPACE_SELECTOR_LABELS"
+    for _pair in "${_pairs[@]}"; do
+      _pair="${_pair//[[:space:]]/}"
+      [[ -z "$_pair" || "$_pair" != *=* ]] && continue
+      _key="${_pair%%=*}"
+      _val="${_pair#*=}"
+      if [[ -z "$_key" ]] || ! _is_valid_k8s_label_key "$_key" || ! _is_valid_k8s_label_value "$_val"; then
+        log_warn "Ignoring invalid label selector pair in NAMESPACE_SELECTOR_LABELS: ${_pair}" >&2
+        continue
+      fi
+      [[ "$first" == "true" ]] && first=false || labels_json+=","
+      labels_json+="\"${_key}\":\"${_val}\""
+    done
+    labels_json+="}"
+    if [[ "$labels_json" == "{}" ]]; then
+      # No valid key=value pairs — fall back to the secure default instead of
+      # emitting matchLabels:{} which matches all namespaces.
+      log_warn "NAMESPACE_SELECTOR_LABELS has no valid key=value pairs; falling back to from: Same" >&2
+      printf '{"namespaces":{"from":"Same"}}'
+      return 0
+    fi
+    printf '{"namespaces":{"from":"Selector","selector":{"matchLabels":%s}}}' "$labels_json"
+  else
+    printf '{"namespaces":{"from":"Same"}}'
+  fi
+}
+
+# patch_gateway_allowed_routes <gateway_name> <gateway_namespace>
+#   Ensures ALL listeners' allowedRoutes on an existing Gateway match the desired
+#   configuration. Patches when:
+#     - Any listener has an insecure allowedRoutes default, OR
+#     - ALLOWED_ROUTE_NAMESPACES or NAMESPACE_SELECTOR_LABELS is set (applies user config)
+#   Skips when all listeners are already at a secure non-All state and no custom
+#   config is requested. Applies the same allowedRoutes to every listener so that
+#   multi-listener Gateways (e.g. HTTP + HTTPS) are patched consistently.
+#
+# Arguments:
+#   gateway_name      - Name of the Gateway resource
+#   gateway_namespace - Namespace of the Gateway
+patch_gateway_allowed_routes() {
+  local gateway_name="$1"
+  local gateway_namespace="$2"
+
+  # Count listeners without requiring jq: emit one 'x' per listener then count chars.
+  local listener_count
+  if ! listener_count=$(kubectl get gateway "$gateway_name" -n "$gateway_namespace" \
+    -o jsonpath='{range .spec.listeners[*]}x{end}' 2>/dev/null | wc -c | tr -d ' '); then
+    log_error "Unable to read Gateway ${gateway_namespace}/${gateway_name} for allowedRoutes update"
+    return 1
+  fi
+  if [[ "$listener_count" -eq 0 ]]; then
+    log_debug "  Gateway ${gateway_namespace}/${gateway_name} has no listeners — skipping allowedRoutes patch"
+    return 0
+  fi
+
+  local has_custom_config=false
+  [[ -n "${ALLOWED_ROUTE_NAMESPACES:-}" || -n "${NAMESPACE_SELECTOR_LABELS:-}" ]] && has_custom_config=true
+
+  # Check whether any listener still carries an insecure allowedRoutes default.
+  # Treat a read failure as needing a patch (fail closed) rather than silently skipping.
+  local any_all=false
+  local i current_from
+  for ((i=0; i<listener_count; i++)); do
+    if ! current_from=$(kubectl get gateway "$gateway_name" -n "$gateway_namespace" \
+      -o jsonpath="{.spec.listeners[$i].allowedRoutes.namespaces.from}" 2>/dev/null); then
+      log_warn "  Could not read listener $i allowedRoutes from Gateway ${gateway_namespace}/${gateway_name} — assuming patch needed"
+      any_all=true
+      break
+    fi
+    [[ "$current_from" == "All" ]] && any_all=true && break
+  done
+
+  # Skip if all listeners are already secure and no custom config is requested.
+  if [[ "$any_all" == "false" && "$has_custom_config" == "false" ]]; then
+    log_debug "  Gateway allowedRoutes already secure on all listeners — skipping"
+    return 0
+  fi
+
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    log_info "  [DRY RUN] Would update allowedRoutes on ${listener_count} listener(s)"
+    return 0
+  fi
+
+  log_info "  Updating Gateway allowedRoutes on ${listener_count} listener(s)..."
+  local json patch_ops="" sep=""
+  json="$(build_allowed_routes_json)"
+  # Build a single JSON patch array covering every listener.
+  # op:add is safe for both present and absent allowedRoutes fields (RFC 6902 §4.1).
+  for ((i=0; i<listener_count; i++)); do
+    patch_ops+="${sep}{\"op\":\"add\",\"path\":\"/spec/listeners/${i}/allowedRoutes\",\"value\":${json}}"
+    sep=","
+  done
+  kubectl patch gateway "$gateway_name" -n "$gateway_namespace" --type='json' \
+    -p="[${patch_ops}]"
 }

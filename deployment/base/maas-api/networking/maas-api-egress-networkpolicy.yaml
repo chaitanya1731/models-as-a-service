@@ -1,0 +1,52 @@
+# Egress NetworkPolicy for maas-api pods.
+#
+# maas-api handles API keys, tokens, and database credentials. Per the RHOAI
+# operand NetworkPolicy contract, sensitive workloads must declare explicit egress
+# behavior. PostgreSQL and other customer-provided dependencies cannot be narrowed
+# by portable pod selectors; see ODH-ADR-Operator-0016 and maas-setup.md.
+#
+# DNS and Kubernetes API rules document critical paths. maas-controller adds allow-all
+# egress at reconcile time unless maasconfig/default sets networkPolicyEgressRules.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: maas-api-egress-restrict
+  labels:
+    app.opendatahub.io/modelsasservice: "true"
+    app.kubernetes.io/part-of: maas
+    app.kubernetes.io/component: networking
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: maas-api
+      app.kubernetes.io/component: api
+      app.kubernetes.io/part-of: models-as-a-service
+  policyTypes:
+    - Egress
+  egress:
+    # DNS (OpenShift CoreDNS; allow both 53 and 5353 for OVN DNAT)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-dns
+          podSelector:
+            matchLabels:
+              dns.operator.openshift.io/daemonset-dns: default
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+        - protocol: UDP
+          port: 5353
+        - protocol: TCP
+          port: 5353
+    # Kubernetes API server. In-cluster clients use kubernetes.default (Service
+    # ClusterIP). OVN may evaluate egress against the VIP before apiserver
+    # endpoint DNAT, so namespaceSelector for openshift-kube-apiserver is not
+    # sufficient on all platforms (maas-group-test). Restrict by API ports only.
+    - ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443

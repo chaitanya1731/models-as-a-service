@@ -8,12 +8,13 @@ Kubernetes-native platform for managing inference model endpoints, built with Go
 
 ## Repository structure
 
-Two independent Go modules — **no root `go.mod` or root `Makefile`**. Always `cd` into the correct subproject before running Go tooling.
+Independent Go modules — **no root `go.mod` or root `Makefile`**. Always `cd` into the correct subproject before running Go tooling.
 
 | Directory | What it is |
 |-----------|-----------|
 | `maas-controller/` | Kubernetes controller (kubebuilder, controller-runtime) |
 | `maas-api/` | HTTP API service (keys, tokens, subscriptions) |
+| `maas-discovery/` | Tenant discovery service (multi-tenancy, ADR ODH-ADR-MS-0004) |
 | `deployment/` | Kustomize manifests (base, overlays, components) |
 | `docs/` | MkDocs user/admin documentation |
 | `test/e2e/` | pytest-based E2E tests |
@@ -43,6 +44,14 @@ make lint
 make test
 ```
 
+### maas-discovery (from maas-discovery/)
+
+```bash
+make lint
+make test
+make build    # full pipeline: tidy, lint, test, binary
+```
+
 ### Kustomize manifests (from repo root)
 
 ```bash
@@ -53,48 +62,54 @@ make test
 
 If you change any file under `maas-controller/api/` or modify `//+kubebuilder:rbac:` markers anywhere in `maas-controller/`, you **must** run `make -C maas-controller generate manifests` and include the generated files in your commit. CI will reject PRs with stale generated code.
 
+## RBAC changes: parent operator repos (required)
+
+RBAC for maas-controller is also consumed by parent operators. Any change that affects ClusterRole/Role rules, bindings, or `//+kubebuilder:rbac:` markers (including regenerated `deployment/base/maas-controller/rbac/` manifests) **must** be mirrored in both:
+
+- https://github.com/opendatahub-io/ai-gateway-operator/
+- https://github.com/opendatahub-io/opendatahub-operator
+
+### Before opening a PR in this repo
+
+If the developer asks an agent to create a PR and the branch includes RBAC changes:
+
+1. **Stop and remind them** that companion PRs are required in both parent repos above.
+2. Ask whether those PRs already exist (or whether the agent should help prepare them).
+3. Do **not** open this repo's PR until the developer confirms how to proceed.
+
+`.github/PULL_REQUEST_TEMPLATE.md` says how to record this in the PR description.
+
 ## Kustomize / deployment
 
 - `deployment/base/maas-controller/default` — operator bootstrap (CRDs, RBAC, Deployment, default CRs such as `Config`). `./scripts/deploy.sh` applies `deployment/base/maas-controller/crd` first and waits **Established**, then applies this bundle unchanged (avoids CRD/CR ordering issues on install).
 - `maas-api/deploy/overlays/odh` — tenant overlay rendered at runtime inside the controller container
-- `deployment/overlays/odh/params.env` — build-time defaults; runtime values come from Tenant CR via `CustomizeParams`
+- `deployment/base/maas-controller/default/params.env` — build-time defaults; runtime values come from ODH's environment variables
 - The controller image embeds `maas-api/deploy`, `deployment/base/maas-api`, components, and policies via Dockerfile COPY
 
 When editing Kustomize files, always run `./scripts/ci/validate-manifests.sh` before committing.
 
-## PR titles
+## Pull requests
 
-Semantic format required: `type: subject` (lowercase subject).
+Before you write a PR title or description, read `.github/PULL_REQUEST_TEMPLATE.md`. Its comments are the rules: follow them, then delete every one. `.github/PR_DESCRIPTION_EXAMPLES.md` shows the right size.
 
-Allowed types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`.
-
-## PR review process
+If the branch includes RBAC changes, follow **RBAC changes: parent operator repos** above before you open the PR.
 
 After creating a PR, immediately add a comment with `@coderabbitai review` to trigger automated code review.
-
-## PR description: risk analysis
-
-When you open or draft a pull request, include a **Risk analysis** in the PR body:
-
-- **Risk rating**: an integer from 0 (lowest) to 5 (highest).
-- **Why**: a short explanation of how you chose the rating (what could break, what is untested, or why it is safe).
-
-Use this scale consistently:
-
-| Rating | Typical meaning |
-|--------|-----------------|
-| 0 | Documentation-only or other changes with negligible runtime impact (e.g. typo fixes, clarifications under `docs/` that do not change product behavior). |
-| 1–3 | Any change to code (Go, scripts that affect builds/deploys, Kustomize, CI logic, etc.) is at least 1. Most code changes fall in 2–3 depending on scope, blast radius, and how well unit/integration tests cover the path. |
-| 4–5 | Automatically 4 or 5 if the behavior is unlikely to be covered by the Prow smoke path in `test/e2e/scripts/prow_run_smoke_test.sh` (review that script's steps and env flags — e.g. full deploy, API keys, subscriptions, models endpoints, deployment validation; paths gated by variables may not run in default CI). |
-| 4–5 | Automatically 4 or 5 for changes involving external systems or tight coupling to upstream operators (e.g. OpenDataHub / parent operator integration, operator catalog images, or contracts outside this repo). |
-
-If multiple rules apply, use the **highest** justified rating and explain the main drivers in **Why**.
 
 ## Testing conventions
 
 - Go tests use `testing` + `gomega` or `testify` — match the style of the package you're editing.
+- Behaviour that needs a real API server (defaulting, update strategies, server-side apply) is covered by Ginkgo specs on envtest: `maas-controller/pkg/testing` starts it, a `fixture` package next to the specs builds inputs, and `make test` downloads the binaries (plain `go test` skips these specs).
 - E2E tests are pytest under `test/e2e/tests/`.
 - New functionality must include tests.
+
+### E2E wait timeouts
+
+Defaults live in `test/e2e/tests/test_helper.py` (and optional `E2E_*` env overrides / `run_e2e_tests.sh` parallel exports). When calling `_wait_*` helpers:
+
+- **Do not pass `timeout=`** unless the value is **greater** than that helper’s default.
+- Every increasing override **must** have a one-line comment on the call explaining why the default is insufficient (e.g. Limitador backlog, dual-model bootstrap).
+- **Never** override to shorten a wait. If a shorter bound is truly required, change the helper default (or use a different helper) instead of a call-site decrease.
 
 ## Documentation policy
 
@@ -106,7 +121,7 @@ If multiple rules apply, use the **highest** justified rating and explain the ma
 ## Things to never do
 
 - Do not create a root-level `go.mod` or `Makefile`.
-- Do not guess image tags, registry paths, or namespace names — ask or check `params.env`.
+- Do not guess image tags, registry paths, or namespace names — ask or check `params.env` and `params.go`.
 - Do not edit `zz_generated.deepcopy.go` or CRD YAML by hand — always regenerate.
 - Do not create a new doc file without first confirming no existing file covers the same topic.
 

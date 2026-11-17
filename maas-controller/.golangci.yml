@@ -58,6 +58,9 @@ linters:
       ignore-string-values:
         - "true"
         - "false"
+    modernize:
+      disable:
+        - newexpr
     gocritic:
       enabled-checks:
         - deferInLoop
@@ -123,6 +126,9 @@ linters:
       - linters:
           - ireturn
         path: pkg/controller/maas/tenant_controller\.go
+      - linters:
+          - ireturn
+        path: pkg/controller/maas/self_deployment_controller\.go
       - linters:
           - ireturn
         path: pkg/reconciler/externalmodel/reconciler\.go

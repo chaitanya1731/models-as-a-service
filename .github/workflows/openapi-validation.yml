@@ -21,10 +21,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '20'
 
@@ -44,28 +44,30 @@ jobs:
 
           # Show summary
           if [ -f openapi-validation-report.json ]; then
-            echo "## OpenAPI Validation Summary" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## OpenAPI Validation Summary" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
 
             ERROR_COUNT=$(jq '[.[] | select(.severity == 0)] | length' openapi-validation-report.json)
             WARN_COUNT=$(jq '[.[] | select(.severity == 1)] | length' openapi-validation-report.json)
             INFO_COUNT=$(jq '[.[] | select(.severity == 2)] | length' openapi-validation-report.json)
             HINT_COUNT=$(jq '[.[] | select(.severity == 3)] | length' openapi-validation-report.json)
 
-            echo "- ❌ Errors: $ERROR_COUNT" >> $GITHUB_STEP_SUMMARY
-            echo "- ⚠️  Warnings: $WARN_COUNT" >> $GITHUB_STEP_SUMMARY
-            echo "- ℹ️  Info: $INFO_COUNT" >> $GITHUB_STEP_SUMMARY
-            echo "- 💡 Hints: $HINT_COUNT" >> $GITHUB_STEP_SUMMARY
+            {
+              echo "- ❌ Errors: $ERROR_COUNT"
+              echo "- ⚠️  Warnings: $WARN_COUNT"
+              echo "- ℹ️  Info: $INFO_COUNT"
+              echo "- 💡 Hints: $HINT_COUNT"
+            } >> "$GITHUB_STEP_SUMMARY"
 
             if [ "$ERROR_COUNT" -eq 0 ]; then
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "✅ **No errors found!** Spec is valid." >> $GITHUB_STEP_SUMMARY
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "✅ **No errors found!** Spec is valid." >> "$GITHUB_STEP_SUMMARY"
             fi
           fi
 
       - name: Upload Validation Report
         if: always()
-        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: openapi-validation-report
           path: openapi-validation-report.json
@@ -78,12 +80,12 @@ jobs:
 
     steps:
       - name: Checkout PR
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0  # Need full history for comparison
 
       - name: Setup Node.js
-        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '20'
 
@@ -112,30 +114,36 @@ jobs:
           git fetch origin "$BASE_REF"
           git show "origin/$BASE_REF:maas-api/openapi3.yaml" > base-spec.yaml
 
-          # Run breaking change detection
-          oasdiff breaking base-spec.yaml maas-api/openapi3.yaml > breaking-changes.txt || true
+          # Run breaking change detection (--err-ignore / --warn-ignore suppress acknowledged changes)
+          oasdiff breaking base-spec.yaml maas-api/openapi3.yaml \
+            --err-ignore maas-api/oasdiff-err-ignore.txt \
+            --warn-ignore maas-api/oasdiff-warn-ignore.txt > breaking-changes.txt || true
 
           # Check if actual breaking changes were detected.
           # oasdiff outputs "No changes detected" when specs are identical, and
           # "No breaking changes to report, but the specs are different" when only
           # non-breaking changes (e.g. new optional fields) are present. Both are safe.
           if [ -s breaking-changes.txt ] && ! grep -qE "^No changes detected$|^No breaking changes" breaking-changes.txt; then
-            echo "has_breaking_changes=true" >> $GITHUB_OUTPUT
-            echo "## ⚠️  Breaking Changes Detected" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            cat breaking-changes.txt >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "has_breaking_changes=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "## ⚠️  Breaking Changes Detected"
+              echo ""
+              echo '```'
+              cat breaking-changes.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "has_breaking_changes=false" >> $GITHUB_OUTPUT
-            echo "## ✅ No Breaking Changes" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "This PR does not introduce any breaking API changes." >> $GITHUB_STEP_SUMMARY
+            echo "has_breaking_changes=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "## ✅ No Breaking Changes"
+              echo ""
+              echo "This PR does not introduce any breaking API changes."
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Upload Breaking Changes Report
         if: always()
-        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: breaking-changes-report
           path: breaking-changes.txt
@@ -158,7 +166,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0  # Need full history for git diff
 
@@ -174,9 +182,9 @@ jobs:
           fi
 
           if git diff --name-only "origin/$BASE_REF...HEAD" | grep -q "maas-api/openapi3.yaml"; then
-            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "changed=true" >> "$GITHUB_OUTPUT"
           else
-            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Verify Changelog Entry
@@ -194,16 +202,18 @@ jobs:
 
           # Check if there's an API changelog file
           if [ ! -f docs/content/release-notes/api-changelog.md ]; then
-            echo "⚠️  No API changelog found at docs/content/release-notes/api-changelog.md" >> $GITHUB_STEP_SUMMARY
-            echo "   Consider creating one to track API changes over time." >> $GITHUB_STEP_SUMMARY
+            echo "⚠️  No API changelog found at docs/content/release-notes/api-changelog.md" >> "$GITHUB_STEP_SUMMARY"
+            echo "   Consider creating one to track API changes over time." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
           # Check if changelog was updated in this PR
           if git diff --name-only "origin/$BASE_REF...HEAD" | grep -q "docs/content/release-notes/api-changelog.md"; then
-            echo "✅ API changelog updated" >> $GITHUB_STEP_SUMMARY
+            echo "✅ API changelog updated" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "⚠️  API spec changed but changelog not updated" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "Consider adding an entry to docs/content/release-notes/api-changelog.md" >> $GITHUB_STEP_SUMMARY
+            {
+              echo "⚠️  API spec changed but changelog not updated"
+              echo ""
+              echo "Consider adding an entry to docs/content/release-notes/api-changelog.md"
+            } >> "$GITHUB_STEP_SUMMARY"
           fi

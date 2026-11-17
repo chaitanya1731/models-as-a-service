@@ -24,7 +24,7 @@ Use this platform to streamline the deployment of your models, monitor usage, an
 - **[Access and Quota Overview](concepts/subscription-overview.md)** - Configuring policies and subscriptions
 - **[Model Setup](configuration-and-management/model-setup.md)** - Setting up models for MaaS
 - **[API Key Administration](configuration-and-management/api-key-administration.md)** - Bulk revocation and cleanup
-- **[Observability](advanced-administration/observability.md)** - Monitoring, metrics, and dashboards
+- **[Observability](observability/index.md)** - Monitoring, metrics, and dashboards
 - **[Limitador Persistence](advanced-administration/limitador-persistence.md)** - Redis backend for rate-limit counters
 - **[TLS Configuration](configuration-and-management/tls-configuration.md)** - Configuring TLS
 - **[Gateway Patterns](configuration-and-management/gateway-patterns.md)** - Curated Gateway API deployment patterns
@@ -32,6 +32,7 @@ Use this platform to streamline the deployment of your models, monitor usage, an
 ### 📋 Release Notes
 
 - **[Release notes](release-notes/index.md)** - Version highlights and known limitations by release
+- **[RHOAI to MaaS Release Mapping](release-notes/index.md#rhoai-to-maas-release-mapping)** - Which RHOAI version ships which MaaS release
 
 ### 📖 Installation Guide
 

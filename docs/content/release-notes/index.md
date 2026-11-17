@@ -2,6 +2,202 @@
 
 Release notes summarize user-visible changes, breaking changes, and migration requirements for each MaaS version.
 
+## RHOAI to MaaS Release Mapping
+
+This table maps each supported Red Hat OpenShift AI (RHOAI) release to the corresponding MaaS component version.
+
+| RHOAI Version | MaaS Version | RHOAI Image Tag | Status | Notes |
+|---------------|--------------|-----------------|--------|-------|
+| 3.6           | TBD          | `v3.6`          | Planned | Short rate-limit IDs for **new** subscriptions; existing CRs keep `selected_subscription_key`; see [Upgrade Guide](../migration/upgrade-to-3.6.md) |
+| 3.5           | v0.2.1       | `v3.5`          | GA     | Multi-tenancy; body-based routing; xKS support; see [Upgrade Guide](../migration/upgrade-to-3.5.md) |
+| 3.4           | v0.1.1       | `v3.4`          | GA     | Subscription-based access; `Tenant` CR; see [Upgrade Guide](../migration/upgrade-to-3.4.md) |
+| 3.3           | v0.0.2       | `v3.3`          | Tech Preview | `ModelsAsService` CR added to DSC; operator-managed deployment |
+| 3.2           | v0.0.2       | `v3.2`          | Tech Preview | Tier-based access; standalone deploy (`modelsAsService` not in DSC schema) |
+
+**Image registries:**
+
+- **Upstream (ODH):** `quay.io/opendatahub/maas-api:<tag>`, `quay.io/opendatahub/maas-controller:<tag>`
+- **Downstream (RHOAI):** `registry.redhat.io/rhoai/odh-maas-api-rhel9:<tag>`, `registry.redhat.io/rhoai/odh-maas-controller-rhel9:<tag>`
+
+For dependency version requirements (OCP, Kuadrant/RHCL, Gateway API), see [Version Compatibility](../install/prerequisites.md#version-compatibility).
+
+---
+
+## Unreleased (RHOAI 3.6)
+
+**Release Date:** TBD
+
+### Upgrade notes
+
+See [Upgrade to 3.6](../migration/upgrade-to-3.6.md) for full guidance. Summary:
+
+- **`maas-api` egress default changed:** When `networkPolicyEgressRules` is empty, new installs get DNS, Kubernetes API, and allow-all (`egress: - {}`). **Upgrades preserve** an existing restrictive operand policy (no allow-all rule) until an administrator sets `networkPolicyEgressRules` or deletes the policy. To adopt allow-all after upgrade, delete `maas-api-egress-restrict` and let the controller recreate it. `networkPolicyAdditionalEgressRules` does not remove allow-all. See [PostgreSQL egress](../install/maas-setup.md#postgresql-egress).
+- **Recommended short downtime** when upgrading from 3.5 → 3.6 while AuthPolicy / TRLP / maas-api adopt short subscription rate-limit IDs for **new** subscriptions (avoids a brief rate-limit fail-open window for those CRs).
+- **Existing subscriptions keep live Limitador quotas by default** — they stay on `selected_subscription_key` matching and counters. Short IDs apply only to subscriptions created after upgrade. Continuity is **not** guaranteed when a CR is opted into `spec.rateLimitIdentity: short`, when it is recreated (also opts into short IDs), or when upgrade renames pre-rate-group per-subscription TRLP limits to `tokens-*` and starts fresh counters for the current window; see [Upgrade to 3.6](../migration/upgrade-to-3.6.md).
+- **Trade-off:** EnvoyFilter / WasmPlugin size savings from short IDs accrue only as old subscriptions are replaced. A mixed-rate group splits into two TRLP limits until the legacy members are gone.
+- **Prometheus and Loki usage history are unaffected** — telemetry still labels by subscription name (`selected_subscription` / `X-MaaS-Subscription`), not the rate-limit ID.
+- **IPP → Praxis plugins ConfigMap migration is gated:** product-default ConfigMaps (and default + response `api-translation`) auto-migrate; customized ConfigMaps block until `maas.opendatahub.io/force-payload-processing-migration=true` is set on `MaasTenantConfig` (see [Upgrade to 3.6](../migration/upgrade-to-3.6.md)).
+- **Anthropic ExternalModels reject unmappable Chat Completions fields:** with Praxis, an OpenAI Chat Completions request to an Anthropic ExternalModel that carries `response_format`, `frequency_penalty`, `presence_penalty` or `logprobs` returns `400` (`unsupported Chat Completions field "<name>" cannot be preserved by Anthropic Messages`). The 3.5 IPP dropped these fields silently and returned `200`. `max_tokens`, `user`, `stop`, `temperature`, `top_p`, `tools`, `n` and `seed` are accepted. See [External Model Setup](../install/external-model-setup.md#anthropic).
+- **Anthropic `messages` ExternalModels no longer block automatic migration** when API translation is on (explicitly, or as the migration records it for a recognized baseline). Azure OpenAI, Vertex AI, Bedrock, and custom bindings still block. If you set `spec.apiTranslation.enabled: false` to unblock, `targetModel` and provider `path` rewriting stop for every ExternalModel; use the force annotation to keep translation on. See [Upgrade to 3.6](../migration/upgrade-to-3.6.md#ipp-praxis-api-translation-migration).
+- **Use RHCL 1.5 with RHOAI 3.6.** On RHCL 1.4.x (OLM channel `stable` installs 1.4.3), a provider error response without token usage can hang for a caller with two or more MaaSSubscriptions while a TokenRateLimitPolicy is active ([Kuadrant/wasm-shim#425](https://github.com/Kuadrant/wasm-shim/issues/425)). RHCL 1.5.0 (channel `stable-1.5`) fixes it. The 1.4 backport ([Kuadrant/wasm-shim#445](https://github.com/Kuadrant/wasm-shim/pull/445)) is not merged, and `stable-1.4` (1.4.4) is not a confirmed fix. When upgrading, switch the RHCL Subscription channel to `stable-1.5`. See [Version Compatibility](../install/prerequisites.md#version-compatibility).
+- **Legacy metrics usage dashboard is opt-in** (`Config.spec.usageMetricsDashboard`, default `false`). The operator no longer deploys `dashboard-3-maas-usage-admin` unless this is set to `true`; existing operator-owned copies are removed on reconcile. See [Upgrade to 3.6](../migration/upgrade-to-3.6.md).
+
+### Key Fixes
+
+- **Tenant namespace admitted by its tenant Gateway:** maas-controller now applies the tenant Gateway's listener `matchLabels` (for example `maas.opendatahub.io/gateway-access-<tenant>=true`) to the tenant namespace, as it already did for the infrastructure namespace. The HTTPRoutes that ai-gateway-controller creates there for tenant-local ExternalModels were previously `NotAllowedByListeners`. Deleting the AITenant removes those labels. Other model namespaces still need manual labels; see [Gateway patterns](../configuration-and-management/gateway-patterns.md#automatic-infrastructure-and-tenant-namespace-labeling).
+
+- **Experimental Gateway buffer annotation for large inference responses:** MaaS applies a default `64 MB` Envoy listener buffer for large responses such as batched embeddings. Platform administrators can override it per Gateway with `maas.opendatahub.io/experimental-body-buffer-limit-mb`, using an integer value from `1` to `64`. This is experimental and may move into the supported tenant configuration API in a future release.
+
+- **Short subscription rate-limit IDs in TokenRateLimitPolicy (new subscriptions only):** TRLP `when` predicates and counters for subscriptions created after upgrade use a stable 16-hex SHA-256 of `namespace/name@modelNs/model` (`selected_subscription_id`) so Kuadrant WASM / EnvoyFilter size no longer embeds long strings for those CRs. Pre-upgrade subscriptions keep `selected_subscription_key`. Limit map keys stay rate-grouped (`tokens-<limit>-per-<window>`). Human-readable `selected_subscription_key` remains for telemetry.
+
+- **Consistent group-name validation, slashes now allowed on all paths:** API-key minting and AuthPolicy enforcement previously disagreed about `/` in group names — API keys rejected `/` while the gateway allowed it, so behavior depended on which path was used. Both now enforce the same allowlist (`[A-Za-z0-9:#._/ -]`), the rule is defined once per component, and a mirrored test in each module fails if the copies drift. Users in IdP groups that contain `/` (Keycloak full-path groups, Entra ID, Okta, GitHub `org/team`) or `#` (for example IBM Cloud IAM names like `IAM#AccessGroupId-...`) can now mint and use API keys; requests with such groups previously failed with a validation error. Requests with unsafe OIDC group names are still rejected at the gateway with 403; when an invalid group name does reach the API-key handler, it now returns HTTP 400 with the allowed character set instead of an opaque 500. Identity headers now also select the group source by identity type (JWT `groups` claim vs OpenShift TokenReview `user.groups`) and gate both on the pattern, closing a claim-confusion path where a crafted JWT `user` claim could forge group names into `X-MaaS-Group`.
+
+---
+
+## v0.2.1
+
+**Release Date:** TBD
+
+### Breaking Changes
+
+**`X-MaaS-Tenant` header eliminated (RHOAIENG-70517)**
+- The `X-MaaS-Tenant` header is no longer sent or expected. Tenant identity is now derived from the `AITenant` CR and namespace context. Clients and middleware that depend on this header must be updated.
+
+**AITenant automatic RBAC bindings removed**
+- `AITenant.spec.rbac` is deprecated and ignored. Existing manifests that still include the field remain schema-valid, but the controller no longer creates RoleBindings from it. The controller still creates tenant-admin Roles; platform administrators must create standard Kubernetes RoleBindings to grant access. See [Tenant RBAC](../configuration-and-management/tenant-rbac.md).
+
+**Tenant configuration migrated to MaasTenantConfig**
+- MaaS runtime settings (`apiKeys`, `telemetry`) previously in the legacy `Tenant` CR are now managed via the namespace-scoped `MaasTenantConfig` CR. OIDC and gateway context moved to the owning `AITenant`. Existing `Tenant.spec` fields are copied to `MaasTenantConfig/default-tenant` automatically during the migration grace window.
+
+**Infrastructure namespace separation**
+- MaaS infrastructure resources (secrets, config) now reside in a dedicated infrastructure namespace rather than the controller namespace. Existing deployments are migrated automatically.
+
+### New Features
+
+**Body-based routing (BBR)**
+
+- Models can now be selected via the `model` field in the request body (OpenAI-compatible format) in addition to URL path routing. Enables standard OpenAI SDK compatibility without path manipulation.
+- Canonical BBR model ID surfaced in `GET /v1/models` and `MaaSModelRef.status`.
+- Model-provider-resolver and maas-headers-guard added to the IPP pipeline for BBR support.
+
+**Multi-tenancy enhancements**
+
+- Default `AITenant` bootstrapped automatically for single-tenant deployments.
+- Any MaaS tenant can now be removed (not just non-default tenants).
+- Validating webhook prevents multiple `AITenant` CRs from claiming the same namespace.
+- Per-tenant IPP (Inference Payload Processing) stacks deployed for each `AITenant` gateway.
+- Configurable `AITenant` deletion timeout with force-remove finalizer.
+- `GET /v1/tenants` endpoint for gateway discovery.
+
+**Observability**
+
+- OTel Collector deployment for usage log collection.
+- EnvoyFilter for OTel structured usage logging with model and tenant context.
+- Logs-based usage dashboards and tenant-specific dashboard panels.
+- Tenant-level metrics, tracing, and logging.
+- Perses dashboards deployed via `maas-controller`.
+
+**Controller self-teardown**
+
+- `maas-controller` supports clean uninstallation — removes managed resources while preserving tenant namespaces.
+
+**Non-OpenShift Kubernetes (xKS) support**
+
+- New `xKS` overlay enables MaaS deployment on vanilla Kubernetes clusters.
+- OpenShift-only watchers are skipped on xKS to prevent cache-sync timeouts.
+
+**Security hardening**
+
+- Container hardening: `readOnlyRootFilesystem`, `seccompProfile` (FIND-007).
+- Request body size limit to prevent OOM (FIND-011).
+- Startup fails on missing gateway host; non-HTTPS probe URLs rejected (FIND-010).
+- Debug CORS restricted to `http://localhost` only (FIND-Debug-CORS).
+- Database credentials removed from error messages (FIND-006).
+- `X-MaaS-Username` and `X-MaaS-Group` added to sensitive headers (FIND-014).
+- SA token automount disabled on cleanup CronJob (FIND-015).
+- `X-MaaS-Subscription` header ignored for non-API-key requests (FIND-009).
+- Username hashed/redacted in logs.
+- GitHub Actions pinned to immutable commit SHAs.
+- `govulncheck` added for maas-api and maas-controller.
+
+**Bulk API key revocation enhancements**
+
+- Subscription-scoped bulk revoke: administrators can revoke all API keys bound to a specific `MaaSSubscription` in a single call.
+- Combined scope: revoke keys for a specific user within a specific subscription.
+- Dry-run mode (`dryRun: true`): preview how many keys would be revoked without mutating any data.
+- Structured audit records emitted for every actual bulk revoke operation (action, actor, scope, count, tenant).
+- See [API Key Administration](../configuration-and-management/api-key-administration.md) for usage examples.
+
+**Additional features**
+
+- OpenShift cluster TLS profiles honored for gateway and controller TLS configuration.
+- OIDC JWKS cache TTL configurable via `Tenant` CR and wired to Authorino.
+- `maas-api` and `payload-processing` replica count configurable via `Tenant` annotation.
+- API key display name exposed in auth identity.
+- Unauthorized models filtered from `GET /subscriptions` response.
+- `stream_options.include_usage` enforced in IPP pipeline.
+- KServe upgraded to v0.19.0 with model-based routing support.
+- New AI Gateway base manifest entry point for modularized deployment.
+- Configurable Limitador scrape interval.
+- API key update debouncing.
+
+**Model access authorization externalized**
+
+- Model access checks moved from inline allowlists in the gateway AuthPolicy to `accessAllowed` metadata returned by maas-api during subscription selection. The gateway authorization rule is now fixed-size regardless of how many subscriptions or models exist, removing a scaling limit caused by per-model allowlists growing the AuthPolicy CR.
+
+### Key Fixes
+
+- **Gateway wasm config exceeding the etcd size limit (RHOAIENG-95277):** each model's `TokenRateLimitPolicy` now has one limit per distinct rate set instead of one per subscription. A subscription at an existing rate adds a predicate clause (about 3 KB per listener) to the gateway's `kuadrant-{gateway-name}` EnvoyFilter (WasmPlugin on Kuadrant 1.4.x) instead of a whole limit (about 27 KB). Budgets stay separate per subscription and per user. See [Subscription Cardinality](../advanced-administration/subscription-cardinality.md#gateway-config-size).
+    - **Upgrade note:** limit names change from `{namespace}-{subscription}-{model}-tokens` to `tokens-{limit}-per-{window}`, so Limitador starts fresh counters once on upgrade (and again on rollback). With long windows (for example `24h`), users can spend up to twice their budget in the window that spans the change.
+- **CVE-2026-33815 / CVE-2026-33816:** pgx memory-safety and SQL injection fixes.
+- Prevent crash-loop when Kuadrant or KServe CRDs are not installed.
+- Preserve MaaS traffic during RHOAI 3.5 upgrades.
+- Require both `Accepted` and `Enforced` conditions for gateway `AuthPolicy` readiness.
+- Scope gateway `deny-all` auth to model inference paths only; exempt `/v1/subscriptions` and `/v1/api-keys`.
+- Resolve body-routed model names in gateway `AuthPolicy` and subscription validation.
+- Gracefully handle empty `monitoring-namespace` configuration.
+- Scope Secret informer cache to infrastructure namespace.
+- Parse Authorino bracket-wrapped groups header format.
+- Return empty list (not error) from management endpoints when no auth context present.
+- **Gateway auth 401/403 responses now return OpenAI-compatible JSON error bodies (RHOAIENG-94567):** Previously, the gateway `AuthPolicy` returned empty or plain-text bodies for authentication and authorization failures. Responses now include structured `{"error":{"message":"...","type":"...","code":...}}` JSON bodies with `Content-Type: application/json`, matching the OpenAI error format expected by standard SDKs and clients.
+
+### Known Limitations
+
+- **Token rate limits for non-OpenAI API formats:** Token-based rate limiting counts tokens only for OpenAI-compatible request/response formats. Models using other API formats (e.g., Anthropic Messages API) are not metered. See [Token Rate Limiting](../configuration-and-management/quota-and-access-configuration.md).
+- **External models in multi-tenant deployments:** External models are not yet fully supported in multi-tenant configurations. See [External Model Setup](../install/external-model-setup.md).
+
+[Full Changelog](https://github.com/opendatahub-io/models-as-a-service/compare/v0.2.0...v0.2.1)
+
+---
+
+## v0.2.0
+
+**Release Date:** TBD
+
+### Breaking Changes
+
+**Gateway-level AuthPolicy (RHOAIENG-62571)**
+- The `maas-controller` now creates a single `AuthPolicy/maas-gateway-auth` in the gateway namespace (`openshift-ingress`) instead of one per-model `AuthPolicy` in each model namespace.
+- Per-model `AuthPolicy` objects managed by the controller are deleted on the first reconcile after upgrade.
+- `status.authPolicies` now references `maas-gateway-auth / openshift-ingress` instead of per-model policy names.
+- New admission webhooks (`failurePolicy=Ignore`) validate that `MaaSAuthPolicy` and `MaaSSubscription` are created in namespaces that contain a `MaasTenantConfig` CR.
+- `AITenant` created outside the configured `--aitenant-namespace` are now rejected at admission instead of being accepted and later marked `Failed/InvalidPlacement` by the controller.
+- **Minimum Kuadrant version:** v1.4.2 or later required for `spec.defaults.rules` support.
+- **End-user auth behavior is unchanged** — valid API key + active subscription + allowed group still returns `200`.
+
+### New Features
+
+**Singleton gateway AuthPolicy**
+- All per-model allowlists aggregated into one CEL expression in `maas-gateway-auth`
+- Dynamic model identity extracted from `X-Gateway-Model-Name` header with `request.path` fallback
+- Model-aware cache keys prevent subscription result pollution across models
+- Response header injection: `X-MaaS-Subscription`, `userId`, `username`, `groups`
+
+**Admission webhooks**
+- Validating webhooks for `MaaSAuthPolicy` and `MaaSSubscription` enforce namespace tenancy requirements
+
+[Full Changelog](https://github.com/opendatahub-io/models-as-a-service/compare/v0.1.1...v0.2.0)
+
 ---
 
 ## v0.1.1
@@ -18,11 +214,11 @@ Release notes summarize user-visible changes, breaking changes, and migration re
 
 ### New Features
 
-**Tenant CR**
-- Platform-level configuration centralized in the `Tenant` CR (`maas.opendatahub.io/v1alpha1`)
+**MaasTenantConfig CR**
+- MaaS runtime configuration centralized in the `MaasTenantConfig` CR (`maas.opendatahub.io/v1alpha1`)
 - Auto-bootstrapped as `default-tenant` in `models-as-a-service` namespace
-- Configurable gateway, API key lifetime, telemetry, and external OIDC via `spec` fields
-- See [Tenant CR Configuration](../install/maas-setup.md#tenant-cr)
+- Configurable API key lifetime and telemetry via `spec` fields
+- See [MaasTenantConfig CR Configuration](../install/maas-setup.md#maastenantconfig-cr)
 
 **Observability**
 - Perses dashboards for model usage visualization

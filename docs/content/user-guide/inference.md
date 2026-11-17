@@ -8,6 +8,30 @@ This guide explains how to make inference requests to models through the MaaS pl
 
 ---
 
+## Endpoint Overview
+
+MaaS provides **OpenAI-compatible** inference endpoints. Send all requests to a single gateway URL and specify the model in the request body:
+
+```text
+POST https://maas.<cluster-domain>/v1/chat/completions   # Chat / text generation
+POST https://maas.<cluster-domain>/v1/embeddings          # Embeddings
+```
+
+The gateway reads the `model` field from the JSON body and routes the request to the correct backend automatically. This is fully compatible with OpenAI SDKs and any client that speaks the OpenAI Chat Completions or Embeddings API.
+
+!!! note "Administrator prerequisite"
+    Body-based routing requires the Inference Payload Processing (IPP) component to be deployed. IPP reads the `model` field from the request body and sets the routing header for the gateway. Contact your administrator to confirm IPP is available on your cluster.
+
+!!! info "Legacy path-based endpoints"
+    MaaS also supports **path-based endpoints** where the model is encoded in the URL path (e.g. `https://maas.<cluster-domain>/llm/my-model/v1/chat/completions` or `.../v1/embeddings`). These endpoints continue to work, but the body-based endpoint above is recommended for new integrations because it matches the standard OpenAI API contract and works with a single `base_url` for all models. See [Path-Based Routing (Legacy)](#path-based-routing-legacy) for details.
+
+    Administrators who standardize on body-based routing can opt LLMInferenceService backends into `serving.kserve.io/model-based-routing-only: "true"`, which removes per-model path matches from the managed HTTPRoute (~19 → ~9 matches) and shrinks gateway rate-limit config. Path URLs for those models then stop working. See [Reduce LLMInferenceService route matches](../advanced-administration/subscription-cardinality.md#reduce-llminferenceservice-route-matches).
+
+!!! info "Multi-tenant deployments"
+    In a multi-tenant setup, non-default tenants use their own gateway URL (e.g. `https://<tenant-gateway>/v1/chat/completions` or `.../v1/embeddings`) with a tenant-scoped API key. See [Multi-Tenant Validation](../install/multi-tenant-validation.md) for details.
+
+---
+
 ## Basic Chat Completion
 
 Make a simple chat completion request using your API key:
@@ -18,11 +42,11 @@ CLUSTER_DOMAIN=$(kubectl get ingresses.config.openshift.io cluster -o jsonpath='
 MAAS_API_URL="https://maas.${CLUSTER_DOMAIN}"
 API_KEY="sk-oai-..."  # Your API key
 
-# Get the first available model
-MODELS=$(curl -s "${MAAS_API_URL}/maas-api/v1/models" \
-    -H "Authorization: Bearer ${API_KEY}")
-MODEL_URL=$(echo $MODELS | jq -r '.data[0].url')
-MODEL_NAME=$(echo $MODELS | jq -r '.data[0].id')
+# Get the first ready model name
+MODEL_NAME=$(curl -s "${MAAS_API_URL}/maas-api/v1/models" \
+    -H "Authorization: Bearer ${API_KEY}" | \
+    jq -re '[.data[] | select(.ready==true)][0].id') || \
+    { echo "No ready models found"; exit 1; }
 
 # Make an inference request
 curl -sS \
@@ -38,8 +62,11 @@ curl -sS \
         ],
         \"max_tokens\": 100
       }" \
-  "${MODEL_URL}/v1/chat/completions"
+  "${MAAS_API_URL}/v1/chat/completions"
 ```
+
+!!! tip "Model ID format"
+    The `model` value must match the `id` returned by `/maas-api/v1/models`. For on-cluster models (LLMInferenceService), this is a publisher ID like `publishers/llm/models/facebook/opt-125m`. For external models, this is typically the model name (e.g. `gpt-4o`). Always use the `id` from the API response rather than constructing it manually.
 
 **Example response:**
 
@@ -48,7 +75,7 @@ curl -sS \
   "id": "chatcmpl-123",
   "object": "chat.completion",
   "created": 1677652288,
-  "model": "llama-2-7b-chat",
+  "model": "publishers/llm/models/facebook/opt-125m",
   "choices": [
     {
       "index": 0,
@@ -88,17 +115,17 @@ curl -sS --no-buffer \
         \"max_tokens\": 200,
         \"stream\": true
       }" \
-  "${MODEL_URL}/v1/chat/completions"
+  "${MAAS_API_URL}/v1/chat/completions"
 ```
 
 **Example streaming response:**
 
-```
-data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1677652288,"model":"llama-2-7b-chat","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+```text
+data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1677652288,"model":"publishers/llm/models/facebook/opt-125m","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1677652288,"model":"llama-2-7b-chat","choices":[{"index":0,"delta":{"content":"Once"},"finish_reason":null}]}
+data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1677652288,"model":"publishers/llm/models/facebook/opt-125m","choices":[{"index":0,"delta":{"content":"Once"},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1677652288,"model":"llama-2-7b-chat","choices":[{"index":0,"delta":{"content":" upon"},"finish_reason":null}]}
+data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1677652288,"model":"publishers/llm/models/facebook/opt-125m","choices":[{"index":0,"delta":{"content":" upon"},"finish_reason":null}]}
 
 data: [DONE]
 ```
@@ -113,7 +140,7 @@ Common parameters for chat completions:
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `model` | string | Yes | Model identifier from `/maas-api/v1/models` |
+| `model` | string | Yes | Model identifier (`id`) from `/maas-api/v1/models` |
 | `messages` | array | Yes | Array of message objects with `role` and `content` |
 | `max_tokens` | integer | No | Maximum tokens to generate (default varies by model) |
 | `temperature` | float | No | Sampling temperature (0-2, default 1.0). Higher = more random. |
@@ -126,6 +153,94 @@ Common parameters for chat completions:
 - `system` - Instructions for the model's behavior
 - `user` - User messages
 - `assistant` - Model responses (for multi-turn conversations)
+
+---
+
+## Embeddings
+
+Generate vector embeddings for text input. Embedding models convert text into numerical vectors for use in search, retrieval, clustering, and classification.
+
+### Basic Request
+
+```bash
+curl -sS \
+  -H "Authorization: Bearer ${API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d "{
+        \"model\": \"${MODEL_NAME}\",
+        \"input\": \"The quick brown fox jumps over the lazy dog\"
+      }" \
+  "${MAAS_API_URL}/v1/embeddings"
+```
+
+**Example response:**
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "object": "embedding",
+      "index": 0,
+      "embedding": [0.0123, -0.0456, 0.0789, ...]
+    }
+  ],
+  "model": "publishers/llm/models/baai/bge-m3",
+  "usage": {
+    "prompt_tokens": 10,
+    "total_tokens": 10
+  }
+}
+```
+
+### Batch Input
+
+Pass an array to embed multiple texts in one call:
+
+```bash
+curl -sS \
+  -H "Authorization: Bearer ${API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d "{
+        \"model\": \"${MODEL_NAME}\",
+        \"input\": [
+          \"First sentence to embed\",
+          \"Second sentence to embed\"
+        ]
+      }" \
+  "${MAAS_API_URL}/v1/embeddings"
+```
+
+### Python Example
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://maas.<cluster-domain>/v1",
+    api_key="sk-oai-...",
+)
+
+response = client.embeddings.create(
+    model="publishers/llm/models/baai/bge-m3",
+    input="The quick brown fox jumps over the lazy dog",
+)
+
+vector = response.data[0].embedding
+print(f"Dimension: {len(vector)}")
+```
+
+### Embedding Request Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `model` | string | Yes | Model identifier (`id`) from `/maas-api/v1/models` |
+| `input` | string or array | Yes | Text to embed. A string for a single input, or an array of strings for batch embedding. |
+| `encoding_format` | string | No | Output format: `"float"` (default) or `"base64"` |
+
+### Token Usage
+
+Embedding requests consume **prompt tokens only** — there are no completion tokens. The `usage` object reports `prompt_tokens` and `total_tokens` (which are equal). These tokens count toward your subscription's token rate limit budget, shared with chat completion requests on the same subscription.
 
 ---
 
@@ -159,8 +274,50 @@ curl -sS \
         ],
         \"max_tokens\": 100
       }" \
+  "${MAAS_API_URL}/v1/chat/completions"
+```
+
+---
+
+## Path-Based Routing (Legacy)
+
+MaaS also supports per-model URL endpoints where the model is identified by the URL path rather than the request body. These endpoints are available at the `url` field returned by `/maas-api/v1/models`.
+
+```bash
+# Get the per-model URL
+MODEL_URL=$(curl -s "${MAAS_API_URL}/maas-api/v1/models" \
+    -H "Authorization: Bearer ${API_KEY}" | \
+    jq -re '[.data[] | select(.ready==true)][0].url') || \
+    { echo "No ready models found"; exit 1; }
+
+# Make an inference request using the path-based URL
+curl -sS \
+  -H "Authorization: Bearer ${API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d "{
+        \"model\": \"${MODEL_NAME}\",
+        \"messages\": [
+          {
+            \"role\": \"user\",
+            \"content\": \"Hello, how are you?\"
+          }
+        ],
+        \"max_tokens\": 100
+      }" \
   "${MODEL_URL}/v1/chat/completions"
 ```
+
+### Comparison
+
+| | Body-based (recommended) | Path-based (legacy) |
+|---|---|---|
+| **URL** | Single: `${MAAS_API_URL}/v1/chat/completions` or `/v1/embeddings` | Per-model: `${MODEL_URL}/v1/chat/completions` or `/v1/embeddings` |
+| **Model selection** | `model` field in request body | URL path determines the model |
+| **OpenAI SDK compatible** | Yes, single `base_url` for all models | Requires setting `base_url` per model |
+| **Requires IPP** | Yes | No |
+
+!!! tip
+    The `model` value must match a model `id` returned by [`/maas-api/v1/models`](model-discovery.md). If the model name does not match, the request will be rejected.
 
 ---
 
@@ -211,7 +368,7 @@ while [ $retry_count -lt $max_retries ]; do
     -H "Authorization: Bearer ${API_KEY}" \
     -H "Content-Type: application/json" \
     -d "{\"model\": \"${MODEL_NAME}\", \"messages\": [{\"role\": \"user\", \"content\": \"Hello\"}]}" \
-    "${MODEL_URL}/v1/chat/completions")
+    "${MAAS_API_URL}/v1/chat/completions")
   
   http_code=$(echo "$response" | tail -n1)
   body=$(echo "$response" | head -n-1)

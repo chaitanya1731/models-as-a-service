@@ -279,6 +279,7 @@ The maas-api server is configured via **environment variables** or **CLI flags**
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DEBUG_MODE` | `false` | Enable debug logging. Set to `true` or `1`. |
+| `LOG_FORMAT` | `zap` | Log output format: `zap` or OpenTelemetry JSON (`otel-json`). |
 | `NAMESPACE` | `maas-api` | Namespace where maas-api is deployed. |
 | `GATEWAY_NAME` | `maas-default-gateway` | Name of the Gateway resource used for model routing. |
 | `GATEWAY_NAMESPACE` | `openshift-ingress` | Namespace of the Gateway resource. |
@@ -288,6 +289,7 @@ The maas-api server is configured via **environment variables** or **CLI flags**
 | `ADDRESS` | `:8443` (HTTPS) or `:8080` (HTTP) | Server listen address (host:port). |
 | `PORT` | - | **DEPRECATED.** Use `ADDRESS` with `SECURE=false` instead. |
 | `API_KEY_MAX_EXPIRATION_DAYS` | `90` | Maximum allowed API key lifetime in days. Users cannot create keys with longer expiration. Minimum: 1. |
+| `API_KEY_DELETION_RETENTION_DAYS` | `90` | Retention period in days for lifecycle-invalidated API keys before physical deletion. Minimum: 1. |
 | `ACCESS_CHECK_TIMEOUT_SECONDS` | `15` | Timeout for model access validation during `/v1/models` requests. Models that don't respond within this window are excluded. Minimum: 1. |
 | `TLS_CERT` | - | Path to TLS certificate file (PEM format). Required if `SECURE=true` and not using self-signed cert. |
 | `TLS_KEY` | - | Path to TLS private key file (PEM format). Required if `SECURE=true` and not using self-signed cert. |
@@ -299,11 +301,12 @@ The maas-api server is configured via **environment variables** or **CLI flags**
 
 ### CLI Flags
 
-Most environment variables have corresponding CLI flags. When both are provided, CLI flags take precedence. Note that `API_KEY_MAX_EXPIRATION_DAYS` and `ACCESS_CHECK_TIMEOUT_SECONDS` are environment variable only and have no CLI flag equivalents.
+Most environment variables have corresponding CLI flags. When both are provided, CLI flags take precedence. Note that `API_KEY_MAX_EXPIRATION_DAYS`, `API_KEY_DELETION_RETENTION_DAYS`, and `ACCESS_CHECK_TIMEOUT_SECONDS` are environment variable only and have no CLI flag equivalents.
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
 | `--debug` | `DEBUG_MODE` | `false` | Enable debug mode. |
+| `--log-format` | `LOG_FORMAT` | `zap` | Log output format: `zap` or `otel-json`. |
 | `--namespace` | `NAMESPACE` | `maas-api` | Namespace of the MaaS instance. |
 | `--name` | `INSTANCE_NAME` | Value of `--gateway-name` | Name of the MaaS instance. |
 | `--gateway-name` | `GATEWAY_NAME` | `maas-default-gateway` | Name of the Gateway resource. |
@@ -325,7 +328,8 @@ maas-api uses PostgreSQL for persistent storage of API key metadata. The databas
 !!! note "Automatic Setup"
     When using `scripts/deploy.sh` for development, PostgreSQL is deployed automatically with the secret created.
 
-For production deployments, see the [Database Setup](../docs/content/install/maas-setup.md#database-setup) guide.
+For production deployments, see the [Database Setup](../docs/content/install/maas-setup.md#database-setup)
+guide, including the optional [PostgreSQL read replica](../docs/content/install/maas-setup.md#optional-postgresql-read-replica).
 
 #### Listing models with subscription filtering
 

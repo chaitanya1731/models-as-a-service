@@ -26,6 +26,7 @@ const (
 	TokenStatusRevoked = "revoked"
 )
 
+//nolint:interfacebloat // The store intentionally groups the complete API-key lifecycle contract.
 type MetadataStore interface {
 	// AddKey stores an API key with hash-only storage (no plaintext).
 	// Keys can be permanent (expiresAt=nil) or expiring (expiresAt set).
@@ -36,15 +37,29 @@ type MetadataStore interface {
 	//     per-key salt encoded in the API key format (sk-oai-{embedded_key_id}_{secret})
 	//   - userGroups: array of user's groups (used for authorization)
 	//   - ephemeral: marks the key as short-lived for programmatic use
+	//   - labels: caller-validated key/value metadata; this layer does not re-validate or enforce limits.
 	//
 	// Note: keyPrefix is NOT stored (security - reduces brute-force attack surface).
-	AddKey(ctx context.Context, username string, keyID, keyHash, name, description string, userGroups []string, subscription string, expiresAt *time.Time, ephemeral bool) error
+	AddKey(ctx context.Context,
+		username string,
+		keyID,
+		keyHash,
+		name,
+		description string,
+		userGroups []string,
+		subscription,
+		tenant string,
+		expiresAt *time.Time,
+		ephemeral bool,
+		labels map[string]string) error
 
 	// Search returns API keys matching the search criteria.
 	// Supports filtering, sorting, and pagination.
+	// Tenant scoping is mandatory — results are always filtered by tenant.
 	Search(
 		ctx context.Context,
 		username string,
+		tenant string,
 		filters *SearchFilters,
 		sort *SortParams,
 		pagination *PaginationParams,
@@ -58,9 +73,33 @@ type MetadataStore interface {
 	// Returns ErrKeyNotFound if key doesn't exist, ErrInvalidKey if revoked or expired.
 	GetByHash(ctx context.Context, keyHash string) (*ApiKey, error)
 
-	// InvalidateAll marks all active tokens for a user as revoked.
-	// Returns the count of keys that were revoked.
-	InvalidateAll(ctx context.Context, username string) (int, error)
+	// BulkRevoke handles both actual revocation and dry-run counting in a single
+	// method. When dryRun is false, it marks all active, non-expired keys matching
+	// the scope as revoked in a single atomic UPDATE and returns the revoked count.
+	// When dryRun is true, it returns the count of keys that would be revoked
+	// without mutating any data. At least one of username or subscription must be
+	// non-empty.
+	BulkRevoke(ctx context.Context, username, subscription, tenant string, dryRun bool) (int, error)
+
+	// BulkRevokeBySubscriptions revokes or counts active keys for one user across
+	// the supplied subscriptions. The subscription list is an internal delegated
+	// administrator scope and must not be client-controlled.
+	BulkRevokeBySubscriptions(
+		ctx context.Context,
+		username string,
+		subscriptions []string,
+		tenant string,
+		dryRun bool,
+	) (int, error)
+
+	// InvalidateTenant marks all active tokens within a tenant as revoked.
+	// All matching keys are soft-deleted for retention; active keys are revoked.
+	// Returns the count of rows newly soft-deleted.
+	InvalidateTenant(ctx context.Context, tenant string) (int, error)
+
+	// InvalidateSubscription soft-deletes all keys for one subscription within a
+	// tenant. It must not affect keys belonging to other subscriptions or tenants.
+	InvalidateSubscription(ctx context.Context, tenant, subscription string) (int, error)
 
 	// Revoke marks a specific API key as revoked (status transition: active → revoked).
 	Revoke(ctx context.Context, keyID string) error
@@ -73,6 +112,10 @@ type MetadataStore interface {
 	// Deletes keys where ephemeral=TRUE AND (status='expired' OR expires_at < NOW()).
 	// Returns the count of deleted keys.
 	DeleteExpiredEphemeral(ctx context.Context) (int64, error)
+
+	// DeleteSoftDeleted removes lifecycle-invalidated keys for this store's
+	// tenant after the retention period.
+	DeleteSoftDeleted(ctx context.Context, retention time.Duration) (int64, error)
 
 	Close() error
 }

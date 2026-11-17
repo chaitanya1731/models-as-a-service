@@ -1,0 +1,169 @@
+#!/bin/bash
+# =============================================================================
+# MaaS Model Deployment
+# =============================================================================
+# Deploys e2e test fixtures (LLMIS, MaaSModelRef, MaaSAuthPolicy, MaaSSubscription)
+# and waits for models, governed refs, and AuthPolicies to be ready.
+# Can be sourced by prow_run_smoke_test.sh or run standalone.
+# =============================================================================
+
+set -euo pipefail
+
+# Bootstrap: find PROJECT_ROOT and source helpers if not already loaded.
+if [[ -z "${PROJECT_ROOT:-}" ]]; then
+    _dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    PROJECT_ROOT="$(cd "$_dir/../../.." && pwd)"
+fi
+[[ "$(type -t find_project_root 2>/dev/null)" == "function" ]] || source "$PROJECT_ROOT/scripts/deployment-helpers.sh"
+
+# Env defaults (no-op if already set by orchestrator)
+GATEWAY_NAME="${GATEWAY_NAME:-maas-default-gateway}"
+GATEWAY_NAMESPACE="${GATEWAY_NAMESPACE:-openshift-ingress}"
+GATEWAY_PROGRAMMED_TIMEOUT="${GATEWAY_PROGRAMMED_TIMEOUT:-600}"
+DEPLOYMENT_NAMESPACE="${DEPLOYMENT_NAMESPACE:-opendatahub}"
+MAAS_SUBSCRIPTION_NAMESPACE="${MAAS_SUBSCRIPTION_NAMESPACE:-models-as-a-service}"
+MODEL_NAMESPACE="${MODEL_NAMESPACE:-llm}"
+MAAS_WEBHOOK_READY_TIMEOUT="${MAAS_WEBHOOK_READY_TIMEOUT:-120}"
+
+wait_for_maas_webhook_ready() {
+    local timeout="${MAAS_WEBHOOK_READY_TIMEOUT}"
+    local deadline=$((SECONDS + timeout))
+    local addresses=""
+
+    echo "Waiting for ready endpoints on maas-controller-webhook-service in ${DEPLOYMENT_NAMESPACE} (timeout: ${timeout}s)..."
+    while [[ $SECONDS -lt $deadline ]]; do
+        addresses=$(kubectl get endpoints maas-controller-webhook-service -n "$DEPLOYMENT_NAMESPACE" \
+            -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)
+        if [[ -n "$addresses" ]]; then
+            echo "✅ MaaS admission webhook has ready endpoints: ${addresses}"
+            return 0
+        fi
+        sleep 2
+    done
+
+    echo "❌ ERROR: maas-controller-webhook-service has no ready endpoints in ${DEPLOYMENT_NAMESPACE} after ${timeout}s"
+    kubectl get deployment,service,endpoints -n "$DEPLOYMENT_NAMESPACE" 2>/dev/null || true
+    kubectl get pods -n "$DEPLOYMENT_NAMESPACE" -l control-plane=maas-controller -o wide 2>/dev/null || true
+    kubectl logs deployment/maas-controller -n "$DEPLOYMENT_NAMESPACE" --tail=100 2>/dev/null || true
+    return 1
+}
+
+apply_e2e_fixtures() {
+    (cd "$PROJECT_ROOT" && kustomize build test/e2e/fixtures/ | \
+        sed "s/namespace: models-as-a-service/namespace: $MAAS_SUBSCRIPTION_NAMESPACE/g" | \
+        kubectl apply -f -)
+}
+
+wait_for_auth_policies_enforced() {
+    local timeout="$AUTHPOLICY_TIMEOUT"
+    local gateway_name="${GATEWAY_NAME:-maas-default-gateway}"
+    local gateway_ns="${GATEWAY_NAMESPACE:-openshift-ingress}"
+    echo "Waiting for AuthPolicies targeting gateway '$gateway_name' to be enforced (timeout: ${timeout}s)..."
+
+    local deadline=$((SECONDS + timeout))
+    while [[ $SECONDS -lt $deadline ]]; do
+        local all_enforced=true
+        local total=0
+        while IFS=$'\t' read -r name target enforced; do
+            [[ -z "$name" ]] && continue
+            if [[ "$target" != "$gateway_name" ]]; then
+                echo "  Skipping $name (targets $target, not $gateway_name)"
+                continue
+            fi
+            total=$((total + 1))
+            if [[ "$enforced" != "True" ]]; then
+                all_enforced=false
+            fi
+        done < <(oc get authpolicies -n "$gateway_ns" -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.targetRef.name}{"\t"}{.status.conditions[?(@.type=="Enforced")].status}{"\n"}{end}' 2>/dev/null)
+        if $all_enforced && [[ $total -gt 0 ]]; then
+            echo "✅ All AuthPolicies targeting $gateway_name enforced ($total policies)"
+            return 0
+        fi
+        echo "  Waiting... ($total policies targeting $gateway_name, not all enforced yet)"
+        sleep 10
+    done
+    echo "❌ ERROR: AuthPolicies targeting $gateway_name not all enforced after ${timeout}s"
+    oc get authpolicies -n "$gateway_ns" -o wide 2>/dev/null || true
+    return 1
+}
+
+deploy_models() {
+    echo "Deploying MaaS system (free + premium: LLMIS + MaaSModelRef + MaaSAuthPolicy + MaaSSubscription)"
+    if ! wait_for_gateway_programmed "$GATEWAY_NAME" "$GATEWAY_NAMESPACE" "$GATEWAY_PROGRAMMED_TIMEOUT"; then
+        exit 1
+    fi
+
+    if ! kubectl get namespace llm >/dev/null 2>&1; then
+        echo "Creating 'llm' namespace..."
+        kubectl create namespace llm || { echo "❌ ERROR: Failed to create 'llm' namespace"; exit 1; }
+    else
+        echo "'llm' namespace already exists"
+    fi
+
+    if ! kubectl get namespace "$MAAS_SUBSCRIPTION_NAMESPACE" >/dev/null 2>&1; then
+        echo "Creating '$MAAS_SUBSCRIPTION_NAMESPACE' namespace..."
+        kubectl create namespace "$MAAS_SUBSCRIPTION_NAMESPACE" || { echo "❌ ERROR: Failed to create '$MAAS_SUBSCRIPTION_NAMESPACE' namespace"; exit 1; }
+    else
+        echo "'$MAAS_SUBSCRIPTION_NAMESPACE' namespace already exists"
+    fi
+
+    if ! [[ "$MAAS_SUBSCRIPTION_NAMESPACE" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+        echo "❌ ERROR: MAAS_SUBSCRIPTION_NAMESPACE is not a valid DNS-1123 label: '$MAAS_SUBSCRIPTION_NAMESPACE'"
+        exit 1
+    fi
+
+    if ! wait_for_maas_webhook_ready; then
+        echo "❌ ERROR: MaaS admission webhook is not ready; refusing to apply e2e fixtures"
+        exit 1
+    fi
+
+    local apply_log
+    apply_log=$(mktemp)
+    if ! apply_e2e_fixtures 2>&1 | tee "$apply_log"; then
+        if grep -Fq 'no endpoints available for service "maas-controller-webhook-service"' "$apply_log"; then
+            echo "⚠️  MaaS webhook endpoints disappeared during fixture creation; waiting and retrying once..."
+            if ! wait_for_maas_webhook_ready || ! apply_e2e_fixtures; then
+                rm -f "$apply_log"
+                echo "❌ ERROR: Failed to deploy MaaS system with e2e fixtures after webhook retry"
+                exit 1
+            fi
+        else
+            rm -f "$apply_log"
+            echo "❌ ERROR: Failed to deploy MaaS system with e2e fixtures"
+            exit 1
+        fi
+    fi
+    rm -f "$apply_log"
+    echo "✅ MaaS system deployed (free + premium + e2e test fixtures)"
+
+    echo "Waiting for models to be ready (timeout: ${LLMIS_TIMEOUT}s)..."
+    local models=("facebook-opt-125m-simulated" "premium-simulated-simulated-premium" "e2e-unconfigured-facebook-opt-125m-simulated" "e2e-external-token-limit-simulated")
+    for model in "${models[@]}"; do
+        if ! oc wait "llminferenceservice/$model" -n llm --for=condition=Ready --timeout="${LLMIS_TIMEOUT}s"; then
+            echo "❌ ERROR: Timed out waiting for $model to be ready"
+            dump_llmis_diagnostics "$model" "llm"
+            exit 1
+        fi
+    done
+    echo "✅ Simulator models ready"
+
+    local governed_models=("facebook-opt-125m-simulated" "premium-simulated-simulated-premium")
+    echo "Waiting for governed MaaSModelRefs to be Ready (timeout: ${MAASMODELREF_TIMEOUT}s per model)..."
+    for model in "${governed_models[@]}"; do
+        if ! oc wait "maasmodelref/$model" -n "$MODEL_NAMESPACE" \
+            --for=jsonpath='{.status.phase}'=Ready --timeout="${MAASMODELREF_TIMEOUT}s"; then
+            echo "❌ ERROR: Timed out waiting for MaaSModelRef $model to reach phase=Ready"
+            oc get maasmodelref "$model" -n "$MODEL_NAMESPACE" -o yaml || true
+            oc get "llminferenceservice/$model" -n "$MODEL_NAMESPACE" -o yaml || true
+            kubectl logs deployment/maas-controller -n "$DEPLOYMENT_NAMESPACE" --tail=100 || true
+            exit 1
+        fi
+    done
+    echo "✅ Governed MaaSModelRefs ready"
+
+    if ! wait_for_auth_policies_enforced; then
+        exit 1
+    fi
+}
+
+deploy_models

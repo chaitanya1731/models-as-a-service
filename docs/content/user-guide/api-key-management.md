@@ -31,15 +31,26 @@ MAAS_API_URL="https://maas.${CLUSTER_DOMAIN}"
 
 ### Create an API Key
 
-Create a new API key with a name, description, and expiration:
+Create a new API key with a name, description, expiration and labels:
 
 ```bash
-API_KEY_RESPONSE=$(curl -sS \
+API_KEY_RESPONSE=$(curl -sS -X POST "${MAAS_API_URL}/maas-api/v1/api-keys" \
   -H "Authorization: Bearer ${OC_TOKEN}" \
   -H "Content-Type: application/json" \
-  -X POST \
-  -d '{"name": "my-api-key", "description": "Key for model access", "expiresIn": "90d"}' \
-  "${MAAS_API_URL}/maas-api/v1/api-keys")
+  -d '{
+    "name": "my-api-key", 
+    "description": "Key for model access",
+    "expiresIn": "90d",
+    "labels": {
+      "cmdb_id": "AST123456",
+      "cost_center": "CC-DATA-001",
+      "environment": "production",
+      "acme.inc/project_code": "PROJ-ML-2024",
+      "owner_email": "ml-team@acme.inc",
+      "owner": "alice"
+    }
+    }' \
+  )
 
 API_KEY=$(echo $API_KEY_RESPONSE | jq -r .key)
 echo "API Key: ${API_KEY}"
@@ -57,23 +68,57 @@ echo "API Key: ${API_KEY}"
 |-------|----------|-------------|
 | `name` | Yes | Human-friendly name for the key (e.g., "production-bot") |
 | `description` | No | Optional description |
-| `expiresIn` | No | TTL string (e.g., `90d`, `30d`, `1h`). Omit to use configured maximum. |
+| `expiresIn` | No | Key expiration duration. See [Expiration Format](#expiration-format) below. Omit to use configured maximum (typically 90 days). |
 | `subscription` | No | MaaSSubscription name to bind. Omit to auto-select highest priority. |
 | `ephemeral` | No | Set to `true` for short-lived keys (max 1 hour). See [Ephemeral Keys](#ephemeral-keys). |
+| `labels` | No | A JSON-formatted key/value pair for attaching labels to API keys that assist in API-key management. See below for formatting rules. |
 
-**Response:**
+**Full Request/Response Example:**
+
+```bash
+curl -sS -X POST "${MAAS_API_URL}/maas-api/v1/api-keys"   -H "Authorization: Bearer ${OC_TOKEN}"   -H "Content-Type: application/json"   -d '{
+    "name": "my-api-key", 
+    "description": "Key for model access",
+    "expiresIn": "90d",
+    "labels": {
+      "cmdb_id": "AST123456",
+      "cost_center": "CC-DATA-001",
+      "environment": "production",
+      "acme.inc/project_code": "PROJ-ML-2024",
+      "owner_email": "ml-team@acme.inc",
+      "owner": "alice"
+    }
+    }' | jq
+```
 
 ```json
 {
-  "id": "550e8400-e29b-41d4-a716-446655440000",
-  "key": "sk-oai-...",
+  "key": "<REDACTED_API_KEY>",
+  "keyPrefix": "<REDACTED_KEY_PREFIX>",
+  "id": "c2011e55-bd97-41e6-aab7-1b8ff6713d95",
   "name": "my-api-key",
-  "subscription": "premium-subscription",
-  "createdAt": "2026-04-28T12:00:00Z",
-  "expiresAt": "2026-07-27T12:00:00Z",
-  "ephemeral": false
+  "subscription": "simulator-subscription",
+  "createdAt": "2026-07-12T00:18:52Z",
+  "expiresAt": "2026-10-10T00:18:52Z",
+  "ephemeral": false,
+  "labels": {
+    "acme.inc/project_code": "PROJ-ML-2024",
+    "cmdb_id": "AST123456",
+    "cost_center": "CC-DATA-001",
+    "environment": "production",
+    "owner": "alice",
+    "owner_email": "ml-team@acme.inc"
+  }
 }
 ```
+
+**Label constraints**
+
+- **Key format:** Label keys follow Kubernetes label syntax: optional DNS subdomain prefix (a-zA-Z0-9?/) plus a name of alphanumerics, dots, underscores, and hyphens (must start/end alphanumeric). Examples: environment, app.kubernetes.io/name.
+- **Label creation:** Labels are ephemeral and can only be defined during API-key creation. This ensures strong auditability.
+- **Maximum entries:** The maximum number of labels is 50.
+- **Key length:** Maximum label key length is 128 characters.
+- **Value length:** Maximum label value length is 1024 characters.
 
 ### Subscription Binding
 
@@ -101,7 +146,10 @@ curl -sS -X POST "${MAAS_API_URL}/maas-api/v1/api-keys/search" \
   -H "Content-Type: application/json" \
   -d '{
     "filters": {
-      "status": ["active"]
+      "status": ["active"],
+      "labelsContain": {
+        "owner": "alice"
+      }
     },
     "sort": {
       "by": "created_at",
@@ -114,13 +162,33 @@ curl -sS -X POST "${MAAS_API_URL}/maas-api/v1/api-keys/search" \
   }' | jq .
 ```
 
+Search by multiple label fields (AND logic):
+
+```bash
+curl -sS -X POST "${MAAS_API_URL}/maas-api/v1/api-keys/search" \
+  -H "Authorization: Bearer $(oc whoami -t)" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "filters": {
+      "labelsContain": {
+        "environment": "production",
+        "acme.inc/project_code": "PROJ-ML-2024"
+      }
+    }
+  }' | jq
+```
+
+A verified SSO organization administrator can search other users' keys in a subscription they administer. Supplying `filters.subscription` limits the search to that subscription; omitting it returns the union of all subscriptions the administrator administers.
+
 **Request options:**
 
 | Field | Description |
 |-------|-------------|
 | `filters.username` | Filter by username. Admin-only; non-admin users can search only their own keys. |
+| `filters.subscription` | Filter by MaaS Subscription name or `namespace/name` alias. When omitted, delegated subscription administrators search all subscriptions they administer. |
 | `filters.status` | Filter by one or more statuses: `active`, `revoked`, `expired` |
 | `filters.includeEphemeral` | Include ephemeral keys (default: false) |
+| `filters.labelsContain` | Filter by one or more key/value pairs. Multiple labels are treated as an AND in the filter. |
 | `sort.by` | Sort field: `created_at` (default), `expires_at`, `last_used_at`, or `name` |
 | `sort.order` | Sort order: `desc` (default) or `asc` |
 | `pagination.limit` | Number of results per page (default: 50, max: 100) |
@@ -143,13 +211,21 @@ curl -sS "${MAAS_API_URL}/maas-api/v1/api-keys/${KEY_ID}" \
   "id": "550e8400-e29b-41d4-a716-446655440000",
   "name": "my-api-key",
   "description": "Key for model access",
-  "username": "alice",
+  "username": "admin",
+  "subscription": "simulator-subscription",
+  "tenant": "models-as-a-service",
+  "creationDate": "2026-07-12T01:27:45Z",
+  "expirationDate": "2026-10-10T01:27:45Z",
   "status": "active",
-  "subscription": "premium-subscription",
-  "creationDate": "2026-04-28T12:00:00Z",
-  "expirationDate": "2026-07-27T12:00:00Z",
-  "lastUsedAt": "2026-04-29T10:30:00Z",
-  "ephemeral": false
+  "ephemeral": false,
+  "labels": {
+    "acme.inc/project_code": "PROJ-ML-2024",
+    "cmdb_id": "AST123456",
+    "cost_center": "CC-DATA-001",
+    "environment": "production",
+    "owner": "alice",
+    "owner_email": "ml-team@acme.inc"
+  }
 }
 ```
 
@@ -157,9 +233,69 @@ curl -sS "${MAAS_API_URL}/maas-api/v1/api-keys/${KEY_ID}" \
 
 ## Key Expiration
 
-Set `expiresIn` to a duration string (`"90d"`, `"30d"`, `"1h"`), or omit it to use the platform maximum. Expired keys return `valid: false` on validation—create a new key to continue access.
+When a key expires, validation requests return `valid: false` and the key's status changes to `"expired"`. You must create a new key to continue access.
 
-**Best practices:** Long TTL (90d) for stable integrations, short TTL (30d or less) for security-conscious environments, ephemeral keys (≤1h) for temporary access.
+**Best practices:**
+
+- **Stable integrations**: Long TTL (90d or platform maximum)
+- **Security-conscious environments**: Short TTL (30d or less) with regular rotation
+- **Temporary access**: Ephemeral keys (≤1h) for demos, testing, or playground sessions
+
+### Expiration Format
+
+The `expiresIn` field accepts duration strings in multiple formats:
+
+**String format with units:**
+
+| Unit | Examples | Description |
+|------|----------|-------------|
+| `d` | `"1d"`, `"30d"`, `"90d"`, `"1.5d"` | Days (24 hours each) |
+| `h` | `"1h"`, `"6h"`, `"24h"`, `"2.5h"` | Hours |
+| `m` | `"30m"`, `"90m"`, `"120m"` | Minutes |
+| `s` | `"60s"`, `"3600s"` | Seconds |
+| Combined | `"2h30m"`, `"1h45m30s"` | Multiple units (no spaces) |
+
+**Numeric format (seconds):**
+
+When passed as a JSON number (not a string), the value is interpreted as **seconds**. E.g. the following `expiresIn: 86400` is one day (24 * 60 * 60):
+
+```json
+{
+  "expiresIn": 86400
+}
+```
+
+**Validation rules:**
+
+- **Minimum**: Any positive duration (e.g., `"1s"` is valid, though not practical)
+- **Maximum for regular keys**: Configured platform maximum
+- **Maximum for ephemeral keys**: 1 hour
+- **Omitted** (i.e. `expiresIn` not sent): Keys still expire; there is no indefinite default.
+  - **Ephemeral keys**: **1 hour**.
+  - **Regular keys**: Omitting `expiresIn` will default to the maximum expiration days value. The maximum expiration value is set by either:
+    - Setting the value in [`MaasTenantConfig.spec.apiKeys.maxExpirationDays`](../install/maas-setup.md#maastenantconfig-cr), or 
+    - When deploying a standalone maas-api instance you can also set this maximum allowed lifetime via the `API_KEY_MAX_EXPIRATION_DAYS` environment variable.
+
+### Examples:
+```bash
+# 6 hours
+curl ... -d '{"name": "key-6h", "expiresIn": "6h"}' ...
+
+# 90 minutes
+curl ... -d '{"name": "key-90m", "expiresIn": "90m"}' ...
+
+# 1.5 days (36 hours)
+curl ... -d '{"name": "key-1.5d", "expiresIn": "1.5d"}' ...
+
+# Use platform maximum (omit expiresIn)
+curl ... -d '{"name": "key-max"}' ...
+
+# Numeric format: 7 days as seconds
+curl ... -d '{"name": "key-7d", "expiresIn": 604800}' ...
+```
+
+!!! warning: "There are no permanent keys."  
+    All API keys must have an expiration. There is no option to create a permanent, never-expiring key. Use the maximum allowed duration for long-lived integrations.
 
 ---
 
@@ -173,7 +309,9 @@ curl -sS -X DELETE "${MAAS_API_URL}/maas-api/v1/api-keys/${KEY_ID}" \
   -H "Authorization: Bearer $(oc whoami -t)"
 ```
 
-Revocation takes effect immediately (Authorino may cache briefly).
+Revocation takes effect immediately on the writable database. If a cluster-local read
+replica is configured, validation observes it after PostgreSQL replication lag plus any
+brief Authorino cache delay.
 
 ### Revoke All Your Keys
 
@@ -203,7 +341,7 @@ curl -sS -X POST "${MAAS_API_URL}/maas-api/v1/api-keys/bulk-revoke" \
 - Rotating all credentials as part of security policy
 
 !!! note "Administrator bulk revocation"
-    Administrators can revoke keys for any user. See [API Key Administration](../configuration-and-management/api-key-administration.md#bulk-key-revocation).
+    Administrators can revoke keys for any user or for an entire subscription. See [API Key Administration](../configuration-and-management/api-key-administration.md#bulk-key-revocation) for organization-scoped user revocation, subscription-scoped revocation, dry-run mode, and combined user+subscription scope.
 
 ---
 

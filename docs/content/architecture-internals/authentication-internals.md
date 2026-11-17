@@ -8,23 +8,33 @@ This page describes how **identity and subscription context** are established at
 
 Today’s pipeline does **not** drive TokenRateLimitPolicy by splitting group membership in CEL the way older drafts did. The flow is:
 
-1. **AuthPolicy** (controller-generated per model) authenticates the caller and calls **maas-api** at  
-   `POST https://maas-api.<namespace>.svc.cluster.local:8443/internal/v1/subscriptions/select`  
+1. **AuthPolicy** (controller-generated per model) authenticates the caller and calls **maas-api** at:
+   - Default tenant: `POST https://maas-api.opendatahub.svc.cluster.local:8443/internal/v1/subscriptions/select`
+   - Additional tenants: `POST https://maas-api-{tenantID}.opendatahub.svc.cluster.local:8443/internal/v1/subscriptions/select`
+   
    with the caller’s groups, username, requested subscription header (when applicable), and model scope.
 
-2. **maas-api** resolves which **MaaSSubscription** applies (including validation, auto-selection when only one subscription applies, and error paths). Results are exposed to Authorino as **`subscription-info`** metadata.
+2. **maas-api** resolves which **MaaSSubscription** applies (including validation, auto-selection when only one subscription applies, and error paths). Results are exposed to Authorino as **`subscription-info`** metadata. When a guardrail resolver is configured, a successful model selection also includes **`selectedGuardrailChecks`**, a sparse map whose keys are the shared SHA-256 check IDs and whose values are `true`. The map is `{}` when no guardrails apply; if a selected attachment cannot be resolved, the endpoint returns `guardrail_unavailable` and does not return a partial selection. The field carries selection state only; request headers are handled separately.
 
 3. **AuthPolicy `filters.identity`** copies resolved fields onto **`auth.identity`**, including:
    - **`selected_subscription_key`** — model-scoped key of the form  
      `{subscriptionNamespace}/{subscriptionName}@{modelNamespace}/{modelName}`  
-     This is the value **rate limiting** keys off.
+     Kept for telemetry and debugging, and still the **rate-limit identity** for subscriptions that existed before the short-ID rollout.
+   - **`selected_subscription_id`** — first 16 hex chars of SHA-256 over that key (from
+     maas-api `subscription-info.rateLimitId`). Set only when the selected MaaSSubscription
+     has `status.rateLimitIdentity=short` (created after upgrade).
+     Also mirrored as response header **`X-MaaS-Subscription-Rate-Limit-Id`** without replacing
+     existing headers.
 
-4. **TokenRateLimitPolicy** (aggregated per model by the MaaSSubscription reconciler) defines **one limit entry per subscription** that applies to that model. Each limit’s **`when`** predicate matches requests where  
-   `auth.identity.selected_subscription_key` equals that subscription’s scoped key (and inference paths are distinguished from discovery; `/v1/models` is exempt from token consumption limits where configured).
+4. **TokenRateLimitPolicy** (aggregated per model by the MaaSSubscription reconciler) defines **one limit entry per distinct rate set** among the subscriptions that apply to that model, split further when that set mixes legacy and short-ID members (they cannot share counters). Each limit’s **`when`** predicate matches:
+   - **new subscriptions:** `auth.identity.selected_subscription_id`
+   - **pre-upgrade subscriptions:** `auth.identity.selected_subscription_key`
+   
+   Inference paths are distinguished from discovery; `/v1/models` is exempt from token consumption limits where configured. Counters use the same identity field as the predicate, plus `userid`. See [Reconciliation Flow](./reconciliation-flow.md#maassubscription-reconciler).
 
-So enforcement is: **subscription resolved in AuthPolicy → same key matched in TRLP**. Group-based **authorization** still uses groups from TokenReview / API key validation in **MaaSAuthPolicy** rules; **rate limit selection** follows the resolved subscription key, not a separate “group split” expression on TRLP.
+So enforcement is: **subscription resolved in AuthPolicy → the same identity the TRLP was built for**. Group-based **authorization** is resolved during subscription selection: **maas-api** evaluates **MaaSAuthPolicy** rules for the caller and returns `accessAllowed` in **`subscription-info`** metadata. The gateway authorization rule simply reads that boolean rather than embedding per-model allowlists, keeping the AuthPolicy CR fixed-size at any subscription count.
 
-**TRLP predicates vs other identity:** TokenRateLimitPolicy **`when`** clauses use **`selected_subscription_key` only**—not `groups_str`, group arrays, or header mirrors. Anything else on `auth.identity` is **not** part of TRLP matching; it exists for **subscription selection** (inputs to maas-api), **Authorino cache/metadata**, and **telemetry** at the gateway/mesh. That matches post–EA2 behavior: limits follow the resolved subscription key; maintainers often describe the remaining decoration as **chiefly telemetry-facing**, aside from selection/caching.
+**TRLP predicates vs other identity:** TokenRateLimitPolicy **`when`** clauses use **`selected_subscription_id` for new subscriptions and `selected_subscription_key` for legacy ones**—not `groups_str`, group arrays, or header mirrors. Anything else on `auth.identity` is **not** part of TRLP matching; it exists for **subscription selection** (inputs to maas-api), **Authorino cache/metadata**, and **telemetry** at the gateway/mesh.
 
 ---
 
@@ -55,7 +65,7 @@ When a JWT carries a groups claim, Authorino may populate **`auth.identity.group
 
 ### TokenRateLimitPolicy (`maassubscription_controller.go`)
 
-TRLP **`when`** predicates match **`auth.identity.selected_subscription_key` only**. Using **`groups_str`** for rate limits is **obsolete**.
+TRLP **`when`** predicates match **`auth.identity.selected_subscription_id`** for subscriptions created after the short-ID rollout and **`auth.identity.selected_subscription_key`** for pre-upgrade subscriptions. Using **`groups_str`** for rate limits is **obsolete**.
 
 ### Troubleshooting: which field to inspect
 
@@ -64,7 +74,8 @@ TRLP **`when`** predicates match **`auth.identity.selected_subscription_key` onl
 | Raw groups after auth | **`auth.metadata.apiKeyValidation.groups`** | **`auth.identity.user.groups`** (from TokenReview **`status.user.groups`**) | **`auth.identity.groups`** if present, else **`auth.identity.user.groups`** |
 | Serialized **`groups_str` in `filters.identity`** | From **`apiKeyValidation.groups.join(",")`** | Not populated from TokenReview (still tied to apiKeyValidation expression) | Same—only apiKeyValidation drives that JSON property |
 | Subscription selection + Authorino cache inputs | **`celGroups`**, **`celUsername`**, **`celSubscription`** + **`auth.metadata["subscription-info"]`** after select | Same **`celGroups`** branch → **`auth.identity.user.groups`** | **`celGroups`** → **`auth.identity.groups`** when set |
-| Rate limiting | **`auth.identity.selected_subscription_key`** after successful select | Same | Same |
+| Rate limiting | **`auth.identity.selected_subscription_id`** (new CRs) or **`selected_subscription_key`** (pre-upgrade CRs) after successful select | Same | Same |
+| Telemetry / debug subscription@model | **`auth.identity.selected_subscription_key`** | Same | Same |
 
 If you read older notes about a “string trick” solely for TRLP group matching, treat that as **obsolete**.
 
@@ -76,7 +87,16 @@ If you read older notes about a “string trick” solely for TRLP group matchin
 
 - Controller-generated AuthPolicies generally **do not** inject most identity headers (`X-MaaS-Username`, `X-MaaS-Group`, `X-MaaS-Key-Id`) upstream to model pods, to reduce leakage via logs or misconfigured proxies.
 
-**`X-MaaS-Subscription`** may be injected where gateway telemetry needs a stable subscription label. Any client-supplied **`X-MaaS-Subscription`** header is **discarded and replaced** with the server-resolved value from Authorino's **AuthPolicy response phase** (Authorino/Kuadrant AuthPolicy is authoritative—the upstream workload sees only what enforcement injected).
+For **API keys**, AuthPolicy injects **`X-MaaS-Subscription`** only when validation returns a nonempty bound subscription. For **user tokens**, AuthPolicy preserves a client-supplied subscription header and uses it for subscription selection; it does not inject another copy. A user-token request without that header does not gain one during authentication, so telemetry that reads the header may have an empty subscription label.
+
+AuthPolicy always sets organization scope and the llm-d flow-control headers, replacing any client-supplied values. Organization comes from the subscription selected by maas-api; an empty value identifies unresolved scope rather than trusting client input:
+
+- **`x-maas-organization-id`**: the stable `MaaSSubscription.spec.organization.id`, with legacy `tokenMetadata.organizationId` as the fallback.
+
+The llm-d flow-control headers are:
+
+- **`x-llm-d-inference-objective`** and **`x-gateway-inference-objective`**: the `objective` returned by maas-api subscription selection, which is the requested model's `objectiveName` from the subscription's [`flowControlStatuses`](../reference/crds/maas-subscription.md#status-flowcontrolstatuses). Empty when the model has none (for example, an ExternalModel) or when another object holds the name, so the scheduler applies priority `0`.
+- **`x-llm-d-inference-fairness-id`** and **`x-gateway-inference-fairness-id`**: the `fairnessId` returned by maas-api, which is the tenant name of the maas-api instance.
 
 **MaaS API routes** use a separate static AuthPolicy that may inject headers required by maas-api middleware (trusted internal service).
 

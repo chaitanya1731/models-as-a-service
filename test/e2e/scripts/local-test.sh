@@ -47,10 +47,16 @@ fi
 
 # ─── Python venv ────────────────────────────────────────────────────────────
 
+# shellcheck source=ensure_e2e_python.sh
+source "$SCRIPT_DIR/ensure_e2e_python.sh"
 VENV_DIR="${E2E_DIR}/.venv"
+if [[ -d "$VENV_DIR" ]] && ! "$VENV_DIR/bin/python" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
+  echo "Recreating e2e venv (existing interpreter is older than Python 3.10)..."
+  rm -rf "$VENV_DIR"
+fi
 if [[ ! -d "$VENV_DIR" ]]; then
-  echo "Creating Python venv..."
-  python3 -m venv "$VENV_DIR" --upgrade-deps
+  echo "Creating Python venv ($E2E_PYTHON)..."
+  "$E2E_PYTHON" -m venv "$VENV_DIR" --upgrade-deps
 fi
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
@@ -127,7 +133,7 @@ echo ""
 # Default: run MaaS management tests (API keys, models endpoint).
 # Model inference tests (TestAPIKeyModelInference) are excluded because they
 # hit the model URL directly from the Mac host, which isn't routable to the
-# Kind docker network. These tests work when BBR + gateway egress is configured.
+# Kind docker network. These tests work when IPP + gateway egress is configured.
 #
 # To run all tests: ./local-test.sh --run-all
 # To run specific tests: ./local-test.sh -k test_create_api_key
@@ -153,7 +159,7 @@ if [[ "$RUN_ALL" == "false" && ${#PASSTHROUGH_ARGS[@]} -eq 0 ]]; then
   #   TestAPIKeySubscriptionPhases - creates API keys and hits model endpoint
   #   test_models_endpoint.py     - api_key fixture hits model endpoint in setup
   #
-  # These will work once BBR is deployed and gateway egress to llm-katan is configured.
+  # These will work once IPP is deployed and gateway egress to llm-katan is configured.
   PYTEST_ARGS+=(
     -k "not (TestAPIKeyModelInference or TestAPIKeySubscriptionPhases or test_revoke_keys_rejected_at_gateway or test_revoke_then_create_new_key_works)"
     "${E2E_DIR}/tests/test_api_keys.py"
